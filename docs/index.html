@@ -50,9 +50,9 @@
 </head>
 <body>
   <main>
-    <p><code>claude-account</code> fuer Linux</p>
-    <h1>Einmal anmelden. Danach direkt wechseln.</h1>
-    <p class="lead">Der Claude Account Swapper speichert die offizielle Claude-Code-Authentifizierung lokal und schaltet den global aktiven Account ohne erneuten Browser-Flow um.</p>
+    <p><code>Claude Account Swapper</code> für Linux</p>
+    <h1>Doppelklick. Account wählen. Fertig.</h1>
+    <p class="lead">Der Desktop-Starter öffnet ein einfaches Terminalmenü. Dort lassen sich Claude-Code-Accounts speichern, einmalig anmelden und danach ohne erneuten Browser-Flow wechseln.</p>
 
     <section class="flow" aria-label="Ablauf">
       <div class="card"><strong>01 Speichern</strong>Den aktuellen Claude-Login einmal benennen.</div>
@@ -61,17 +61,23 @@
     </section>
 
     <h2>Installation</h2>
-    <pre><code>cargo install --git https://github.com/EarlySalty/Claude-Account-Swapper --locked</code></pre>
-    <p>Erforderlich sind Linux, Rust 1.88 oder neuer und eine installierte offizielle Claude-Code-CLI.</p>
+    <pre><code>git clone https://github.com/EarlySalty/Claude-Account-Swapper.git
+cd Claude-Account-Swapper
+./install.sh</code></pre>
+    <p>Der Installer aktualisiert die Binary und legt <strong>Claude Account Swapper</strong> auf dem Desktop sowie im Anwendungsmenü an. Erforderlich sind Linux, Rust 1.88 oder neuer und die offizielle Claude-Code-CLI.</p>
 
     <h2>Erste Einrichtung</h2>
-    <p>Speichere zuerst den Account, mit dem Claude Code aktuell verbunden ist:</p>
-    <pre><code>claude-account save privat</code></pre>
-    <p>Fuege den zweiten Account hinzu. Nur hierbei erscheint noch einmal der offizielle Browser-Login:</p>
-    <pre><code>claude-account login arbeit</code></pre>
-    <p>Ab jetzt wird ohne Browser gewechselt:</p>
-    <pre><code>claude-account switch privat
-claude-account switch arbeit</code></pre>
+    <ol>
+      <li><strong>Claude Account Swapper</strong> auf dem Desktop doppelklicken.</li>
+      <li><strong>Aktuellen Account speichern</strong> wählen und einen kurzen Namen eingeben.</li>
+      <li><strong>Neuen Account anmelden</strong> wählen und den offiziellen Browser-Login einmal abschließen.</li>
+      <li>Danach über <strong>Account wechseln</strong> direkt umschalten.</li>
+    </ol>
+    <pre><code>[1] Account wechseln
+[2] Aktuellen Account speichern
+[3] Neuen Account anmelden
+[4] Status anzeigen
+[5] Beenden</code></pre>
 
     <h2>Befehle</h2>
     <table>
@@ -82,7 +88,7 @@ claude-account switch arbeit</code></pre>
         <tr><td><code>switch &lt;name&gt;</code></td><td>Wechselt zum gespeicherten Account. <code>use</code> ist ein Alias.</td></tr>
         <tr><td><code>list</code></td><td>Listet Profile und markiert den aktiven Account.</td></tr>
         <tr><td><code>status</code></td><td>Fragt Claude nach dem tatsaechlich aktiven Login.</td></tr>
-        <tr><td><code>claude-account</code></td><td>Oeffnet eine nummerierte Auswahl.</td></tr>
+        <tr><td><code>claude-account</code></td><td>Öffnet dasselbe Hauptmenü wie der Desktop-Starter.</td></tr>
       </tbody>
     </table>
 

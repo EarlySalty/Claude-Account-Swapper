@@ -262,13 +262,94 @@ impl App {
     }
 
     pub fn interactive(&self) -> Result<()> {
+        loop {
+            let profiles = match self.load_profiles() {
+                Ok(profiles) => profiles,
+                Err(error) => {
+                    eprintln!(
+                        "Warnung: Gespeicherte Accounts konnten nicht gelesen werden: {error:#}"
+                    );
+                    Vec::new()
+                }
+            };
+            let current = match self.load_state() {
+                Ok(state) => state.current,
+                Err(error) => {
+                    eprintln!("Warnung: Letzter Account-Status ist beschaedigt: {error:#}");
+                    None
+                }
+            };
+            let active = self.menu_active_label(&profiles, current.as_deref());
+
+            println!("\n================================");
+            println!("  Claude Account Swapper");
+            println!("================================");
+            println!("Aktiv: {active}\n");
+            println!("  [1] Account wechseln");
+            println!("  [2] Aktuellen Account speichern");
+            println!("  [3] Neuen Account anmelden");
+            println!("  [4] Status anzeigen");
+            println!("  [5] Beenden\n");
+
+            let Some(choice) = prompt_line("Auswahl: ")? else {
+                return Ok(());
+            };
+            let action = match choice.as_str() {
+                "1" => self.interactive_switch(),
+                "2" => self.interactive_save(),
+                "3" => self.interactive_login(),
+                "4" => self.status(),
+                "5" | "q" | "quit" | "exit" => return Ok(()),
+                _ => {
+                    eprintln!("Fehler: Bitte 1 bis 5 waehlen.");
+                    if !pause()? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+            if let Err(error) = action {
+                eprintln!("Fehler: {error:#}");
+            }
+            if !pause()? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn menu_active_label(&self, profiles: &[Profile], fallback: Option<&str>) -> String {
+        let live = self
+            .ensure_no_auth_override()
+            .and_then(|()| self.auth_status());
+        match live {
+            Ok(status) if !status.logged_in => "nicht eingeloggt".to_owned(),
+            Ok(status) => match status.email() {
+                Ok(email) => profiles
+                    .iter()
+                    .find(|profile| status.matches(profile))
+                    .map(|profile| format!("{} ({})", profile.name, profile.email))
+                    .unwrap_or_else(|| format!("{email} (nicht gespeichert)")),
+                Err(_) => "nicht ermittelbar".to_owned(),
+            },
+            Err(_) => fallback
+                .and_then(|name| profiles.iter().find(|profile| profile.name == name))
+                .map(|profile| {
+                    format!(
+                        "{} ({}, Status nicht pruefbar)",
+                        profile.name, profile.email
+                    )
+                })
+                .unwrap_or_else(|| "nicht ermittelbar".to_owned()),
+        }
+    }
+
+    fn interactive_switch(&self) -> Result<()> {
         let profiles = self.load_profiles()?;
         if profiles.is_empty() {
-            println!("Keine Accounts gespeichert. Starte mit: claude-account save <name>");
-            return Ok(());
+            bail!("Noch keine Accounts gespeichert. Nutze zuerst Menuepunkt 2.");
         }
         let current = self.load_state()?.current;
-        println!("\nClaude Accounts\n---------------");
+        println!("\nGespeicherte Accounts:");
         for (index, profile) in profiles.iter().enumerate() {
             let marker = if current.as_deref() == Some(profile.name.as_str()) {
                 " *"
@@ -276,29 +357,52 @@ impl App {
                 ""
             };
             println!(
-                "{}.{} {} ({})",
+                "  [{}]{} {} ({})",
                 index + 1,
                 marker,
                 profile.name,
                 profile.email
             );
         }
-        print!("\nAccount waehlen: ");
-        io::stdout()
-            .flush()
-            .context("Ausgabe konnte nicht geschrieben werden")?;
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .context("Auswahl konnte nicht gelesen werden")?;
-        let selected = input
-            .trim()
+        println!("  [0] Zurueck");
+        let Some(choice) = prompt_line("Account: ")? else {
+            return Ok(());
+        };
+        if choice == "0" {
+            return Ok(());
+        }
+        let selected = choice
             .parse::<usize>()
             .context("bitte eine Account-Nummer eingeben")?;
         let profile = profiles
-            .get(selected.saturating_sub(1))
+            .get(
+                selected
+                    .checked_sub(1)
+                    .context("ungueltige Account-Nummer")?,
+            )
             .context("ungueltige Account-Nummer")?;
         self.switch(&profile.name)
+    }
+
+    fn interactive_save(&self) -> Result<()> {
+        let Some(name) = prompt_line("Profilname, z.B. privat: ")? else {
+            return Ok(());
+        };
+        if name.is_empty() {
+            bail!("Profilname darf nicht leer sein");
+        }
+        self.save(&name)
+    }
+
+    fn interactive_login(&self) -> Result<()> {
+        let Some(name) = prompt_line("Profilname fuer den neuen Account: ")? else {
+            return Ok(());
+        };
+        if name.is_empty() {
+            bail!("Profilname darf nicht leer sein");
+        }
+        println!("\nDer offizielle Claude-Login wird jetzt geoeffnet ...\n");
+        self.login(&name)
     }
 
     fn save_live_as(&self, name: &str) -> Result<Profile> {
@@ -526,6 +630,25 @@ fn validate_name(name: &str) -> Result<()> {
         bail!("Profilname darf nur A-Z, a-z, 0-9, Punkt, Minus und Unterstrich enthalten");
     }
     Ok(())
+}
+
+fn prompt_line(label: &str) -> Result<Option<String>> {
+    print!("{label}");
+    io::stdout()
+        .flush()
+        .context("Ausgabe konnte nicht geschrieben werden")?;
+    let mut input = String::new();
+    let bytes = io::stdin()
+        .read_line(&mut input)
+        .context("Eingabe konnte nicht gelesen werden")?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    Ok(Some(input.trim().to_owned()))
+}
+
+fn pause() -> Result<bool> {
+    Ok(prompt_line("\nEnter druecken, um zum Menue zurueckzukehren ...")?.is_some())
 }
 
 fn read_valid_credentials(path: &Path) -> Result<Vec<u8>> {
