@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude Account Swapper - Anleitung</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #11100e;
+      --surface: #1d1a16;
+      --border: #3c3429;
+      --text: #f2eadf;
+      --muted: #b8aa98;
+      --accent: #d29b67;
+      --code: #171411;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top right, #2a2018 0, var(--background) 38rem);
+      color: var(--text);
+      font: 17px/1.65 ui-sans-serif, system-ui, sans-serif;
+    }
+    main { width: min(860px, calc(100% - 32px)); margin: 0 auto; padding: 72px 0 96px; }
+    h1, h2 { line-height: 1.15; }
+    h1 { max-width: 720px; margin: 0; font-size: clamp(2.4rem, 8vw, 5rem); letter-spacing: -0.055em; }
+    h2 { margin-top: 3rem; color: var(--accent); }
+    .lead { max-width: 680px; margin: 24px 0 40px; color: var(--muted); font-size: 1.2rem; }
+    .card { padding: 24px; border: 1px solid var(--border); border-radius: 14px; background: color-mix(in srgb, var(--surface) 94%, transparent); }
+    .flow { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .flow strong { display: block; color: var(--accent); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.12em; }
+    code { padding: 0.12rem 0.38rem; border-radius: 5px; background: var(--code); color: #f6c895; }
+    pre { overflow-x: auto; padding: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--code); }
+    pre code { padding: 0; background: transparent; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 12px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { color: var(--muted); }
+    .warning { border-left: 4px solid var(--accent); }
+    a { color: var(--accent); }
+    @media (max-width: 680px) {
+      main { padding-top: 40px; }
+      .flow { grid-template-columns: 1fr; }
+      table, tbody, tr, td { display: block; }
+      thead { display: none; }
+      td { padding: 8px 0; }
+      td:last-child { padding-bottom: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <p><code>claude-account</code> fuer Linux</p>
+    <h1>Einmal anmelden. Danach direkt wechseln.</h1>
+    <p class="lead">Der Claude Account Swapper speichert die offizielle Claude-Code-Authentifizierung lokal und schaltet den global aktiven Account ohne erneuten Browser-Flow um.</p>
+
+    <section class="flow" aria-label="Ablauf">
+      <div class="card"><strong>01 Speichern</strong>Den aktuellen Claude-Login einmal benennen.</div>
+      <div class="card"><strong>02 Anmelden</strong>Jeden weiteren Account genau einmal offiziell autorisieren.</div>
+      <div class="card"><strong>03 Wechseln</strong>Danach per Name oder interaktiv in Sekunden umschalten.</div>
+    </section>
+
+    <h2>Installation</h2>
+    <pre><code>cargo install --git https://github.com/EarlySalty/Claude-Account-Swapper --locked</code></pre>
+    <p>Erforderlich sind Linux, Rust 1.88 oder neuer und eine installierte offizielle Claude-Code-CLI.</p>
+
+    <h2>Erste Einrichtung</h2>
+    <p>Speichere zuerst den Account, mit dem Claude Code aktuell verbunden ist:</p>
+    <pre><code>claude-account save privat</code></pre>
+    <p>Fuege den zweiten Account hinzu. Nur hierbei erscheint noch einmal der offizielle Browser-Login:</p>
+    <pre><code>claude-account login arbeit</code></pre>
+    <p>Ab jetzt wird ohne Browser gewechselt:</p>
+    <pre><code>claude-account switch privat
+claude-account switch arbeit</code></pre>
+
+    <h2>Befehle</h2>
+    <table>
+      <thead><tr><th>Befehl</th><th>Wirkung</th></tr></thead>
+      <tbody>
+        <tr><td><code>save &lt;name&gt;</code></td><td>Speichert den aktuell autorisierten Login.</td></tr>
+        <tr><td><code>login &lt;name&gt;</code></td><td>Fuehrt einmal den offiziellen Claude-Login aus und speichert ihn.</td></tr>
+        <tr><td><code>switch &lt;name&gt;</code></td><td>Wechselt zum gespeicherten Account. <code>use</code> ist ein Alias.</td></tr>
+        <tr><td><code>list</code></td><td>Listet Profile und markiert den aktiven Account.</td></tr>
+        <tr><td><code>status</code></td><td>Fragt Claude nach dem tatsaechlich aktiven Login.</td></tr>
+        <tr><td><code>claude-account</code></td><td>Oeffnet eine nummerierte Auswahl.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Was beim Wechsel passiert</h2>
+    <ol>
+      <li>Der Switcher fragt <code>claude auth status</code> nach der aktiven Identitaet.</li>
+      <li>Der aktuelle Inhalt von <code>~/.claude/.credentials.json</code> wird zum passenden Profil zurueckgesichert.</li>
+      <li>Das Zielprofil wird validiert und ueber eine temporaere Datei atomar aktiviert.</li>
+      <li>Offene Claude-Code-Sessions nutzen den neuen globalen Login bei der naechsten Anfrage.</li>
+    </ol>
+
+    <h2>Sicherheitsmodell</h2>
+    <div class="card warning">
+      <strong>Die gespeicherten Dateien sind aktive OAuth-Geheimnisse.</strong>
+      <p>Sie liegen unter <code>~/.claude-account-switcher/</code> mit privaten Dateirechten. Nimm dieses Verzeichnis nicht in Git, Cloud-Sync oder unverschluesselte Backups auf.</p>
+    </div>
+    <p>Ein unbekannter aktiver Login wird nie verworfen. Ungueltige Zielprofile werden vor jeder Mutation abgelehnt. Abgebrochene oder falsche Browser-Logins rollen auf den vorherigen Credential-Stand zurueck.</p>
+    <p>Gesetzte Variablen wie <code>ANTHROPIC_API_KEY</code> wuerden die Datei-Auswahl ueberschreiben. Der Switcher erkennt diese Overrides und bricht sichtbar ab.</p>
+
+    <h2>Grenzen</h2>
+    <p>Das Tool ist absichtlich klein und aktuell Linux-only. Es loest keine serverseitigen OAuth-Fehler und keinen internen Refresh-Token-Race in mehreren Claude-Prozessen. Wechsle idealerweise zwischen zwei Prompts statt waehrend einer laufenden Anfrage.</p>
+
+    <p><a href="https://github.com/EarlySalty/Claude-Account-Swapper">Quellcode auf GitHub</a></p>
+  </main>
+</body>
+</html>
