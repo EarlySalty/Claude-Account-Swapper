@@ -16,38 +16,47 @@ Claude Code nutzt unter Linux genau einen aktiven OAuth-Datensatz in `~/.claude/
 
 Voraussetzungen: Linux, Rust 1.88 oder neuer und die offizielle Claude-Code-CLI.
 
+Empfohlen: Repository laden und den Desktop-Installer starten:
+
+```bash
+git clone https://github.com/EarlySalty/Claude-Account-Swapper.git
+cd Claude-Account-Swapper
+./install.sh
+```
+
+Der Installer legt **Claude Account Swapper** auf dem Desktop und im Anwendungsmenü an. Danach reicht ein Doppelklick. Alternativ kann nur die Kommandozeile installiert werden:
+
 ```bash
 cargo install --git https://github.com/EarlySalty/Claude-Account-Swapper --locked
 ```
 
-Aus einem lokalen Checkout:
-
-```bash
-cargo install --path . --locked
-```
-
 ## Einrichtung
 
-Den aktuell eingeloggten Account einmal speichern:
+1. **Claude Account Swapper** auf dem Desktop doppelklicken.
+2. **Aktuellen Account speichern** wählen und beispielsweise `privat` eingeben.
+3. **Neuen Account anmelden** wählen, einen Namen eingeben und einmal den offiziellen Browser-Login abschließen.
+4. Danach über **Account wechseln** ohne neuen Browser-Login umschalten.
+
+Das Menü sieht so aus:
+
+```text
+[1] Account wechseln
+[2] Aktuellen Account speichern
+[3] Neuen Account anmelden
+[4] Status anzeigen
+[5] Beenden
+```
+
+Die bisherigen Terminalbefehle bleiben verfügbar:
 
 ```bash
 claude-account save privat
-```
-
-Einen weiteren Account einmalig im offiziellen Claude-Browser-Flow anmelden und direkt speichern:
-
-```bash
 claude-account login arbeit
-```
-
-Danach erfolgt jeder Wechsel ohne Browser:
-
-```bash
 claude-account switch privat
 claude-account switch arbeit
 ```
 
-Ohne Argument oeffnet `claude-account` eine nummerierte Auswahl.
+Ohne Argument öffnet `claude-account` dasselbe Hauptmenü wie der Desktop-Starter.
 
 ## Befehle
 
@@ -58,7 +67,7 @@ Ohne Argument oeffnet `claude-account` eine nummerierte Auswahl.
 | `claude-account switch <name>` | Wechselt atomar zum gespeicherten Account. Alias: `use`. |
 | `claude-account list` | Zeigt alle Profile und markiert das aktive. |
 | `claude-account status` | Zeigt den von Claude bestaetigten aktiven Account. |
-| `claude-account` | Oeffnet die interaktive Account-Auswahl. |
+| `claude-account` | Öffnet das vollständige Hauptmenü. |
 
 Profilnamen duerfen Buchstaben, Zahlen, `.`, `-` und `_` enthalten.
 

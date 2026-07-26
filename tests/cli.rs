@@ -1,7 +1,8 @@
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use serde_json::json;
 use tempfile::TempDir;
@@ -99,6 +100,28 @@ esac
     fn run(&self, args: &[&str]) -> Output {
         self.command().args(args).output().expect("run command")
     }
+
+    fn run_with_input(&self, args: &[&str], input: &str) -> Output {
+        let mut command = self.command();
+        command.args(args);
+        run_command_with_input(command, input)
+    }
+}
+
+fn run_command_with_input(mut command: Command, input: &str) -> Output {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn interactive command");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(input.as_bytes())
+        .expect("write interactive input");
+    child.wait_with_output().expect("interactive output")
 }
 
 fn write_credentials(path: &Path, access: &str, refresh: &str) {
@@ -428,4 +451,130 @@ fn incomplete_profile_directories_do_not_block_valid_accounts() {
 
     assert_success(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("personal"));
+}
+
+#[test]
+fn menu_can_save_the_current_account_without_cli_arguments() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+
+    let output = harness.run_with_input(&[], "2\npersonal\n\n5\n");
+
+    assert_success(&output);
+    assert!(harness.saved_credentials("personal").is_file());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Account wechseln"));
+    assert!(stdout.contains("Aktuellen Account speichern"));
+    assert!(stdout.contains("Neuen Account anmelden"));
+}
+
+#[test]
+fn menu_can_switch_between_saved_accounts() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+    harness.set_active("work@example.test", "access-work", "refresh-work");
+    assert_success(&harness.run(&["save", "work"]));
+
+    let output = harness.run_with_input(&[], "1\n1\n\n5\n");
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        fs::read(harness.saved_credentials("personal")).expect("personal")
+    );
+}
+
+#[test]
+fn menu_returns_after_an_invalid_action_instead_of_closing() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+
+    let output = harness.run_with_input(&[], "2\n../invalid\n\n5\n");
+
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Fehler:"));
+    assert!(!harness.store.join("outside").exists());
+}
+
+#[test]
+fn menu_can_run_the_one_time_login_flow() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+    let login_credentials = harness.home.join("login-credentials.json");
+    let login_status = harness.home.join("login-status.json");
+    write_credentials(&login_credentials, "access-work", "refresh-work");
+    write_status(&login_status, "work@example.test");
+
+    let mut command = harness.command();
+    command
+        .env("FAKE_LOGIN_CREDENTIALS", &login_credentials)
+        .env("FAKE_LOGIN_STATUS", &login_status);
+    let output = run_command_with_input(command, "3\nwork\n\n5\n");
+
+    assert_success(&output);
+    assert!(harness.saved_credentials("work").is_file());
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        fs::read(harness.saved_credentials("work")).expect("work")
+    );
+}
+
+#[test]
+fn menu_header_uses_the_real_claude_login_not_stale_switcher_state() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+    harness.set_active(
+        "external@example.test",
+        "access-external",
+        "refresh-external",
+    );
+
+    let output = harness.run_with_input(&[], "5\n");
+
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Aktiv: external@example.test (nicht gespeichert)")
+    );
+}
+
+#[test]
+fn corrupt_state_does_not_close_the_desktop_menu() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+    fs::write(harness.store.join("state.json"), b"{\n").expect("corrupt state");
+
+    let output = harness.run_with_input(&[], "5\n");
+
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Warnung:"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Claude Account Swapper"));
 }
