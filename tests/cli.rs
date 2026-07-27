@@ -86,6 +86,48 @@ esac
         write_status(&self.status, email);
     }
 
+    fn claude_json(&self) -> PathBuf {
+        self.home.join(".claude.json")
+    }
+
+    /// Bildet den Identitaets-Cache nach, den Claude Code selbst in `.claude.json` haelt.
+    fn write_claude_json(&self, email: &str) {
+        let payload = json!({
+            "numStartups": 7,
+            "userID": format!("hash-of-{email}"),
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": format!("uuid-of-{email}"),
+            }
+        });
+        fs::write(
+            self.claude_json(),
+            serde_json::to_vec(&payload).expect("claude json"),
+        )
+        .expect("write claude json");
+    }
+
+    fn read_claude_json(&self) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(self.claude_json()).expect("read claude json"))
+            .expect("parse claude json")
+    }
+
+    /// Claude kennt den Login, aber noch keine Identitaet - genau der Zustand direkt
+    /// nach einem Wechsel, bevor Claude Code das Profil neu geladen hat.
+    fn set_status_without_identity(&self) {
+        let payload = json!({
+            "loggedIn": true,
+            "authMethod": "claude.ai",
+            "email": null,
+            "subscriptionType": "pro"
+        });
+        fs::write(
+            &self.status,
+            serde_json::to_vec(&payload).expect("status json"),
+        )
+        .expect("write status");
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_claude-account"));
         command
@@ -203,6 +245,75 @@ fn save_and_switch_syncs_the_latest_outgoing_credentials() {
             .mode()
             & 0o777,
         0o600
+    );
+}
+
+#[test]
+fn switch_clears_the_stale_account_identity_cache() {
+    let harness = Harness::new();
+    harness.set_active("personal@example.test", "access-p", "refresh-p");
+    harness.write_claude_json("personal@example.test");
+    assert_success(&harness.run(&["save", "personal"]));
+
+    harness.set_active("work@example.test", "access-w", "refresh-w");
+    harness.write_claude_json("work@example.test");
+    assert_success(&harness.run(&["save", "work"]));
+
+    assert_success(&harness.run(&["switch", "personal"]));
+
+    let claude_json = harness.read_claude_json();
+    assert!(
+        claude_json.get("oauthAccount").is_none(),
+        "oauthAccount haette geleert werden muessen: {claude_json}"
+    );
+    assert!(
+        claude_json.get("userID").is_none(),
+        "userID haette geleert werden muessen: {claude_json}"
+    );
+    assert_eq!(
+        claude_json.get("numStartups").and_then(|v| v.as_u64()),
+        Some(7),
+        "uebrige Claude-Einstellungen duerfen nicht verloren gehen"
+    );
+    assert_eq!(
+        fs::metadata(harness.claude_json())
+            .expect("claude json metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn switch_without_a_known_identity_syncs_the_last_active_profile() {
+    let harness = Harness::new();
+    harness.set_active("personal@example.test", "access-p", "refresh-p");
+    assert_success(&harness.run(&["save", "personal"]));
+    harness.set_active("work@example.test", "access-w", "refresh-w");
+    assert_success(&harness.run(&["save", "work"]));
+
+    // Wechsel hat den Identitaets-Cache geleert; Claude wurde seitdem nicht gestartet,
+    // waehrend der aktive Login (work) seine Tokens rotiert hat.
+    write_credentials(
+        &harness.active_credentials(),
+        "access-w-rotated",
+        "refresh-w-rotated",
+    );
+    harness.set_status_without_identity();
+
+    assert_success(&harness.run(&["switch", "personal"]));
+
+    let work =
+        String::from_utf8(fs::read(harness.saved_credentials("work")).expect("work profile"))
+            .expect("utf8");
+    assert!(
+        work.contains("refresh-w-rotated"),
+        "rotierte Tokens muessen im ausgehenden Profil landen, nicht verloren gehen: {work}"
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        fs::read(harness.saved_credentials("personal")).expect("personal profile")
     );
 }
 

@@ -16,6 +16,8 @@ const MAX_CREDENTIAL_SIZE: u64 = 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub credentials: PathBuf,
+    /// Claude Codes Konfigurationsdatei; enthaelt den Identitaets-Cache zum aktiven Login.
+    pub claude_json: PathBuf,
     pub store: PathBuf,
     pub claude_bin: PathBuf,
 }
@@ -26,10 +28,16 @@ impl Paths {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .context("HOME ist nicht gesetzt")?;
-        let claude_config = env::var_os("CLAUDE_CONFIG_DIR")
+        let config_dir = env::var_os("CLAUDE_CONFIG_DIR")
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".claude"));
+            .map(PathBuf::from);
+        // Ohne CLAUDE_CONFIG_DIR liegt `.credentials.json` in `~/.claude`, `.claude.json`
+        // dagegen direkt im Home; mit gesetzter Variable liegen beide in diesem Verzeichnis.
+        let claude_json = config_dir
+            .clone()
+            .unwrap_or_else(|| home.clone())
+            .join(".claude.json");
+        let claude_config = config_dir.unwrap_or_else(|| home.join(".claude"));
         let store = env::var_os("CLAUDE_ACCOUNT_SWITCHER_HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -41,6 +49,7 @@ impl Paths {
 
         Ok(Self {
             credentials: claude_config.join(".credentials.json"),
+            claude_json,
             store,
             claude_bin,
         })
@@ -80,6 +89,14 @@ struct AuthStatus {
 }
 
 impl AuthStatus {
+    /// Claude kennt die Kontodaten zum aktiven Login. Direkt nach einem Wechsel ist das
+    /// erst wieder der Fall, sobald Claude Code einmal gelaufen ist.
+    fn has_identity(&self) -> bool {
+        self.email
+            .as_deref()
+            .is_some_and(|email| !email.trim().is_empty())
+    }
+
     fn email(&self) -> Result<&str> {
         if !self.logged_in {
             bail!("Claude Code ist nicht eingeloggt; nutze `claude-account login <name>`");
@@ -87,7 +104,7 @@ impl AuthStatus {
         self.email
             .as_deref()
             .filter(|email| !email.trim().is_empty())
-            .context("Claude meldet einen Login ohne E-Mail-Adresse")
+            .context("Claude kennt die Kontodaten zum aktiven Login noch nicht; starte einmal Claude Code")
     }
 
     fn matches(&self, profile: &Profile) -> bool {
@@ -201,14 +218,15 @@ impl App {
 
         atomic_write(&self.paths.credentials, &target_credentials, 0o600)
             .context("aktive Claude-Credentials konnten nicht ersetzt werden")?;
-        if let Err(error) = self.write_state(&State {
-            current: Some(target.name.clone()),
-        }) {
+        let switched = self.clear_cached_identity().and_then(|()| {
+            self.write_state(&State {
+                current: Some(target.name.clone()),
+            })
+        });
+        if let Err(error) = switched {
             atomic_write(&self.paths.credentials, &outgoing_credentials, 0o600)
                 .context("Rollback der aktiven Claude-Credentials ist fehlgeschlagen")?;
-            return Err(error).context(
-                "Profilstatus konnte nicht gespeichert werden; Wechsel wurde zurueckgerollt",
-            );
+            return Err(error).context("Wechsel wurde zurueckgerollt");
         }
 
         println!(
@@ -244,13 +262,19 @@ impl App {
     pub fn status(&self) -> Result<()> {
         self.ensure_no_auth_override()?;
         let status = self.auth_status()?;
-        let email = status.email()?;
-        let profile_name = self
-            .load_profiles()?
-            .into_iter()
-            .find(|profile| status.matches(profile))
-            .map(|profile| profile.name)
-            .unwrap_or_else(|| "nicht gespeichert".to_owned());
+        if !status.logged_in {
+            bail!("Claude Code ist nicht eingeloggt; nutze `claude-account login <name>`");
+        }
+        let profile = self.resolve_active_profile(&status).ok();
+        let (profile_name, profile_email) = match profile {
+            Some(profile) => (profile.name, Some(profile.email)),
+            None => ("nicht gespeichert".to_owned(), None),
+        };
+        let email = status
+            .email
+            .as_deref()
+            .or(profile_email.as_deref())
+            .unwrap_or("von Claude noch nicht geladen");
         let plan = status.subscription_type.as_deref().unwrap_or("unbekannt");
         println!("Aktiver Account: {email}");
         println!("Profil: {profile_name}");
@@ -323,13 +347,13 @@ impl App {
             .and_then(|()| self.auth_status());
         match live {
             Ok(status) if !status.logged_in => "nicht eingeloggt".to_owned(),
-            Ok(status) => match status.email() {
-                Ok(email) => profiles
-                    .iter()
-                    .find(|profile| status.matches(profile))
-                    .map(|profile| format!("{} ({})", profile.name, profile.email))
-                    .unwrap_or_else(|| format!("{email} (nicht gespeichert)")),
-                Err(_) => "nicht ermittelbar".to_owned(),
+            Ok(status) => match self.resolve_active_profile(&status) {
+                Ok(profile) => format!("{} ({})", profile.name, profile.email),
+                Err(_) => status
+                    .email
+                    .as_deref()
+                    .map(|email| format!("{email} (nicht gespeichert)"))
+                    .unwrap_or_else(|| "nicht ermittelbar".to_owned()),
             },
             Err(_) => fallback
                 .and_then(|name| profiles.iter().find(|profile| profile.name == name))
@@ -442,26 +466,95 @@ impl App {
         status: &AuthStatus,
         credentials: &[u8],
     ) -> Result<Profile> {
-        let matches: Vec<Profile> = self
-            .load_profiles()?
-            .into_iter()
-            .filter(|profile| status.matches(profile))
-            .collect();
-        let profile = match matches.as_slice() {
-            [profile] => profile.clone(),
-            [] => {
-                let email = status.email()?;
-                bail!(
-                    "aktiver Login {email} ist nicht gespeichert; zuerst `claude-account save <name>` ausfuehren"
-                );
-            }
-            _ => bail!("aktiver Login passt zu mehreren Profilen; doppelte Profile bereinigen"),
-        };
+        let profile = self.resolve_active_profile(status)?;
         atomic_write(&self.profile_credentials(&profile.name), credentials, 0o600)?;
         self.write_state(&State {
             current: Some(profile.name.clone()),
         })?;
         Ok(profile)
+    }
+
+    /// Ermittelt, zu welchem Profil der gerade aktive Login gehoert.
+    ///
+    /// Claude meldet die Identitaet aus seinem Cache in `.claude.json`. Direkt nach einem
+    /// Wechsel ist dieser Cache absichtlich leer, bis Claude Code einmal lief; dann ist der
+    /// zuletzt gesetzte Account die einzige verlaessliche Quelle.
+    fn resolve_active_profile(&self, status: &AuthStatus) -> Result<Profile> {
+        if !status.logged_in {
+            bail!("Claude Code ist nicht eingeloggt; nutze `claude-account login <name>`");
+        }
+        let profiles = self.load_profiles()?;
+        if status.has_identity() {
+            let matches: Vec<Profile> = profiles
+                .into_iter()
+                .filter(|profile| status.matches(profile))
+                .collect();
+            return match matches.as_slice() {
+                [profile] => Ok(profile.clone()),
+                [] => {
+                    let email = status.email()?;
+                    bail!(
+                        "aktiver Login {email} ist nicht gespeichert; zuerst `claude-account save <name>` ausfuehren"
+                    )
+                }
+                _ => bail!("aktiver Login passt zu mehreren Profilen; doppelte Profile bereinigen"),
+            };
+        }
+        let current = self.load_state()?.current.context(
+            "aktiver Login ist keinem Profil zuzuordnen; starte einmal Claude Code oder speichere ihn mit `claude-account save <name>`",
+        )?;
+        profiles
+            .into_iter()
+            .find(|profile| profile.name == current)
+            .with_context(|| format!("zuletzt aktives Profil `{current}` existiert nicht mehr"))
+    }
+
+    /// Entfernt Claude Codes Identitaets-Cache aus `.claude.json`.
+    ///
+    /// `.credentials.json` enthaelt nur Tokens, keine Kontodaten. Bleibt der Cache nach einem
+    /// Credential-Tausch auf dem alten Konto stehen, meldet Claude Code `Login expired`, und der
+    /// Switcher wuerde die Tokens des neuen Kontos in das alte Profil zurueckschreiben. Ohne die
+    /// Felder laedt Claude Code beide beim naechsten Start selbst neu.
+    fn clear_cached_identity(&self) -> Result<()> {
+        let path = &self.paths.claude_json;
+        let data = match fs::read(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Claude-Konfiguration konnte nicht gelesen werden: {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+        let mut value: Value = serde_json::from_slice(&data).with_context(|| {
+            format!(
+                "Claude-Konfiguration ist kein gueltiges JSON: {}",
+                path.display()
+            )
+        })?;
+        let object = value.as_object_mut().with_context(|| {
+            format!(
+                "Claude-Konfiguration ist kein JSON-Objekt: {}",
+                path.display()
+            )
+        })?;
+        let mut changed = false;
+        for field in ["oauthAccount", "userID"] {
+            changed |= object.remove(field).is_some();
+        }
+        if !changed {
+            return Ok(());
+        }
+        let payload = serde_json::to_vec(&value)?;
+        atomic_write_into_existing_dir(path, &payload, 0o600).with_context(|| {
+            format!(
+                "Identitaets-Cache konnte nicht geleert werden: {}",
+                path.display()
+            )
+        })
     }
 
     fn auth_status(&self) -> Result<AuthStatus> {
@@ -717,6 +810,15 @@ fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         .parent()
         .with_context(|| format!("ungueltiger Zielpfad: {}", path.display()))?;
     create_private_dir(parent)?;
+    atomic_write_into_existing_dir(path, data, mode)
+}
+
+/// Wie `atomic_write`, ohne das Zielverzeichnis anzulegen oder dessen Rechte zu aendern.
+/// Fuer Pfade wie `~/.claude.json`, deren Verzeichnis nicht dem Switcher gehoert.
+fn atomic_write_into_existing_dir(path: &Path, data: &[u8], mode: u32) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("ungueltiger Zielpfad: {}", path.display()))?;
     let stamp = unix_timestamp()?;
     let mut temporary = None;
     for attempt in 0..100_u32 {
