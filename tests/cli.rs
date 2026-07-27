@@ -318,6 +318,43 @@ fn switch_without_a_known_identity_syncs_the_last_active_profile() {
 }
 
 #[test]
+fn switch_refuses_to_sync_when_claude_reports_a_stale_identity() {
+    let harness = Harness::new();
+    harness.set_active("personal@example.test", "access-p", "refresh-p");
+    assert_success(&harness.run(&["save", "personal"]));
+    harness.set_active("work@example.test", "access-w", "refresh-w");
+    assert_success(&harness.run(&["save", "work"]));
+
+    // Aktiv sind die work-Tokens, Claude meldet aber noch personal - so sieht ein
+    // Identitaets-Cache aus, den eine laufende Session zurueckgeschrieben hat.
+    write_status(&harness.status, "personal@example.test");
+    let personal_before = fs::read(harness.saved_credentials("personal")).expect("personal");
+    let work_before = fs::read(harness.saved_credentials("work")).expect("work");
+    let active_before = fs::read(harness.active_credentials()).expect("active");
+
+    let output = harness.run(&["switch", "personal"]);
+
+    assert!(
+        !output.status.success(),
+        "stale Identitaet darf keinen Sync ausloesen: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fs::read(harness.saved_credentials("personal")).expect("personal"),
+        personal_before,
+        "fremde Tokens duerfen nicht in ein Profil geschrieben werden"
+    );
+    assert_eq!(
+        fs::read(harness.saved_credentials("work")).expect("work"),
+        work_before
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        active_before
+    );
+}
+
+#[test]
 fn switch_refuses_to_discard_an_unsaved_active_login() {
     let harness = Harness::new();
     harness.set_active(

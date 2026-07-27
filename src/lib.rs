@@ -265,10 +265,13 @@ impl App {
         if !status.logged_in {
             bail!("Claude Code ist nicht eingeloggt; nutze `claude-account login <name>`");
         }
-        let profile = self.resolve_active_profile(&status).ok();
-        let (profile_name, profile_email) = match profile {
-            Some(profile) => (profile.name, Some(profile.email)),
-            None => ("nicht gespeichert".to_owned(), None),
+        let (profile_name, profile_email, hint) = match self.resolve_active_profile(&status) {
+            Ok(profile) => (profile.name, Some(profile.email), None),
+            Err(error) => (
+                "nicht zuzuordnen".to_owned(),
+                None,
+                Some(format!("{error:#}")),
+            ),
         };
         let email = status
             .email
@@ -281,6 +284,9 @@ impl App {
         println!("Abo: {plan}");
         if let Some(org_name) = status.org_name.as_deref() {
             println!("Organisation: {org_name}");
+        }
+        if let Some(hint) = hint {
+            println!("Hinweis: {hint}");
         }
         Ok(())
     }
@@ -476,37 +482,55 @@ impl App {
 
     /// Ermittelt, zu welchem Profil der gerade aktive Login gehoert.
     ///
-    /// Claude meldet die Identitaet aus seinem Cache in `.claude.json`. Direkt nach einem
-    /// Wechsel ist dieser Cache absichtlich leer, bis Claude Code einmal lief; dann ist der
-    /// zuletzt gesetzte Account die einzige verlaessliche Quelle.
+    /// Es gibt zwei Quellen: Claudes Identitaets-Cache in `.claude.json` und den zuletzt vom
+    /// Switcher gesetzten Account. Der Cache ist direkt nach einem Wechsel absichtlich leer und
+    /// kann von einer laufenden Claude-Session mit veralteten Kontodaten neu geschrieben werden.
+    /// Widersprechen sich beide Quellen, laesst sich der aktive Login nicht sicher zuordnen; dann
+    /// wird abgebrochen statt geraten, sonst landen fremde Tokens in einem Profil.
     fn resolve_active_profile(&self, status: &AuthStatus) -> Result<Profile> {
         if !status.logged_in {
             bail!("Claude Code ist nicht eingeloggt; nutze `claude-account login <name>`");
         }
         let profiles = self.load_profiles()?;
-        if status.has_identity() {
-            let matches: Vec<Profile> = profiles
+        let last_active = self.load_state()?.current;
+        if !status.has_identity() {
+            let current = last_active.context(
+                "aktiver Login ist keinem Profil zuzuordnen; starte einmal Claude Code oder speichere ihn mit `claude-account save <name>`",
+            )?;
+            return profiles
                 .into_iter()
-                .filter(|profile| status.matches(profile))
-                .collect();
-            return match matches.as_slice() {
-                [profile] => Ok(profile.clone()),
-                [] => {
-                    let email = status.email()?;
-                    bail!(
-                        "aktiver Login {email} ist nicht gespeichert; zuerst `claude-account save <name>` ausfuehren"
-                    )
-                }
-                _ => bail!("aktiver Login passt zu mehreren Profilen; doppelte Profile bereinigen"),
-            };
+                .find(|profile| profile.name == current)
+                .with_context(|| {
+                    format!("zuletzt aktives Profil `{current}` existiert nicht mehr")
+                });
         }
-        let current = self.load_state()?.current.context(
-            "aktiver Login ist keinem Profil zuzuordnen; starte einmal Claude Code oder speichere ihn mit `claude-account save <name>`",
-        )?;
-        profiles
+
+        let matches: Vec<Profile> = profiles
             .into_iter()
-            .find(|profile| profile.name == current)
-            .with_context(|| format!("zuletzt aktives Profil `{current}` existiert nicht mehr"))
+            .filter(|profile| status.matches(profile))
+            .collect();
+        let profile = match matches.as_slice() {
+            [profile] => profile.clone(),
+            [] => {
+                let email = status.email()?;
+                bail!(
+                    "aktiver Login {email} ist nicht gespeichert; zuerst `claude-account save <name>` ausfuehren"
+                )
+            }
+            _ => bail!("aktiver Login passt zu mehreren Profilen; doppelte Profile bereinigen"),
+        };
+        if let Some(last_active) = last_active
+            && last_active != profile.name
+        {
+            bail!(
+                "Claude meldet `{}` ({}), der Switcher hat zuletzt `{last_active}` aktiviert; \
+                 beende offene Claude-Code-Sessions und starte Claude einmal neu, oder speichere \
+                 den aktiven Login mit `claude-account save <name>`",
+                profile.name,
+                profile.email
+            );
+        }
+        Ok(profile)
     }
 
     /// Entfernt Claude Codes Identitaets-Cache aus `.claude.json`.
