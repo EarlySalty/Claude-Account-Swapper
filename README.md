@@ -6,6 +6,8 @@ Speichert mehrere Claude-Code-Logins und wechselt die aktive Authentifizierung o
 
 Claude Code nutzt unter Linux genau einen aktiven OAuth-Datensatz in `~/.claude/.credentials.json`. `claude-account` sichert diesen Datensatz unter einem Profilnamen und ersetzt ihn beim Wechsel atomar. Vor jedem Wechsel wird der aktuelle Stand zurueckgesichert, damit von Claude rotierte Tokens nicht verloren gehen.
 
+Zum Login gehoeren zwei Dateien: die Tokens in `~/.claude/.credentials.json` und die Kontodaten, die Claude Code getrennt davon in `~/.claude.json` (`oauthAccount`, `userID`) zwischenspeichert. Der Switcher leert diesen Cache bei jedem Wechsel, damit Claude ihn passend zum neuen Token neu laedt. Bleibt er stehen, meldet Claude Code `Login expired · Please run /login`.
+
 - kein eigener OAuth-Flow
 - keine Passwoerter oder IMAP-Zugaenge
 - keine Proxy- oder API-Manipulation
@@ -85,6 +87,7 @@ Credential-Backups sind aktive OAuth-Geheimnisse. Nicht in Git, Cloud-Sync oder 
 
 - Aktuell ist das Tool bewusst Linux-only. macOS speichert Claude-Credentials im Keychain und braucht einen anderen Backend-Adapter.
 - Am sichersten wird zwischen zwei Prompts gewechselt, nicht waehrend eine Anfrage laeuft.
+- Eine laufende Claude-Code-Session haelt `~/.claude.json` im Speicher und schreibt sie beim Beenden komplett zurueck, samt altem Identitaets-Cache. Fuer einen sauberen Wechsel vorher alle offenen Sessions beenden.
 - Der Switcher synchronisiert den aktuellen Credential-Stand bei jedem Wechsel. Er kann jedoch keine internen OAuth-Fehler oder Refresh-Races mehrerer Claude-Prozesse beheben.
 
 Die ausfuehrliche Anleitung liegt in [`docs/index.html`](docs/index.html).

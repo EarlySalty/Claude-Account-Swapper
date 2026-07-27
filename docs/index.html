@@ -97,8 +97,13 @@ cd Claude-Account-Swapper
       <li>Der Switcher fragt <code>claude auth status</code> nach der aktiven Identitaet.</li>
       <li>Der aktuelle Inhalt von <code>~/.claude/.credentials.json</code> wird zum passenden Profil zurueckgesichert.</li>
       <li>Das Zielprofil wird validiert und ueber eine temporaere Datei atomar aktiviert.</li>
+      <li>Der Identitaets-Cache in <code>~/.claude.json</code> wird geleert; Claude Code laedt ihn beim naechsten Start passend zum neuen Token neu.</li>
       <li>Offene Claude-Code-Sessions nutzen den neuen globalen Login bei der naechsten Anfrage.</li>
     </ol>
+
+    <h2>Warum der Identitaets-Cache geleert wird</h2>
+    <p><code>.credentials.json</code> enthaelt nur Tokens, keine Kontodaten. Zu welchem Konto der Login gehoert, haelt Claude Code getrennt davon in <code>~/.claude.json</code> unter <code>oauthAccount</code> und <code>userID</code>. Wird nur die Credential-Datei getauscht, zeigt dieser Cache weiter auf das alte Konto.</p>
+    <p>Die Folgen waren <em>Login expired &middot; Please run /login</em> in Claude Code und ein Switcher, der die Tokens des neuen Kontos in das Profil des alten zurueckschrieb, weil <code>claude auth status</code> denselben veralteten Cache liest. Der Switcher entfernt darum beide Felder bei jedem Wechsel und laesst alle uebrigen Einstellungen in <code>~/.claude.json</code> unangetastet.</p>
 
     <h2>Sicherheitsmodell</h2>
     <div class="card warning">
@@ -110,6 +115,7 @@ cd Claude-Account-Swapper
 
     <h2>Grenzen</h2>
     <p>Das Tool ist absichtlich klein und aktuell Linux-only. Es loest keine serverseitigen OAuth-Fehler und keinen internen Refresh-Token-Race in mehreren Claude-Prozessen. Wechsle idealerweise zwischen zwei Prompts statt waehrend einer laufenden Anfrage.</p>
+    <p>Eine laufende Claude-Code-Session haelt <code>~/.claude.json</code> im Speicher und schreibt die Datei beim Beenden komplett zurueck &ndash; samt altem Identitaets-Cache. Fuer einen sauberen Wechsel alle offenen Sessions vorher beenden.</p>
 
     <p><a href="https://github.com/EarlySalty/Claude-Account-Swapper">Quellcode auf GitHub</a></p>
   </main>
