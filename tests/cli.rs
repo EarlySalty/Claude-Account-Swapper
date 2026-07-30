@@ -861,8 +861,9 @@ fn sync_without_identity_updates_the_last_active_profile() {
     let output = harness.run(&["sync"]);
 
     assert_success(&output);
-    let personal = String::from_utf8(fs::read(harness.saved_credentials("personal")).expect("read"))
-        .expect("utf8");
+    let personal =
+        String::from_utf8(fs::read(harness.saved_credentials("personal")).expect("read"))
+            .expect("utf8");
     assert!(personal.contains("refresh-rotated"), "{personal}");
 }
 
@@ -922,9 +923,7 @@ fn legacy_profiles_without_sync_metadata_still_load() {
 
     // Profil im alten Format, wie es vor dem Sync-Feature geschrieben wurde.
     fs::write(
-        harness
-            .store
-            .join("accounts/personal/profile.json"),
+        harness.store.join("accounts/personal/profile.json"),
         serde_json::to_vec(&json!({
             "name": "personal",
             "email": "personal@example.test",

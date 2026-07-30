@@ -301,7 +301,9 @@ impl App {
         let synced = profile
             .credentials_synced_at
             .map(|value| format_timestamp(value as i64))
-            .unwrap_or_else(|| "unbekannt (vor der automatischen Sicherung gespeichert)".to_owned());
+            .unwrap_or_else(|| {
+                "unbekannt (vor der automatischen Sicherung gespeichert)".to_owned()
+            });
 
         let expiry = match read_refresh_token_expiry(&self.profile_credentials(&profile.name)) {
             Ok(expiry) => expiry,
@@ -314,7 +316,9 @@ impl App {
 
         match expiry {
             None => {
-                lines.push(format!("Snapshot: {synced} | Refresh-Token: Ablauf unbekannt"));
+                lines.push(format!(
+                    "Snapshot: {synced} | Refresh-Token: Ablauf unbekannt"
+                ));
             }
             Some(expires_at) => {
                 lines.push(format!(
