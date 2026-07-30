@@ -1,5 +1,13 @@
 # Changelog
 
+## #6 — Ein Wechsel reißt keine laufende Sitzung mehr ab
+
+Offene Claude-Sitzungen und IDE-Integrationen übernehmen den Account beim nächsten Befehl von selbst — auch mitten in der Arbeit. Genau deshalb traf ein Wechsel auf einen verbrauchten Zugang alle auf einmal: überall stand plötzlich „401 OAuth access token has expired".
+
+Muss ein gespeicherter Zugang vor dem Wechsel erst verlängert werden, wird er jetzt vorher abseits ausprobiert. Trägt er, wird der dabei erneuerte Stand aktiv; trägt er nicht, bricht der Wechsel ab und der bisherige Account läuft unbeschadet weiter. Ein Zugang, der ohnehin noch gilt, wechselt unverändert sofort.
+
+Die Übersicht behauptet außerdem keine Gültigkeit mehr, die es nicht gibt: ein Account, dessen Verlängerung nachweislich scheiterte, wird als „braucht einen neuen Login" geführt.
+
 ## #5 — Ungenutzte Accounts bleiben nutzbar
 
 Ein gespeicherter Zugang verfällt rund 30 Tage nachdem er zuletzt benutzt wurde. Ein Account, den man einen Monat lang liegen ließ, war danach nur noch über einen neuen Anmeldevorgang zu retten — auch wenn sein gespeicherter Stand tagesaktuell war.

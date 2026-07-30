@@ -14,6 +14,10 @@ Zum Login gehoeren zwei Dateien: die Tokens in `~/.claude/.credentials.json` und
 - Credentials bleiben lokal und werden nie ausgegeben
 - offene Claude-Code-Sessions verwenden den global aktiven Login bei ihrer naechsten Anfrage, wie nach `claude auth login`
 
+Diese Sofortwirkung ist die Staerke des Wechsels und zugleich seine einzige echte Gefahr: gemessen an einer laufenden Session liest Claude Code `.credentials.json` bei **jedem** Request neu. Ein verbrauchter Snapshot wuerde deshalb nicht nur den Wechsel scheitern lassen, sondern jede offene Session und jede IDE-Integration im selben Moment in `401 OAuth access token has expired` reissen.
+
+Deshalb wird ein Snapshot, der vor dem Einsetzen erst verlaengert werden muesste, zuerst in einem eigenen Konfigurationsverzeichnis ausprobiert — dort trifft ein Fehlschlag niemanden. Traegt er, wandert der dabei rotierte Stand live und zugleich ins Profil. Traegt er nicht, bricht der Wechsel ab und der aktive Account laeuft unveraendert weiter. Ein Snapshot mit noch gueltigem Access-Token braucht diese Pruefung nicht und wechselt unveraendert sofort; `claude-account switch <name> --no-check` erzwingt den ungeprueften Tausch.
+
 ## Installation
 
 Voraussetzungen: Linux, Rust 1.88 oder neuer und die offizielle Claude-Code-CLI.
@@ -66,7 +70,7 @@ Ohne Argument öffnet `claude-account` dasselbe Hauptmenü wie der Desktop-Start
 | --- | --- |
 | `claude-account save <name>` | Speichert den aktuell autorisierten Login. |
 | `claude-account login <name>` | Startet einmal `claude auth login --claudeai` und speichert den neuen Login. |
-| `claude-account switch <name>` | Wechselt atomar zum gespeicherten Account. Alias: `use`. |
+| `claude-account switch <name>` | Wechselt atomar zum gespeicherten Account, nachdem der gespeicherte Login geprueft wurde. `--no-check` ueberspringt die Pruefung. Alias: `use`. |
 | `claude-account list` | Zeigt alle Profile, den letzten Sicherungsstand und den Token-Ablauf. |
 | `claude-account status` | Zeigt den von Claude bestaetigten aktiven Account. |
 | `claude-account sync` | Sichert von Claude rotierte Tokens einmalig ins aktive Profil. |
