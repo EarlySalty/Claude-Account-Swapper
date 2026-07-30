@@ -22,7 +22,12 @@ enum AccountCommand {
     Login { name: String },
     /// Zu einem gespeicherten Account wechseln
     #[command(alias = "use")]
-    Switch { name: String },
+    Switch {
+        name: String,
+        /// Gespeicherten Login nicht vorher ausprobieren
+        #[arg(long)]
+        no_check: bool,
+    },
     /// Gespeicherte Accounts anzeigen
     List,
     /// Aktiven Claude-Login anzeigen
@@ -55,7 +60,7 @@ fn run() -> Result<()> {
     match cli.command {
         Some(AccountCommand::Save { name }) => app.save(&name),
         Some(AccountCommand::Login { name }) => app.login(&name),
-        Some(AccountCommand::Switch { name }) => app.switch(&name),
+        Some(AccountCommand::Switch { name, no_check }) => app.switch_checked(&name, !no_check),
         Some(AccountCommand::List) => app.list(),
         Some(AccountCommand::Status) => app.status(),
         Some(AccountCommand::Sync) => app.sync().map(|outcome| println!("{outcome}")),
