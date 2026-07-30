@@ -86,8 +86,10 @@ cd Claude-Account-Swapper
         <tr><td><code>save &lt;name&gt;</code></td><td>Speichert den aktuell autorisierten Login.</td></tr>
         <tr><td><code>login &lt;name&gt;</code></td><td>Fuehrt einmal den offiziellen Claude-Login aus und speichert ihn.</td></tr>
         <tr><td><code>switch &lt;name&gt;</code></td><td>Wechselt zum gespeicherten Account. <code>use</code> ist ein Alias.</td></tr>
-        <tr><td><code>list</code></td><td>Listet Profile und markiert den aktiven Account.</td></tr>
+        <tr><td><code>list</code></td><td>Listet Profile, letzten Sicherungsstand und Token-Ablauf.</td></tr>
         <tr><td><code>status</code></td><td>Fragt Claude nach dem tatsaechlich aktiven Login.</td></tr>
+        <tr><td><code>sync</code></td><td>Sichert von Claude verlaengerte Tokens einmalig ins aktive Profil.</td></tr>
+        <tr><td><code>watch</code></td><td>Macht dasselbe dauerhaft. <code>--interval &lt;sekunden&gt;</code>, Standard 5.</td></tr>
         <tr><td><code>claude-account</code></td><td>Öffnet dasselbe Hauptmenü wie der Desktop-Starter.</td></tr>
       </tbody>
     </table>
@@ -105,6 +107,34 @@ cd Claude-Account-Swapper
     <p><code>.credentials.json</code> enthaelt nur Tokens, keine Kontodaten. Zu welchem Konto der Login gehoert, haelt Claude Code getrennt davon in <code>~/.claude.json</code> unter <code>oauthAccount</code> und <code>userID</code>. Wird nur die Credential-Datei getauscht, zeigt dieser Cache weiter auf das alte Konto.</p>
     <p>Die Folgen waren <em>Login expired &middot; Please run /login</em> in Claude Code und ein Switcher, der die Tokens des neuen Kontos in das Profil des alten zurueckschrieb, weil <code>claude auth status</code> denselben veralteten Cache liest. Der Switcher entfernt darum beide Felder bei jedem Wechsel und laesst alle uebrigen Einstellungen in <code>~/.claude.json</code> unangetastet.</p>
 
+    <h2>Warum Accounts ohne Hintergrunddienst ablaufen</h2>
+    <p>Claude Code verlaengert seinen Login selbststaendig und tauscht dabei den Refresh-Token gegen einen neuen. Der alte ist danach verbraucht. Der Switcher hat den Profil-Snapshot frueher nur bei <code>save</code>, <code>switch</code> und <code>login</code> geschrieben &ndash; jede Verlaengerung dazwischen fehlte im Profil.</p>
+    <p>Beim Wechsel zurueck landete dann der verbrauchte Token wieder in <code>~/.claude/.credentials.json</code>, und Claude Code meldete <em>Login expired &middot; Please run /login</em>. Der Wechsel selbst funktionierte dabei die ganze Zeit; veraltet war der gespeicherte Stand.</p>
+    <p>Der Dienst <code>claude-account watch</code> beobachtet die aktive Credential-Datei und schreibt jede Verlaengerung sofort in das Profil, zu dem sie gehoert.</p>
+
+    <h3>Einrichten</h3>
+    <p><code>./install.sh</code> richtet den Dienst mit ein und startet ihn. Manuell:</p>
+    <pre><code>mkdir -p ~/.config/systemd/user
+sed "s|__BINARY__|$HOME/.cargo/bin/claude-account|" \
+  systemd/claude-account-sync.service &gt;~/.config/systemd/user/claude-account-sync.service
+systemctl --user daemon-reload
+systemctl --user enable --now claude-account-sync.service</code></pre>
+
+    <h3>Pruefen</h3>
+    <pre><code>systemctl --user status claude-account-sync.service
+journalctl --user -u claude-account-sync.service -n 20
+claude-account list</code></pre>
+    <p>Das Journal enthaelt eine Zeile pro Entscheidung, auch fuer die folgenlosen:</p>
+    <pre><code>[2026-07-30 11:02:14] Beobachte /home/du/.claude/.credentials.json alle 5s
+[2026-07-30 11:02:14] Bereits aktuell: privat
+[2026-07-30 18:41:53] Aktualisiert: privat (du@example.com)
+[2026-07-30 18:42:03] Uebersprungen: Switcher wird gerade benutzt</code></pre>
+    <p>Meldet der Dienst dauerhaft <code>ist nicht gespeichert</code> oder <code>passt zu mehreren Profilen</code>, gehoert der aktive Login zu keinem eindeutigen Profil. Dann einmal <code>claude-account save &lt;name&gt;</code> ausfuehren.</p>
+
+    <h3>Was der Dienst nicht tut</h3>
+    <p>Er schreibt nie in ein Profil, dessen Zuordnung unklar ist. Widersprechen sich Claudes Identitaets-Cache und der zuletzt vom Switcher gesetzte Account, bleibt alles unveraendert und der Grund steht im Journal &ndash; lieber ein nicht gesicherter Stand als fremde Tokens im falschen Profil.</p>
+    <p>Ausschalten mit <code>systemctl --user disable --now claude-account-sync.service</code>. Ohne den Dienst bleibt der manuelle Weg <code>claude-account sync</code> nach jeder laengeren Sitzung.</p>
+
     <h2>Sicherheitsmodell</h2>
     <div class="card warning">
       <strong>Die gespeicherten Dateien sind aktive OAuth-Geheimnisse.</strong>
@@ -116,6 +146,7 @@ cd Claude-Account-Swapper
     <h2>Grenzen</h2>
     <p>Das Tool ist absichtlich klein und aktuell Linux-only. Es loest keine serverseitigen OAuth-Fehler und keinen internen Refresh-Token-Race in mehreren Claude-Prozessen. Wechsle idealerweise zwischen zwei Prompts statt waehrend einer laufenden Anfrage.</p>
     <p>Eine laufende Claude-Code-Session haelt <code>~/.claude.json</code> im Speicher und schreibt die Datei beim Beenden komplett zurueck &ndash; samt altem Identitaets-Cache. Fuer einen sauberen Wechsel alle offenen Sessions vorher beenden.</p>
+    <p>Der Refresh-Token laeuft nach etwa 30 Tagen ohne Nutzung ab. Ein Profil, das so lange nicht aktiv war, braucht einen neuen Browser-Login; <code>claude-account list</code> warnt eine Woche vorher.</p>
 
     <p><a href="https://github.com/EarlySalty/Claude-Account-Swapper">Quellcode auf GitHub</a></p>
   </main>
