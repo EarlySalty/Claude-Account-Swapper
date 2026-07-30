@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Warum Claude-Logins ablaufen - Claude Account Swapper</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #11100e;
+      --surface: #1d1a16;
+      --border: #3c3429;
+      --text: #f2eadf;
+      --muted: #b8aa98;
+      --accent: #d29b67;
+      --code: #171411;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top right, #2a2018 0, var(--background) 38rem);
+      color: var(--text);
+      font: 17px/1.65 ui-sans-serif, system-ui, sans-serif;
+    }
+    main { width: min(860px, calc(100% - 32px)); margin: 0 auto; padding: 72px 0 96px; }
+    h1, h2 { line-height: 1.15; }
+    h1 { max-width: 720px; margin: 0; font-size: clamp(2.1rem, 6vw, 3.6rem); letter-spacing: -0.045em; }
+    h2 { margin-top: 3rem; color: var(--accent); }
+    h3 { margin-top: 2rem; }
+    .lead { max-width: 680px; margin: 24px 0 40px; color: var(--muted); font-size: 1.2rem; }
+    .card { padding: 24px; border: 1px solid var(--border); border-radius: 14px; background: color-mix(in srgb, var(--surface) 94%, transparent); }
+    code { padding: 0.12rem 0.38rem; border-radius: 5px; background: var(--code); color: #f6c895; }
+    pre { overflow-x: auto; padding: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--code); }
+    pre code { padding: 0; background: transparent; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 12px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { color: var(--muted); }
+    .warning { border-left: 4px solid var(--accent); }
+    a { color: var(--accent); }
+    @media (max-width: 680px) {
+      main { padding-top: 40px; }
+      table, tbody, tr, td { display: block; }
+      thead { display: none; }
+      td { padding: 8px 0; }
+      td:last-child { padding-bottom: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <p><a href="index.html">&larr; Anleitung</a></p>
+    <h1>Warum Claude-Logins ablaufen</h1>
+    <p class="lead">Gemessen an einer laufenden Installation, nicht aus der Dokumentation abgeleitet. Diese Seite haelt fest, wie Claude Code seinen Login verwaltet, wodurch gespeicherte Accounts sterben und welche Gegenmassnahme jeweils greift.</p>
+
+    <h2>Woraus ein Login besteht</h2>
+    <table>
+      <thead><tr><th>Bestandteil</th><th>Ort</th><th>Lebensdauer</th></tr></thead>
+      <tbody>
+        <tr><td>Access-Token</td><td><code>~/.claude/.credentials.json</code></td><td>rund 8 Stunden</td></tr>
+        <tr><td>Refresh-Token</td><td>dieselbe Datei</td><td>rund 30 Tage ab der letzten Nutzung</td></tr>
+        <tr><td>Kontodaten</td><td><code>~/.claude.json</code>, Felder <code>oauthAccount</code> und <code>userID</code></td><td>Cache, wird nachgeladen</td></tr>
+      </tbody>
+    </table>
+    <p>Die Credential-Datei enthaelt nur Tokens, keinerlei Hinweis darauf, zu welchem Konto sie gehoeren. Diese Zuordnung steht ausschliesslich im Cache der zweiten Datei &ndash; deshalb muss ein Wechsel beide anfassen.</p>
+
+    <h2>Der Refresh-Token rotiert</h2>
+    <p>Verlaengert Claude Code den Login, bekommt es nicht nur einen neuen Access-Token, sondern auch einen <strong>neuen Refresh-Token</strong>. Der alte ist ab diesem Moment tot. Beobachtet an einem Wechsel um 10:47:02: unmittelbar danach wechselte der Refresh-Token in der aktiven Datei, waehrend der gespeicherte Profil-Snapshot noch auf dem Stand von 02:25 stand &ndash; und damit auf einem verbrauchten Token.</p>
+    <div class="card warning">
+      <strong>Daraus folgt die wichtigste Regel des Switchers:</strong>
+      <p>Ein Profil-Snapshot ist nur so lange gueltig, wie sein Token seit dem Speichern nicht benutzt wurde. Jede Verlaengerung, die nicht ins Profil zurueckgeschrieben wird, macht den gespeicherten Stand wertlos.</p>
+    </div>
+
+    <h2>Die zwei Arten zu sterben</h2>
+    <h3>1. Der Snapshot verpasst eine Verlaengerung</h3>
+    <p>Frueher schrieb der Switcher den Snapshot nur bei <code>save</code>, <code>switch</code> und <code>login</code>. Alles, was Claude Code dazwischen verlaengerte, fehlte im Profil. Beim Wechsel zurueck landete der verbrauchte Token wieder in der aktiven Datei, und Claude Code meldete <em>Login expired &middot; Please run /login</em>.</p>
+    <p><strong>Gegenmassnahme:</strong> <code>claude-account watch</code> beobachtet die aktive Datei und schreibt jede Verlaengerung sofort ins zugehoerige Profil.</p>
+
+    <h3>2. Der Refresh-Token laeuft ab</h3>
+    <p>Auch ein perfekt gepflegter Snapshot stirbt, wenn das Profil rund 30 Tage nicht benutzt wird. Danach hilft nur ein neuer Browser-Login.</p>
+    <p><strong>Gegenmassnahme:</strong> <code>claude-account keepalive</code> benutzt faellige Profile, bevor es zu spaet ist &ndash; siehe unten.</p>
+
+    <h2>Auffrischen ohne Account-Wechsel</h2>
+    <p>Der Trick ist <code>CLAUDE_CONFIG_DIR</code>: die Variable verschiebt <em>beide</em> Login-Dateien in ein beliebiges Verzeichnis. Damit laesst sich ein zweiter, vollstaendig getrennter Login betreiben, ohne den global aktiven anzufassen.</p>
+    <ol>
+      <li>Ein privates Arbeitsverzeichnis anlegen und den Profil-Snapshot als <code>.credentials.json</code> hineinlegen.</li>
+      <li>Die echte Claude-CLI mit <code>CLAUDE_CONFIG_DIR</code> auf dieses Verzeichnis zeigen lassen und einen minimalen Request abschicken.</li>
+      <li>Claude Code erneuert den Login dabei selbst und schreibt die neuen Tokens in dieses Verzeichnis.</li>
+      <li>Das Ergebnis zurueck ins Profil, danach das Arbeitsverzeichnis restlos loeschen.</li>
+    </ol>
+    <p>Vor dem Schreiben prueft der Switcher zusaetzlich, dass sich die global aktive Datei waehrenddessen nicht veraendert hat. Tut sie es doch, wird nichts uebernommen.</p>
+
+    <h3>Warum kein eigener OAuth-Aufruf</h3>
+    <p>Der Token-Endpunkt ist <code>https://platform.claude.com/v1/oauth/token</code>. Ein direkter Aufruf von dort ist trotzdem der falsche Weg: generische HTTP-Clients beantwortet Cloudflare mit <code>Error 1010: browser_signature_banned</code>. Die offizielle CLI zu benutzen ist nicht nur robuster gegen solche Sperren, sondern haelt auch den Token-Austausch dort, wo er hingehoert &ndash; ohne nachgebaute Client-ID und ohne eigene Fehlerbehandlung fuer einen fremden Flow.</p>
+
+    <h3><code>auth status</code> verlaengert nichts</h3>
+    <p>Naheliegend, aber falsch: <code>claude auth status</code> liest die Datei nur und meldet <code>loggedIn: true</code>, selbst wenn der Access-Token laengst abgelaufen ist. Es findet kein Netzwerkzugriff statt. Nur ein echter Request loest eine Verlaengerung aus &ndash; deshalb schickt die Auffrischung einen minimalen Prompt.</p>
+
+    <h2>Was bei einem gescheiterten Refresh passiert</h2>
+    <p>Ist der Refresh-Token verbraucht oder abgelaufen, meldet Claude Code <code>Failed to authenticate: OAuth session expired and could not be refreshed</code> &ndash; und <strong>leert die Credential-Datei</strong>: leerer Access-Token, leerer Refresh-Token, <code>expiresAt: 0</code>.</p>
+    <div class="card warning">
+      <strong>Ein leerer Stand darf niemals einen gespeicherten ueberschreiben.</strong>
+      <p>Sonst zerstoert genau der Mechanismus, der Accounts retten soll, den letzten brauchbaren Snapshot. Sowohl die laufende Sicherung als auch die Auffrischung pruefen deshalb vor jedem Schreiben, dass ein vollstaendiger Login dasteht.</p>
+    </div>
+
+    <h2>Mehrere Sessions teilen eine Datei</h2>
+    <p>Alle gleichzeitig laufenden Claude-Code-Prozesse benutzen dieselbe <code>~/.claude/.credentials.json</code>. Verlaengert eine Session ihren Login, sehen das alle anderen. Laeuft eine Session mit Konto A noch, waehrend der Switcher auf B gewechselt hat, kann sie die Datei mit A-Tokens ueberschreiben.</p>
+    <p>Deshalb ordnet der Hintergrunddienst nur zu, was Claude Code selbst bestaetigt. Ist der Identitaets-Cache leer &ndash; der Zustand direkt nach einem Wechsel &ndash; wartet er, statt auf den Switcher-Status zurueckzufallen. Verloren geht dabei nichts: sobald Claude die Kontodaten kennt, wird der dann aktuelle Stand gesichert.</p>
+
+    <h2>Wie geschrieben wird</h2>
+    <p>Claude Code schreibt die Credential-Datei ueber eine temporaere Datei und <code>rename</code>. Zwei Konsequenzen:</p>
+    <ul>
+      <li>Ein Symlink von <code>~/.claude/.credentials.json</code> auf eine Profildatei funktioniert nicht &ndash; der erste Schreibvorgang ersetzt ihn durch eine echte Datei.</li>
+      <li>Zur Aenderungserkennung gehoert die Inode-Nummer. Zeitstempel und Groesse allein wuerden einen Tausch mit identischen Werten uebersehen.</li>
+    </ul>
+
+    <h2>Zusammenfassung der Gegenmassnahmen</h2>
+    <table>
+      <thead><tr><th>Problem</th><th>Was hilft</th></tr></thead>
+      <tbody>
+        <tr><td>Verlaengerung landet nicht im Profil</td><td><code>watch</code> sichert sie sofort</td></tr>
+        <tr><td>Profil laenger als 30 Tage untaetig</td><td><code>keepalive</code> benutzt es alle 7 Tage</td></tr>
+        <tr><td>Fremde Session ueberschreibt die aktive Datei</td><td>Zuordnung nur mit bestaetigter Identitaet, sonst warten</td></tr>
+        <tr><td>Gescheiterter Refresh leert die Datei</td><td>unvollstaendige Logins werden nie gespeichert</td></tr>
+        <tr><td>Kontodaten zeigen aufs alte Konto</td><td>Wechsel leert den Identitaets-Cache</td></tr>
+        <tr><td>Snapshot schon vor der Sicherung verbrannt</td><td>nicht heilbar &ndash; neuer Browser-Login</td></tr>
+      </tbody>
+    </table>
+
+    <p style="margin-top:3rem"><a href="index.html">Zurueck zur Anleitung</a> &middot; <a href="https://github.com/EarlySalty/Claude-Account-Swapper">Quellcode auf GitHub</a></p>
+  </main>
+</body>
+</html>

@@ -1,5 +1,11 @@
 # Changelog
 
+## #5 — Ungenutzte Accounts bleiben nutzbar
+
+Ein gespeicherter Zugang verfällt rund 30 Tage nachdem er zuletzt benutzt wurde. Ein Account, den man einen Monat lang liegen ließ, war danach nur noch über einen neuen Anmeldevorgang zu retten — auch wenn sein gespeicherter Stand tagesaktuell war.
+
+Der Hintergrunddienst benutzt jetzt jeden Account, der länger als eine Woche nicht dran war, einmal ganz kurz und verlängert ihn dabei. Der gerade angemeldete Account bleibt davon unberührt. Ist ein Zugang bereits verfallen, wird er nicht angefasst, sondern gemeldet.
+
 ## #4 — Gespeicherte Accounts laufen nicht mehr ab
 
 Claude Code tauscht den gespeicherten Zugang bei jeder Verlängerung gegen einen neuen aus. Der Switcher hat den Stand eines Accounts aber nur beim Speichern und beim Wechseln gesichert — dazwischen wurde der abgelegte Stand wertlos, und ein späterer Wechsel zurück endete in „Login expired".

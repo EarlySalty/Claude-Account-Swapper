@@ -70,12 +70,15 @@ Ohne Argument öffnet `claude-account` dasselbe Hauptmenü wie der Desktop-Start
 | `claude-account list` | Zeigt alle Profile, den letzten Sicherungsstand und den Token-Ablauf. |
 | `claude-account status` | Zeigt den von Claude bestaetigten aktiven Account. |
 | `claude-account sync` | Sichert von Claude rotierte Tokens einmalig ins aktive Profil. |
-| `claude-account watch` | Macht dasselbe dauerhaft; laeuft als Hintergrunddienst. `--interval <sekunden>`, Standard 5. |
+| `claude-account watch` | Macht dasselbe dauerhaft und frischt untaetige Profile auf; laeuft als Hintergrunddienst. `--interval <sekunden>`, Standard 5. |
+| `claude-account keepalive` | Benutzt untaetige Profile, damit ihr Login nicht abläuft. `--max-age-days <tage>`, Standard 7. |
 | `claude-account` | Öffnet das vollständige Hauptmenü. |
 
 Profilnamen duerfen Buchstaben, Zahlen, `.`, `-` und `_` enthalten.
 
 ## Warum Accounts ohne Hintergrunddienst „ablaufen"
+
+Die vollständige Analyse mit allen gemessenen Details steht in [`docs/lebensdauer.html`](docs/lebensdauer.html) — inklusive Token-Lebensdauern, Verhalten bei gescheitertem Refresh und dem Zusammenspiel mehrerer paralleler Sessions. Kurzfassung:
 
 Claude Code verlaengert seinen Login selbststaendig und tauscht dabei den Refresh-Token gegen einen neuen aus. Der alte ist danach verbraucht. Der Switcher hat den Profil-Snapshot frueher nur bei `save`, `switch` und `login` geschrieben — jede Verlaengerung dazwischen fehlte im Profil. Beim naechsten Wechsel zurueck landete der verbrauchte Token wieder in `~/.claude/.credentials.json`, und Claude Code meldete `Login expired · Please run /login`. Der Wechsel selbst funktionierte dabei die ganze Zeit; kaputt war der gespeicherte Stand.
 
@@ -112,6 +115,21 @@ Das Journal enthaelt eine Zeile pro Entscheidung, auch fuer die folgenlosen:
 
 Eine Ablehnung wird ebenso protokolliert wie ein Erfolg. Meldet der Dienst dauerhaft `ist nicht gespeichert` oder `passt zu mehreren Profilen`, gehoert der aktive Login zu keinem eindeutigen Profil — dann einmal `claude-account save <name>` ausfuehren.
 
+### Untaetige Profile am Leben halten
+
+Ein Snapshot kann perfekt gepflegt und trotzdem wertlos sein: der Refresh-Token laeuft rund 30 Tage nach seiner letzten Nutzung ab. Dagegen hilft nur, das Profil zu benutzen.
+
+Der Dienst frischt darum alle zwoelf Stunden jedes Profil auf, das laenger als sieben Tage nicht gesichert wurde. Es bekommt einen minimalen Request in einem eigenen `CLAUDE_CONFIG_DIR` — der aktiv eingeloggte Account bleibt unberuehrt, und vor dem Schreiben wird geprueft, dass er sich nicht veraendert hat.
+
+```text
+[2026-07-30 11:12:53] Untaetige Profile werden nach 7 Tagen aufgefrischt
+[2026-07-30 11:12:53] Auffrischung uebersprungen: privat ist aktiv
+[2026-07-30 11:12:55] Aufgefrischt: arbeit (du@example.com)
+[2026-07-30 11:12:57] Abgelaufen: alt (alt@example.com) braucht einen neuen Login
+```
+
+Manuell: `claude-account keepalive`. Abschalten: `watch --no-keepalive`. Ein bereits abgelaufenes Profil wird nicht angefasst, sondern nur gemeldet — retten kann es dann nur noch `claude-account login <name>`.
+
 ### Was der Dienst nicht tut
 
 Er schreibt niemals in ein Profil, dessen Zuordnung unklar ist. Widersprechen sich Claudes Identitaets-Cache und der zuletzt vom Switcher gesetzte Account, bleibt alles unveraendert und der Grund steht im Journal. Lieber ein nicht gesicherter Stand als fremde Tokens im falschen Profil.
@@ -136,7 +154,9 @@ Credential-Backups sind aktive OAuth-Geheimnisse. Nicht in Git, Cloud-Sync oder 
 - Am sichersten wird zwischen zwei Prompts gewechselt, nicht waehrend eine Anfrage laeuft.
 - Eine laufende Claude-Code-Session haelt `~/.claude.json` im Speicher und schreibt sie beim Beenden komplett zurueck, samt altem Identitaets-Cache. Fuer einen sauberen Wechsel vorher alle offenen Sessions beenden.
 - Mit laufendem `claude-account-sync` folgt der gespeicherte Stand den Verlaengerungen von Claude. Ohne den Dienst veraltet er zwischen zwei Wechseln, und ein Rueckwechsel kann `Login expired` melden.
-- Der Refresh-Token selbst hat ein Ablaufdatum von etwa 30 Tagen. Ein Profil, das laenger nicht aktiv war, braucht einen neuen Browser-Login — `claude-account list` warnt eine Woche vorher.
+- Der Refresh-Token selbst hat ein Ablaufdatum von etwa 30 Tagen ab der letzten Nutzung. Mit laufendem Dienst wird das durch die Auffrischung abgefangen; ohne ihn braucht ein laenger untaetiges Profil einen neuen Browser-Login. `claude-account list` warnt eine Woche vorher.
+- Ein Profil, dessen Token bereits verbraucht ist, laesst sich nicht mehr retten — auch nicht durch die Auffrischung. Der Switcher meldet das, statt es zu verschleiern.
+- `claude-account login <name>` macht den neuen Account global aktiv und zieht alle laufenden Sessions mit. Danach gegebenenfalls zurueckwechseln.
 - Der Switcher kann keine internen OAuth-Fehler beheben und kein Refresh-Race mehrerer gleichzeitig laufender Claude-Prozesse aufloesen. Schreiben zwei Sessions mit verschiedenen Accounts abwechselnd in dieselbe Credential-Datei, lehnt der Dienst die Zuordnung ab, statt zu raten.
 
 Die ausfuehrliche Anleitung liegt in [`docs/index.html`](docs/index.html).
