@@ -108,6 +108,17 @@ enum RenewOutcome {
     Renewed,
     StillValid,
     Expired,
+    /// Der Request ist gescheitert und hat nichts erneuert. Das Profil bleibt unangetastet -
+    /// vor allem gilt es nicht als geprueft, sonst laeuft seine echte Frist still weiter.
+    RequestFailed(String),
+}
+
+/// Was ein Auffrischungsversuch hinterlassen hat.
+struct RenewalAttempt {
+    /// `None` heisst: Claude hat den Login geleert, er ist nicht mehr zu erneuern.
+    credentials: Option<Vec<u8>>,
+    /// Gefuellt, wenn der Aufruf selbst schiefging.
+    failure: Option<String>,
 }
 
 /// Ergebnis eines Sync-Durchlaufs. Auch der Fall "nichts zu tun" ist ein Ergebnis und
@@ -735,13 +746,9 @@ impl App {
             log_event("Auffrischung laeuft bereits");
             return Ok(());
         };
-        let (profiles, active, live) = {
+        let (profiles, active) = {
             let _lock = self.lock()?;
-            (
-                self.load_profiles()?,
-                self.load_state()?.current,
-                fs::read(&self.paths.credentials).ok(),
-            )
+            (self.load_profiles()?, self.load_state()?.current)
         };
         if profiles.is_empty() {
             log_event("Auffrischung: keine Profile gespeichert");
@@ -761,8 +768,11 @@ impl App {
             // Der Switcher-Status kann veraltet sein. Traegt ein Profil genau die Tokens, die
             // gerade live sind, wuerde die Auffrischung den Login unter einer laufenden Session
             // wegrotieren - der Byte-Vergleich ist die verlaessliche Aussage, nicht `state.json`.
+            // Beide Seiten werden pro Profil frisch gelesen: ein Durchlauf dauert lange genug,
+            // dass der Nutzer zwischendurch auf ein spaeter drankommendes Profil wechseln kann.
+            let live = fs::read(&self.paths.credentials).ok();
             let snapshot = fs::read(self.profile_credentials(&profile.name)).ok();
-            if snapshot.is_some() && snapshot.as_deref() == live.as_deref() {
+            if snapshot.is_some() && snapshot == live {
                 log_event(&format!(
                     "Auffrischung uebersprungen: {} ist der aktuell benutzte Login",
                     profile.name
@@ -794,6 +804,11 @@ impl App {
                      `claude-account login {}`",
                     profile.name, profile.email, profile.name
                 )),
+                Ok(RenewOutcome::RequestFailed(reason)) => log_problem(&format!(
+                    "Auffrischung von {} ohne Wirkung: {reason} - \
+                     naechster Versuch beim naechsten Durchlauf",
+                    profile.name
+                )),
                 Err(error) => log_problem(&format!(
                     "Auffrischung fehlgeschlagen: {} - {error:#}",
                     profile.name
@@ -819,13 +834,17 @@ impl App {
             ));
         }
 
-        let renewed = result?;
-        let credentials = match renewed {
+        let attempt = result?;
+        let credentials = match attempt.credentials {
             None => return Ok(RenewOutcome::Expired),
-            // Der Login war noch gueltig, Claude hatte nichts zu erneuern. Der Zeitpunkt wird
-            // trotzdem festgehalten, sonst bekommt dasselbe Profil alle zwoelf Stunden erneut
-            // einen Request.
+            // Unveraendert heisst: Claude hat nichts erneuert. Bei einem gescheiterten Aufruf
+            // ist das kein Gesundheitszeugnis, sondern ein Fehlschlag - das Profil darf dann
+            // nicht als geprueft gelten, sonst laeuft seine echte Frist still weiter, waehrend
+            // das Journal gruen meldet.
             Some(credentials) if credentials == snapshot => {
+                if let Some(failure) = attempt.failure {
+                    return Ok(RenewOutcome::RequestFailed(failure));
+                }
                 let _lock = self.lock()?;
                 let mut profile = profile.clone();
                 profile.credentials_synced_at = Some(unix_timestamp()?);
@@ -834,6 +853,16 @@ impl App {
             }
             Some(credentials) => credentials,
         };
+
+        // Der Aufruf ging schief, hat aber trotzdem einen neuen Login hinterlassen: Claude
+        // rotiert, bevor es antwortet. Der Vorfall gehoert ins Journal, gesichert wird er
+        // trotzdem - sonst waere der Token unwiederbringlich weg.
+        if let Some(failure) = attempt.failure {
+            log_problem(&format!(
+                "{failure}; der bereits erneuerte Login von `{}` wird trotzdem gesichert",
+                profile.name
+            ));
+        }
 
         // Ab hier gilt: der neue Token existiert nur noch hier, der alte ist serverseitig tot.
         // Was jetzt nicht gespeichert wird, ist verloren - deshalb wird ab diesem Punkt nichts
@@ -862,7 +891,7 @@ impl App {
     }
 
     /// `Ok(None)` heisst: Claude konnte den Login nicht erneuern.
-    fn renew_in_workspace(&self, workspace: &Path, snapshot: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn renew_in_workspace(&self, workspace: &Path, snapshot: &[u8]) -> Result<RenewalAttempt> {
         let credentials = workspace.join(".credentials.json");
         atomic_write(&credentials, snapshot, 0o600)?;
 
@@ -884,22 +913,19 @@ impl App {
         // rotiert den Token, bevor es antwortet. Ein Timeout oder Fehler nach diesem Punkt
         // heisst nicht, dass kein neuer Login dasteht - er waere nur unwiederbringlich weg.
         let timeout = self.keepalive_timeout();
-        match child.wait_timeout(timeout) {
-            Ok(Some(_)) => {}
+        let failure = match child.wait_timeout(timeout) {
+            Ok(Some(status)) if status.success() => None,
+            Ok(Some(status)) => Some(format!("Claude endete mit {status}")),
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                log_problem(&format!(
-                    "Claude hat nach {} Sekunden nicht geantwortet; \
-                     ein bereits erneuerter Login wird trotzdem gesichert",
+                Some(format!(
+                    "Claude hat nach {} Sekunden nicht geantwortet",
                     timeout.as_secs()
-                ));
+                ))
             }
-            Err(error) => log_problem(&format!(
-                "Claude konnte nicht abgewartet werden ({error}); \
-                 ein bereits erneuerter Login wird trotzdem gesichert"
-            )),
-        }
+            Err(error) => Some(format!("Claude konnte nicht abgewartet werden: {error}")),
+        };
 
         let renewed = fs::read(&credentials).with_context(|| {
             format!(
@@ -907,7 +933,10 @@ impl App {
                 credentials.display()
             )
         })?;
-        Ok(validate_credentials(&renewed).ok().map(|()| renewed))
+        Ok(RenewalAttempt {
+            credentials: validate_credentials(&renewed).ok().map(|()| renewed),
+            failure,
+        })
     }
 
     /// Testbar und im Notfall operativ anpassbar; der Standard reicht fuer einen Prompt samt

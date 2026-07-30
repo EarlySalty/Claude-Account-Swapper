@@ -1277,6 +1277,49 @@ fn keepalive_rescues_the_renewed_login_when_the_request_runs_into_the_timeout() 
 }
 
 #[test]
+fn keepalive_reports_a_failed_request_instead_of_calling_it_valid() {
+    let harness = Harness::new();
+    harness.set_active("idle@example.test", "access-idle", "refresh-idle");
+    assert_success(&harness.run(&["save", "idle"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    // Ein alter Sicherungszeitpunkt, wie ihn ein laenger untaetiges Profil traegt.
+    let profile_path = harness.store.join("accounts/idle/profile.json");
+    let mut profile: serde_json::Value =
+        serde_json::from_slice(&fs::read(&profile_path).expect("profile")).expect("json");
+    profile["credentials_synced_at"] = json!(1_700_000_000_u64);
+    fs::write(&profile_path, serde_json::to_vec(&profile).expect("json")).expect("write profile");
+
+    // Claude bricht ab, ohne etwas zu erneuern - Netzfehler, Rate-Limit, was auch immer.
+    // Der Snapshot ist unveraendert, aber die 30-Tage-Uhr laeuft weiter. Wer das als
+    // "noch gueltig" verbucht, laesst den Account still sterben und meldet dabei gruen.
+    let output = harness
+        .command()
+        .args(["keepalive", "--max-age-days", "0"])
+        .env("FAKE_PROMPT_EXIT", "1")
+        .output()
+        .expect("keepalive");
+
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        log.contains("idle") && !log.contains("noch gueltig"),
+        "ein gescheiterter Request darf nicht als gueltig gemeldet werden: {log}"
+    );
+    assert_eq!(
+        read_profile(&harness, "idle")
+            .get("credentials_synced_at")
+            .and_then(|value| value.as_u64()),
+        Some(1_700_000_000),
+        "nach einem Fehlschlag darf die Altersuhr nicht zurueckgesetzt werden"
+    );
+}
+
+#[test]
 fn keepalive_does_not_hunt_a_profile_that_needs_no_renewal() {
     let harness = Harness::new();
     harness.set_active("frisch@example.test", "access-frisch", "refresh-frisch");
