@@ -25,6 +25,9 @@ pub const DEFAULT_KEEPALIVE_MAX_AGE_DAYS: u64 = 7;
 const KEEPALIVE_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
 /// Ein haengender Request wuerde den Dienst sonst dauerhaft anhalten.
 const KEEPALIVE_REQUEST_TIMEOUT_SECONDS: u64 = 120;
+/// Restlaufzeit, ab der ein Access-Token vor einem Wechsel als sicher gilt. Darunter muesste
+/// Claude Code refreshen, und genau dabei kann ein verbrauchter Login auffliegen.
+const ACCESS_TOKEN_MIN_REMAINING_SECONDS: i64 = 5 * 60;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -87,6 +90,11 @@ struct Profile {
     /// Unix-Sekunden des letzten Snapshot-Schreibens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credentials_synced_at: Option<u64>,
+    /// Unix-Sekunden des letzten Versuchs, den Login zu erneuern, bei dem Claude ihn geleert hat.
+    /// Der Ablauf im Snapshot sagt darueber nichts: ein Refresh-Token kann laut Datei noch
+    /// wochenlang gelten und trotzdem verbraucht sein. Nur der gescheiterte Versuch beweist es.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    login_failed_at: Option<u64>,
 }
 
 /// Woher die Zuordnung "aktiver Login gehoert zu Profil X" stammen darf.
@@ -111,6 +119,24 @@ enum RenewOutcome {
     /// Der Request ist gescheitert und hat nichts erneuert. Das Profil bleibt unangetastet -
     /// vor allem gilt es nicht als geprueft, sonst laeuft seine echte Frist still weiter.
     RequestFailed(String),
+}
+
+/// Ergebnis einer Auffrischung samt der Credentials, die danach gelten. `RenewOutcome` sagt nur,
+/// was passiert ist; der Wechsel braucht zusaetzlich den Stand selbst, denn nach einer Rotation
+/// ist genau dieser Stand der einzig gueltige.
+enum RenewResult {
+    Renewed(Vec<u8>),
+    StillValid(Vec<u8>),
+    Expired,
+    RequestFailed(String),
+}
+
+/// Ob eine Hilfsfunktion das Switcher-Lock selbst nehmen muss oder der Aufrufer es schon haelt.
+/// Das Lock ist nicht reentrant: ein zweiter Versuch aus demselben Prozess blockiert fuer immer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Locking {
+    Acquire,
+    AlreadyHeld,
 }
 
 /// Was ein Auffrischungsversuch hinterlassen hat.
@@ -259,12 +285,24 @@ impl App {
     }
 
     pub fn switch(&self, name: &str) -> Result<()> {
+        self.switch_checked(name, true)
+    }
+
+    /// Wechselt zum gespeicherten Account.
+    ///
+    /// Jede laufende Claude-Session liest `.credentials.json` bei ihrer naechsten Anfrage neu.
+    /// Das ist der Sinn des Wechsels - und zugleich seine Gefahr: liegt dort ein verbrauchter
+    /// Login, laufen alle offenen Sessions und IDE-Integrationen sofort in `401 OAuth access
+    /// token has expired`. Ein Snapshot, dessen Access-Token noch gilt, traegt garantiert; einer,
+    /// der erst refreshen muss, kann serverseitig laengst tot sein. Genau dieser Fall wird vorher
+    /// in einem eigenen Konfigurationsverzeichnis ausprobiert, wo ein Fehlschlag niemanden trifft.
+    pub fn switch_checked(&self, name: &str, check: bool) -> Result<()> {
         validate_name(name)?;
         self.ensure_no_auth_override()?;
         let _lock = self.lock()?;
 
         let target = self.load_profile(name)?;
-        let target_credentials = read_valid_credentials(&self.profile_credentials(name))
+        let mut target_credentials = read_valid_credentials(&self.profile_credentials(name))
             .with_context(|| {
                 format!("gespeicherte Credentials fuer Profil `{name}` sind ungueltig")
             })?;
@@ -287,6 +325,18 @@ impl App {
             outgoing_credentials = latest_outgoing;
         }
 
+        // Erst hier steht fest, dass wirklich gewechselt wird. Frueher geprueft, wuerde ein
+        // `switch <aktives Profil>` den Login rotieren, der gerade live benutzt wird, und der
+        // "Bereits aktiv"-Zweig kaeme zurueck, ohne den erneuerten Stand einzusetzen - alle
+        // offenen Sessions liefen dann in genau den 401, den die Pruefung verhindern soll.
+        // Der Byte-Vergleich haelt denselben Fall auch dann ab, wenn Claudes Identitaet und
+        // der Switcher-Status auseinanderlaufen: identische Bytes heissen, der Login ist der
+        // live benutzte, und der beweist seine Gueltigkeit gerade selbst.
+        if check && target_credentials != outgoing_credentials && needs_refresh(&target_credentials)
+        {
+            target_credentials = self.verify_target_login(&target)?;
+        }
+
         atomic_write(&self.paths.credentials, &target_credentials, 0o600)
             .context("aktive Claude-Credentials konnten nicht ersetzt werden")?;
         let switched = self.clear_cached_identity().and_then(|()| {
@@ -305,6 +355,33 @@ impl App {
             outgoing.name, outgoing.email, target.name, target.email
         );
         Ok(())
+    }
+
+    /// Probiert den Login eines Profils aus, bevor er live gesetzt wird, und liefert den Stand,
+    /// der danach gilt. Ein dabei rotierter Token ist der einzig gueltige und wird zugleich im
+    /// Profil gesichert; ohne das waere er nach dem naechsten Refresh unwiederbringlich weg.
+    fn verify_target_login(&self, target: &Profile) -> Result<Vec<u8>> {
+        println!("Pruefe gespeicherten Login von {} ...", target.name);
+        match self.renew_snapshot(target, Locking::AlreadyHeld)? {
+            RenewResult::Renewed(credentials) | RenewResult::StillValid(credentials) => {
+                Ok(credentials)
+            }
+            RenewResult::Expired => bail!(
+                "der gespeicherte Login von `{}` ({}) ist verbraucht; der Wechsel wurde \
+                 abgebrochen, der aktive Account laeuft weiter. Neu anmelden mit \
+                 `claude-account login {}`",
+                target.name,
+                target.email,
+                target.name
+            ),
+            RenewResult::RequestFailed(reason) => bail!(
+                "der gespeicherte Login von `{}` liess sich nicht pruefen: {reason}. \
+                 Der Wechsel wurde abgebrochen, der aktive Account laeuft weiter; \
+                 mit `claude-account switch {} --no-check` trotzdem wechseln",
+                target.name,
+                target.name
+            ),
+        }
     }
 
     pub fn list(&self) -> Result<()> {
@@ -338,6 +415,17 @@ impl App {
     /// verschluckt - sonst faellt er erst beim naechsten Wechsel auf.
     fn snapshot_report(&self, profile: &Profile) -> Vec<String> {
         let mut lines = Vec::new();
+        // Ein gescheiterter Versuch schlaegt jeden Ablauf aus der Datei: der Refresh-Token kann
+        // dort noch wochenlang gelten und trotzdem verbraucht sein.
+        if let Some(failed_at) = profile.login_failed_at {
+            lines.push(format!(
+                "Snapshot: braucht einen neuen Login (Pruefung am {} fehlgeschlagen) - \
+                 `claude-account login {}`",
+                format_timestamp(failed_at as i64),
+                profile.name
+            ));
+            return lines;
+        }
         let synced = profile
             .credentials_synced_at
             .map(|value| format_timestamp(value as i64))
@@ -581,6 +669,7 @@ impl App {
             saved_at: unix_timestamp()?,
             credential_fingerprint: Some(credential_fingerprint(&credentials)?),
             credentials_synced_at: Some(unix_timestamp()?),
+            login_failed_at: None,
         };
         let profile_dir = self.profile_dir(name);
         create_private_dir(&profile_dir)?;
@@ -601,6 +690,8 @@ impl App {
         atomic_write(&self.profile_credentials(&profile.name), credentials, 0o600)?;
         profile.credential_fingerprint = Some(credential_fingerprint(credentials)?);
         profile.credentials_synced_at = Some(unix_timestamp()?);
+        // Ein Login, der gerade live benutzt wird, ist nicht tot.
+        profile.login_failed_at = None;
         self.write_profile(&profile)?;
         self.write_state(&State {
             current: Some(profile.name.clone()),
@@ -636,6 +727,12 @@ impl App {
         let stored = fs::read(self.profile_credentials(&profile.name)).unwrap_or_default();
         if stored == credentials {
             self.refresh_profile_metadata(profile.clone(), &credentials)?;
+            // Auch ohne Byte-Aenderung ist damit belegt, wer gerade aktiv ist. Bliebe der
+            // Status auf einem fremden Profil stehen, wuerde die Auffrischung das falsche
+            // Profil fuer aktiv halten und `list` den falschen Account markieren.
+            self.write_state(&State {
+                current: Some(profile.name.clone()),
+            })?;
             return Ok(SyncOutcome::Unchanged {
                 profile: profile.name,
             });
@@ -652,9 +749,12 @@ impl App {
     /// sind, ohne den unveraenderten Credential-Snapshot neu zu schreiben.
     fn refresh_profile_metadata(&self, mut profile: Profile, credentials: &[u8]) -> Result<()> {
         let fingerprint = credential_fingerprint(credentials)?;
-        if profile.credential_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+        if profile.credential_fingerprint.as_deref() == Some(fingerprint.as_str())
+            && profile.login_failed_at.is_none()
+        {
             return Ok(());
         }
+        profile.login_failed_at = None;
         profile.credential_fingerprint = Some(fingerprint);
         profile.credentials_synced_at = Some(unix_timestamp()?);
         self.write_profile(&profile)
@@ -818,11 +918,23 @@ impl App {
         Ok(())
     }
 
-    /// Laesst Claude Code den Login eines Profils in einem eigenen Konfigurationsverzeichnis
-    /// erneuern. Geschrieben wird nur, wenn danach ein vollstaendiger Login dasteht: schlaegt
-    /// der Refresh fehl, leert Claude Code die Datei, und ein leerer Stand darf den letzten
-    /// bekannten niemals ueberschreiben.
     fn renew_profile(&self, profile: &Profile) -> Result<RenewOutcome> {
+        Ok(match self.renew_snapshot(profile, Locking::Acquire)? {
+            RenewResult::Renewed(_) => RenewOutcome::Renewed,
+            RenewResult::StillValid(_) => RenewOutcome::StillValid,
+            RenewResult::Expired => RenewOutcome::Expired,
+            RenewResult::RequestFailed(reason) => RenewOutcome::RequestFailed(reason),
+        })
+    }
+
+    /// Laesst Claude Code den Login eines Profils in einem eigenen Konfigurationsverzeichnis
+    /// erneuern und liefert den Stand, der danach gilt. Geschrieben wird nur, wenn danach ein
+    /// vollstaendiger Login dasteht: schlaegt der Refresh fehl, leert Claude Code die Datei, und
+    /// ein leerer Stand darf den letzten bekannten niemals ueberschreiben.
+    ///
+    /// `locking` sagt, ob das Switcher-Lock hier genommen werden muss. Der Wechsel haelt es
+    /// bereits; ein zweiter Versuch auf dieselbe Datei wuerde den eigenen Prozess blockieren.
+    fn renew_snapshot(&self, profile: &Profile, locking: Locking) -> Result<RenewResult> {
         let snapshot = read_valid_credentials(&self.profile_credentials(&profile.name))?;
         let workspace = self.renew_workspace(&profile.name)?;
         let result = self.renew_in_workspace(&workspace, &snapshot);
@@ -836,20 +948,30 @@ impl App {
 
         let attempt = result?;
         let credentials = match attempt.credentials {
-            None => return Ok(RenewOutcome::Expired),
+            None => {
+                // Der Beweis, dass dieses Profil einen Browser-Login braucht. Er gehoert ins
+                // Profil, sonst zeigt die Liste weiter den Ablauf aus der Datei an - und der
+                // behauptet Wochen an Gueltigkeit, die es nicht mehr gibt.
+                let _lock = self.acquire(locking)?;
+                let mut profile = profile.clone();
+                profile.login_failed_at = Some(unix_timestamp()?);
+                self.write_profile(&profile)?;
+                return Ok(RenewResult::Expired);
+            }
             // Unveraendert heisst: Claude hat nichts erneuert. Bei einem gescheiterten Aufruf
             // ist das kein Gesundheitszeugnis, sondern ein Fehlschlag - das Profil darf dann
             // nicht als geprueft gelten, sonst laeuft seine echte Frist still weiter, waehrend
             // das Journal gruen meldet.
             Some(credentials) if credentials == snapshot => {
                 if let Some(failure) = attempt.failure {
-                    return Ok(RenewOutcome::RequestFailed(failure));
+                    return Ok(RenewResult::RequestFailed(failure));
                 }
-                let _lock = self.lock()?;
+                let _lock = self.acquire(locking)?;
                 let mut profile = profile.clone();
                 profile.credentials_synced_at = Some(unix_timestamp()?);
+                profile.login_failed_at = None;
                 self.write_profile(&profile)?;
-                return Ok(RenewOutcome::StillValid);
+                return Ok(RenewResult::StillValid(snapshot));
             }
             Some(credentials) => credentials,
         };
@@ -867,7 +989,7 @@ impl App {
         // Ab hier gilt: der neue Token existiert nur noch hier, der alte ist serverseitig tot.
         // Was jetzt nicht gespeichert wird, ist verloren - deshalb wird ab diesem Punkt nichts
         // mehr abgebrochen, was sich nicht auf dieses Profil bezieht.
-        let _lock = self.lock()?;
+        let _lock = self.acquire(locking)?;
         let unchanged = fs::read(self.profile_credentials(&profile.name))
             .is_ok_and(|current| current == snapshot);
         if !unchanged {
@@ -886,8 +1008,16 @@ impl App {
         )?;
         profile.credential_fingerprint = Some(credential_fingerprint(&credentials)?);
         profile.credentials_synced_at = Some(unix_timestamp()?);
+        profile.login_failed_at = None;
         self.write_profile(&profile)?;
-        Ok(RenewOutcome::Renewed)
+        Ok(RenewResult::Renewed(credentials))
+    }
+
+    fn acquire(&self, locking: Locking) -> Result<Option<File>> {
+        match locking {
+            Locking::Acquire => self.lock().map(Some),
+            Locking::AlreadyHeld => Ok(None),
+        }
     }
 
     /// `Ok(None)` heisst: Claude konnte den Login nicht erneuern.
@@ -1427,6 +1557,28 @@ fn credential_fingerprint(credentials: &[u8]) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Muss Claude Code diesen Login beim naechsten Request erst erneuern?
+///
+/// Nur dann kann er ueberhaupt scheitern. Solange der Access-Token gilt, ist der Wechsel
+/// risikolos - und ein Pruef-Request waere nur verbrauchte Zeit. Ein Login ohne lesbaren Ablauf
+/// gilt als erneuerungsbeduerftig: lieber einmal zu viel geprueft als eine Session zerschossen.
+fn needs_refresh(credentials: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(credentials) else {
+        return true;
+    };
+    let Some(expires_at) = value
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("expiresAt"))
+        .and_then(Value::as_i64)
+    else {
+        return true;
+    };
+    let Ok(now) = unix_timestamp() else {
+        return true;
+    };
+    expires_at / 1000 <= now as i64 + ACCESS_TOKEN_MIN_REMAINING_SECONDS
 }
 
 fn read_refresh_token_expiry(path: &Path) -> Result<Option<i64>> {

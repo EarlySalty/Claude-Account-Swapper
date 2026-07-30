@@ -1415,3 +1415,246 @@ fn corrupt_state_does_not_close_the_desktop_menu() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("Warnung:"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("Claude Account Swapper"));
 }
+
+/// Schreibt Credentials mit frei waehlbarem Ablauf des Access-Tokens. Ein abgelaufener
+/// Access-Token zwingt Claude Code beim naechsten Request zu einem Refresh - genau dort
+/// entscheidet sich, ob ein Snapshot noch traegt oder jede laufende Session in einen 401 reisst.
+fn write_credentials_expiring_access(path: &Path, access: &str, refresh: &str, in_minutes: i64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64;
+    let payload = json!({
+        "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAt": now + in_minutes * 60 * 1000,
+            "subscriptionType": "pro"
+        }
+    });
+    fs::write(path, serde_json::to_vec(&payload).expect("credential json"))
+        .expect("write credentials");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("credential mode");
+}
+
+/// Legt ein Profil an, dessen Access-Token bereits abgelaufen ist.
+fn save_profile_with_stale_access(harness: &Harness, name: &str, email: &str, refresh: &str) {
+    write_credentials_expiring_access(&harness.active_credentials(), "access-stale", refresh, -60);
+    write_status(&harness.status, email);
+    assert_success(&harness.run(&["save", name]));
+}
+
+#[test]
+fn switch_refuses_a_dead_snapshot_instead_of_breaking_running_sessions() {
+    let harness = Harness::new();
+    save_profile_with_stale_access(&harness, "tot", "tot@example.test", "refresh-dead");
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+    harness.write_claude_json("aktiv@example.test");
+    let active_before = fs::read(harness.active_credentials()).expect("active");
+    let identity_before = harness.read_claude_json();
+
+    let output = harness.run(&["switch", "tot"]);
+
+    assert!(
+        !output.status.success(),
+        "ein toter Snapshot darf nicht live gesetzt werden: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        active_before,
+        "der laufende Login muss unangetastet bleiben"
+    );
+    assert_eq!(
+        harness.read_claude_json(),
+        identity_before,
+        "ohne Wechsel darf auch der Identitaets-Cache nicht geleert werden"
+    );
+    let message = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        message.contains("claude-account login tot") && message.contains("laeuft weiter"),
+        "die Meldung muss den Ausweg nennen und beruhigen: {message}"
+    );
+}
+
+#[test]
+fn switch_puts_the_renewed_login_live_when_the_snapshot_needed_a_refresh() {
+    let harness = Harness::new();
+    save_profile_with_stale_access(&harness, "alt", "alt@example.test", "refresh-alt");
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    let output = harness.run(&["switch", "alt"]);
+
+    assert_success(&output);
+    let live =
+        String::from_utf8(fs::read(harness.active_credentials()).expect("active")).expect("utf8");
+    assert!(
+        live.contains("refresh-renewed"),
+        "live gehoert der erneuerte Stand, nicht der verbrauchte: {live}"
+    );
+    let saved =
+        String::from_utf8(fs::read(harness.saved_credentials("alt")).expect("alt")).expect("utf8");
+    assert!(
+        saved.contains("refresh-renewed"),
+        "der rotierte Token muss auch im Profil stehen, sonst ist er beim naechsten Mal weg: {saved}"
+    );
+}
+
+#[test]
+fn switch_spends_no_request_while_the_snapshot_is_still_valid() {
+    let harness = Harness::new();
+    harness.set_active("erst@example.test", "access-erst", "refresh-erst");
+    assert_success(&harness.run(&["save", "erst"]));
+    harness.set_active("zweit@example.test", "access-zweit", "refresh-zweit");
+    assert_success(&harness.run(&["save", "zweit"]));
+    let saved_before = fs::read(harness.saved_credentials("erst")).expect("erst");
+
+    assert_success(&harness.run(&["switch", "erst"]));
+
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        saved_before,
+        "ein gueltiger Snapshot wandert unveraendert live; ein Request waere nur verbrauchte Zeit"
+    );
+}
+
+#[test]
+fn switch_no_check_keeps_the_old_unverified_way() {
+    let harness = Harness::new();
+    save_profile_with_stale_access(&harness, "tot", "tot@example.test", "refresh-dead");
+    let dead_snapshot = fs::read(harness.saved_credentials("tot")).expect("tot");
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    assert_success(&harness.run(&["switch", "tot", "--no-check"]));
+
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        dead_snapshot,
+        "mit --no-check bleibt es beim ungeprueften Tausch"
+    );
+}
+
+#[test]
+fn sync_writes_the_state_even_when_the_snapshot_already_matches() {
+    let harness = Harness::new();
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+    // Zustand nach dem allerersten Start des Dienstes: der Switcher hat noch nichts aktiviert.
+    fs::write(harness.store.join("state.json"), b"{\"current\":null}").expect("state");
+
+    assert_success(&harness.run(&["sync"]));
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(harness.store.join("state.json")).expect("state"))
+            .expect("state json");
+    assert_eq!(
+        state.get("current").and_then(serde_json::Value::as_str),
+        Some("aktiv"),
+        "auch ohne Byte-Aenderung muss der Switcher wissen, wer aktiv ist: {state}"
+    );
+}
+
+#[test]
+fn list_marks_a_profile_whose_renewal_failed() {
+    let harness = Harness::new();
+    save_profile_with_stale_access(&harness, "tot", "tot@example.test", "refresh-dead");
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+    assert_success(&harness.run(&["keepalive", "--max-age-days", "0"]));
+
+    let output = harness.run(&["list"]);
+
+    assert_success(&output);
+    let listing = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        listing.contains("braucht einen neuen Login"),
+        "ein gescheiterter Versuch darf nicht als Gueltigkeit durchgehen: {listing}"
+    );
+}
+
+#[test]
+fn list_forgets_the_mark_after_a_successful_renewal() {
+    let harness = Harness::new();
+    save_profile_with_stale_access(&harness, "tot", "tot@example.test", "refresh-dead");
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+    assert_success(&harness.run(&["keepalive", "--max-age-days", "0"]));
+
+    // Der Nutzer hat sich neu eingeloggt; der Snapshot traegt wieder.
+    write_credentials(
+        &harness.saved_credentials("tot"),
+        "access-neu",
+        "refresh-neu",
+    );
+    assert_success(&harness.run(&["keepalive", "--max-age-days", "0"]));
+
+    let output = harness.run(&["list"]);
+    assert_success(&output);
+    let listing = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        !listing.contains("braucht einen neuen Login"),
+        "nach einem geglueckten Versuch muss die Markierung verschwinden: {listing}"
+    );
+}
+
+#[test]
+fn profiles_written_before_this_version_still_load() {
+    let harness = Harness::new();
+    harness.set_active("alt@example.test", "access-alt", "refresh-alt");
+    assert_success(&harness.run(&["save", "alt"]));
+    let path = harness
+        .store
+        .join("accounts")
+        .join("alt")
+        .join("profile.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "name": "alt",
+            "email": "alt@example.test",
+            "saved_at": 1_700_000_000
+        }))
+        .expect("legacy profile"),
+    )
+    .expect("write legacy profile");
+
+    let output = harness.run(&["list"]);
+
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("alt@example.test"));
+}
+
+#[test]
+fn switch_to_the_active_account_never_rotates_the_live_login() {
+    let harness = Harness::new();
+    // Der aktive Login muss demnaechst verlaengert werden - genau die Lage, in der ein
+    // Pruef-Request ihn serverseitig rotieren wuerde. Passiert das ohne dass der erneuerte
+    // Stand live geschrieben wird, sind alle offenen Sessions ausgesperrt.
+    write_credentials_expiring_access(
+        &harness.active_credentials(),
+        "access-bald-abgelaufen",
+        "refresh-aktiv",
+        -60,
+    );
+    write_status(&harness.status, "aktiv@example.test");
+    assert_success(&harness.run(&["save", "aktiv"]));
+    let live_before = fs::read(harness.active_credentials()).expect("active");
+
+    let output = harness.run(&["switch", "aktiv"]);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        live_before,
+        "der live benutzte Login darf beim Wechsel auf sich selbst nicht rotiert werden"
+    );
+    assert_eq!(
+        fs::read(harness.saved_credentials("aktiv")).expect("aktiv"),
+        live_before,
+        "und im Profil ebenso wenig"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Bereits aktiv"));
+}
