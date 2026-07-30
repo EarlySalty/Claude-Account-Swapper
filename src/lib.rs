@@ -306,9 +306,6 @@ impl App {
             .with_context(|| {
                 format!("gespeicherte Credentials fuer Profil `{name}` sind ungueltig")
             })?;
-        if check && needs_refresh(&target_credentials) {
-            target_credentials = self.verify_target_login(&target)?;
-        }
         let active_status = self.auth_status()?;
         let mut outgoing_credentials = read_valid_credentials(&self.paths.credentials)?;
         let mut outgoing =
@@ -326,6 +323,18 @@ impl App {
         if latest_outgoing != outgoing_credentials {
             outgoing = self.sync_known_active_with_credentials(&active_status, &latest_outgoing)?;
             outgoing_credentials = latest_outgoing;
+        }
+
+        // Erst hier steht fest, dass wirklich gewechselt wird. Frueher geprueft, wuerde ein
+        // `switch <aktives Profil>` den Login rotieren, der gerade live benutzt wird, und der
+        // "Bereits aktiv"-Zweig kaeme zurueck, ohne den erneuerten Stand einzusetzen - alle
+        // offenen Sessions liefen dann in genau den 401, den die Pruefung verhindern soll.
+        // Der Byte-Vergleich haelt denselben Fall auch dann ab, wenn Claudes Identitaet und
+        // der Switcher-Status auseinanderlaufen: identische Bytes heissen, der Login ist der
+        // live benutzte, und der beweist seine Gueltigkeit gerade selbst.
+        if check && target_credentials != outgoing_credentials && needs_refresh(&target_credentials)
+        {
+            target_credentials = self.verify_target_login(&target)?;
         }
 
         atomic_write(&self.paths.credentials, &target_credentials, 0o600)

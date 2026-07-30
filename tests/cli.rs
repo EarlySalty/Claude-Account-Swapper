@@ -1626,3 +1626,35 @@ fn profiles_written_before_this_version_still_load() {
     assert_success(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("alt@example.test"));
 }
+
+#[test]
+fn switch_to_the_active_account_never_rotates_the_live_login() {
+    let harness = Harness::new();
+    // Der aktive Login muss demnaechst verlaengert werden - genau die Lage, in der ein
+    // Pruef-Request ihn serverseitig rotieren wuerde. Passiert das ohne dass der erneuerte
+    // Stand live geschrieben wird, sind alle offenen Sessions ausgesperrt.
+    write_credentials_expiring_access(
+        &harness.active_credentials(),
+        "access-bald-abgelaufen",
+        "refresh-aktiv",
+        -60,
+    );
+    write_status(&harness.status, "aktiv@example.test");
+    assert_success(&harness.run(&["save", "aktiv"]));
+    let live_before = fs::read(harness.active_credentials()).expect("active");
+
+    let output = harness.run(&["switch", "aktiv"]);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        live_before,
+        "der live benutzte Login darf beim Wechsel auf sich selbst nicht rotiert werden"
+    );
+    assert_eq!(
+        fs::read(harness.saved_credentials("aktiv")).expect("aktiv"),
+        live_before,
+        "und im Profil ebenso wenig"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Bereits aktiv"));
+}
