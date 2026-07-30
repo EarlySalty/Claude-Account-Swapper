@@ -180,6 +180,35 @@ fn write_credentials(path: &Path, access: &str, refresh: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("credential mode");
 }
 
+/// Wie `write_credentials`, setzt zusaetzlich den Ablauf des Refresh-Tokens.
+fn write_credentials_expiring_in(path: &Path, access: &str, refresh: &str, in_days: i64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64;
+    let payload = json!({
+        "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAt": 4_102_444_800_000_u64,
+            "refreshTokenExpiresAt": now + in_days * 24 * 60 * 60 * 1000,
+            "subscriptionType": "pro"
+        }
+    });
+    fs::write(path, serde_json::to_vec(&payload).expect("credential json"))
+        .expect("write credentials");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("credential mode");
+}
+
+fn read_profile(harness: &Harness, name: &str) -> serde_json::Value {
+    let path = harness
+        .store
+        .join("accounts")
+        .join(name)
+        .join("profile.json");
+    serde_json::from_slice(&fs::read(path).expect("read profile")).expect("parse profile")
+}
+
 fn write_status(path: &Path, email: &str) {
     let payload = json!({
         "loggedIn": true,
@@ -706,6 +735,320 @@ fn menu_header_uses_the_real_claude_login_not_stale_switcher_state() {
     assert!(
         String::from_utf8_lossy(&output.stdout)
             .contains("Aktiv: external@example.test (nicht gespeichert)")
+    );
+}
+
+#[test]
+fn sync_writes_rotated_live_tokens_into_the_active_profile() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+
+    // Claude Code hat die Tokens rotiert, ohne dass der Switcher lief.
+    write_credentials(
+        &harness.active_credentials(),
+        "access-rotated",
+        "refresh-rotated",
+    );
+
+    let output = harness.run(&["sync"]);
+
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Aktualisiert: personal"));
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        fs::read(harness.saved_credentials("personal")).expect("personal profile")
+    );
+    assert_eq!(
+        fs::metadata(harness.saved_credentials("personal"))
+            .expect("saved metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn sync_reports_unchanged_credentials_without_rewriting() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+    let before = fs::metadata(harness.saved_credentials("personal"))
+        .expect("saved metadata")
+        .modified()
+        .expect("mtime");
+
+    let output = harness.run(&["sync"]);
+
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Bereits aktuell: personal"));
+    assert_eq!(
+        fs::metadata(harness.saved_credentials("personal"))
+            .expect("saved metadata")
+            .modified()
+            .expect("mtime"),
+        before,
+        "unveraenderte Credentials duerfen nicht neu geschrieben werden"
+    );
+}
+
+#[test]
+fn sync_refuses_when_claude_reports_a_different_identity() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+    harness.set_active("work@example.test", "access-work", "refresh-work");
+    assert_success(&harness.run(&["save", "work"]));
+
+    // Aktiv ist laut Switcher `work`, Claude meldet aber `personal` - so sieht es aus,
+    // wenn eine fremde Session die Live-Datei ueberschrieben hat.
+    write_credentials(
+        &harness.active_credentials(),
+        "access-foreign",
+        "refresh-foreign",
+    );
+    write_status(&harness.status, "personal@example.test");
+    let personal_before = fs::read(harness.saved_credentials("personal")).expect("personal");
+    let work_before = fs::read(harness.saved_credentials("work")).expect("work");
+
+    let output = harness.run(&["sync"]);
+
+    assert!(
+        !output.status.success(),
+        "widerspruechliche Identitaet darf nicht synchronisiert werden"
+    );
+    assert_eq!(
+        fs::read(harness.saved_credentials("personal")).expect("personal"),
+        personal_before
+    );
+    assert_eq!(
+        fs::read(harness.saved_credentials("work")).expect("work"),
+        work_before
+    );
+}
+
+#[test]
+fn sync_without_identity_updates_the_last_active_profile() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+
+    // Direkt nach einem Wechsel ist der Identitaets-Cache leer, die Tokens rotieren trotzdem.
+    write_credentials(
+        &harness.active_credentials(),
+        "access-rotated",
+        "refresh-rotated",
+    );
+    harness.set_status_without_identity();
+
+    let output = harness.run(&["sync"]);
+
+    assert_success(&output);
+    let personal = String::from_utf8(fs::read(harness.saved_credentials("personal")).expect("read"))
+        .expect("utf8");
+    assert!(personal.contains("refresh-rotated"), "{personal}");
+}
+
+#[test]
+fn saved_profile_stores_a_fingerprint_instead_of_the_token() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+
+    let profile = read_profile(&harness, "personal");
+    let fingerprint = profile
+        .get("credential_fingerprint")
+        .and_then(|value| value.as_str())
+        .expect("Fingerprint fehlt im Profil");
+    assert_eq!(fingerprint.len(), 64, "sha256-Hex erwartet: {fingerprint}");
+    assert!(
+        !serde_json::to_string(&profile)
+            .expect("profile json")
+            .contains("refresh-personal"),
+        "Profil-Metadaten duerfen keinen Klartext-Token enthalten: {profile}"
+    );
+    assert!(
+        profile
+            .get("credentials_synced_at")
+            .and_then(|value| value.as_u64())
+            .is_some_and(|value| value > 1_700_000_000),
+        "Sync-Zeitpunkt fehlt: {profile}"
+    );
+
+    write_credentials(
+        &harness.active_credentials(),
+        "access-rotated",
+        "refresh-rotated",
+    );
+    assert_success(&harness.run(&["sync"]));
+    let after = read_profile(&harness, "personal");
+    assert_ne!(
+        after.get("credential_fingerprint"),
+        profile.get("credential_fingerprint"),
+        "Fingerprint muss der Rotation folgen"
+    );
+}
+
+#[test]
+fn legacy_profiles_without_sync_metadata_still_load() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+
+    // Profil im alten Format, wie es vor dem Sync-Feature geschrieben wurde.
+    fs::write(
+        harness
+            .store
+            .join("accounts/personal/profile.json"),
+        serde_json::to_vec(&json!({
+            "name": "personal",
+            "email": "personal@example.test",
+            "subscription_type": "pro",
+            "saved_at": 1_700_000_000_u64
+        }))
+        .expect("legacy profile"),
+    )
+    .expect("write legacy profile");
+
+    let output = harness.run(&["list"]);
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("personal"));
+
+    harness.set_active("work@example.test", "access-work", "refresh-work");
+    assert_success(&harness.run(&["save", "work"]));
+    assert_success(&harness.run(&["switch", "personal"]));
+}
+
+#[test]
+fn list_warns_about_a_refresh_token_that_expires_soon() {
+    let harness = Harness::new();
+    write_credentials_expiring_in(
+        &harness.active_credentials(),
+        "access-personal",
+        "refresh-personal",
+        3,
+    );
+    write_status(&harness.status, "personal@example.test");
+    assert_success(&harness.run(&["save", "personal"]));
+
+    let output = harness.run(&["list"]);
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("WARNUNG"),
+        "bald ablaufender Refresh-Token muss gemeldet werden: {stdout}"
+    );
+}
+
+#[test]
+fn watch_keeps_the_active_profile_in_sync_with_rotated_tokens() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+
+    let mut child = harness
+        .command()
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    write_credentials(
+        &harness.active_credentials(),
+        "access-rotated",
+        "refresh-rotated",
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut synced = false;
+    while std::time::Instant::now() < deadline {
+        let saved = fs::read_to_string(harness.saved_credentials("personal")).unwrap_or_default();
+        if saved.contains("refresh-rotated") {
+            synced = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+
+    assert!(
+        synced,
+        "watch haette die Rotation sichern muessen\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn watch_logs_every_decision_including_the_ones_without_changes() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+
+    // Kein Profil gespeichert: der aktive Login ist nicht zuzuordnen. Auch das muss im Log stehen.
+    let mut child = harness
+        .command()
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        log.contains("Beobachte"),
+        "Startzeile mit beobachtetem Pfad fehlt: {log}"
+    );
+    assert!(
+        log.contains("nicht zuzuordnen") || log.contains("nicht gespeichert"),
+        "abgelehnte Zuordnung muss protokolliert werden: {log}"
+    );
+    assert!(
+        !log.contains("refresh-personal"),
+        "Log darf keine Token enthalten: {log}"
     );
 }
 

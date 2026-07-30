@@ -1,0 +1,12 @@
+[Unit]
+Description=Claude Account Swapper - rotierte Tokens ins aktive Profil sichern
+Documentation=https://github.com/EarlySalty/Claude-Account-Swapper
+
+[Service]
+Type=simple
+ExecStart=__BINARY__ watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
