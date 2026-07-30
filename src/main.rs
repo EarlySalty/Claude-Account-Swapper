@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use claude_account_swapper::App;
+use claude_account_swapper::{App, DEFAULT_WATCH_INTERVAL_SECONDS};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,6 +27,14 @@ enum AccountCommand {
     List,
     /// Aktiven Claude-Login anzeigen
     Status,
+    /// Von Claude rotierte Tokens einmalig ins aktive Profil sichern
+    Sync,
+    /// Rotierte Tokens dauerhaft ins aktive Profil sichern (Hintergrunddienst)
+    Watch {
+        /// Pruefintervall in Sekunden
+        #[arg(long, default_value_t = DEFAULT_WATCH_INTERVAL_SECONDS)]
+        interval: u64,
+    },
 }
 
 fn run() -> Result<()> {
@@ -38,6 +46,8 @@ fn run() -> Result<()> {
         Some(AccountCommand::Switch { name }) => app.switch(&name),
         Some(AccountCommand::List) => app.list(),
         Some(AccountCommand::Status) => app.status(),
+        Some(AccountCommand::Sync) => app.sync().map(|outcome| println!("{outcome}")),
+        Some(AccountCommand::Watch { interval }) => app.watch(interval),
         None => app.interactive(),
     }
 }

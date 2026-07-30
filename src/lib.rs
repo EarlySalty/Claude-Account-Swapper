@@ -1,17 +1,22 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const MAX_CREDENTIAL_SIZE: u64 = 1024 * 1024;
+/// Ab dieser Restlaufzeit des Refresh-Tokens warnt `list`.
+const REFRESH_TOKEN_WARN_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const DEFAULT_WATCH_INTERVAL_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -67,6 +72,45 @@ struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subscription_type: Option<String>,
     saved_at: u64,
+    /// sha256 des zuletzt gesicherten Refresh-Tokens. Nie der Token selbst: der Hash reicht,
+    /// um eine Rotation zu erkennen, und laesst sich nicht zurueckrechnen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_fingerprint: Option<String>,
+    /// Unix-Sekunden des letzten Snapshot-Schreibens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credentials_synced_at: Option<u64>,
+}
+
+/// Woher die Zuordnung "aktiver Login gehoert zu Profil X" stammen darf.
+///
+/// Ein Mensch, der `sync` tippt, weiss was er gerade gewechselt hat; fuer ihn genuegt der
+/// Switcher-Status als Rueckfallebene. Der Hintergrunddienst bekommt diese Rueckfallebene
+/// bewusst nicht: er liefe sonst genau in den Fall, den er verhindern soll, naemlich eine
+/// fremde Session, die die Live-Datei ueberschreibt, waehrend Claudes Identitaets-Cache
+/// direkt nach einem Wechsel noch leer ist. Er wartet lieber, bis Claude die Identitaet kennt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentitySource {
+    AnyIncludingSwitcherState,
+    ClaudeOnly,
+}
+
+/// Ergebnis eines Sync-Durchlaufs. Auch der Fall "nichts zu tun" ist ein Ergebnis und
+/// wird protokolliert - sonst sieht ein stiller Fehlschlag wie Erfolg aus.
+#[derive(Debug)]
+pub enum SyncOutcome {
+    Updated { profile: String, email: String },
+    Unchanged { profile: String },
+}
+
+impl std::fmt::Display for SyncOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Updated { profile, email } => {
+                write!(formatter, "Aktualisiert: {profile} ({email})")
+            }
+            Self::Unchanged { profile } => write!(formatter, "Bereits aktuell: {profile}"),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -255,8 +299,60 @@ impl App {
                 .map(|value| format!(" [{value}]"))
                 .unwrap_or_default();
             println!("{marker} {} - {}{plan}", profile.name, profile.email);
+            for line in self.snapshot_report(&profile) {
+                println!("    {line}");
+            }
         }
         Ok(())
+    }
+
+    /// Beschreibt den gespeicherten Snapshot eines Profils: wann er zuletzt nachgezogen wurde
+    /// und wie lange sein Refresh-Token noch gilt. Ein unlesbarer Snapshot wird gemeldet, nicht
+    /// verschluckt - sonst faellt er erst beim naechsten Wechsel auf.
+    fn snapshot_report(&self, profile: &Profile) -> Vec<String> {
+        let mut lines = Vec::new();
+        let synced = profile
+            .credentials_synced_at
+            .map(|value| format_timestamp(value as i64))
+            .unwrap_or_else(|| {
+                "unbekannt (vor der automatischen Sicherung gespeichert)".to_owned()
+            });
+
+        let expiry = match read_refresh_token_expiry(&self.profile_credentials(&profile.name)) {
+            Ok(expiry) => expiry,
+            Err(error) => {
+                lines.push(format!("Snapshot: {synced}"));
+                lines.push(format!("WARNUNG: Snapshot unlesbar: {error:#}"));
+                return lines;
+            }
+        };
+
+        match expiry {
+            None => {
+                lines.push(format!(
+                    "Snapshot: {synced} | Refresh-Token: Ablauf unbekannt"
+                ));
+            }
+            Some(expires_at) => {
+                lines.push(format!(
+                    "Snapshot: {synced} | Refresh-Token gueltig bis {}",
+                    format_timestamp(expires_at)
+                ));
+                let remaining = expires_at - unix_timestamp().map(|now| now as i64).unwrap_or(0);
+                if remaining <= 0 {
+                    lines.push(
+                        "WARNUNG: Refresh-Token ist abgelaufen - dieses Profil braucht einen neuen Login"
+                            .to_owned(),
+                    );
+                } else if remaining < REFRESH_TOKEN_WARN_SECONDS {
+                    lines.push(format!(
+                        "WARNUNG: Refresh-Token laeuft in {} Tagen ab - Profil einmal aktivieren",
+                        remaining / (24 * 60 * 60)
+                    ));
+                }
+            }
+        }
+        lines
     }
 
     pub fn status(&self) -> Result<()> {
@@ -456,6 +552,8 @@ impl App {
             org_name: status.org_name,
             subscription_type: status.subscription_type,
             saved_at: unix_timestamp()?,
+            credential_fingerprint: Some(credential_fingerprint(&credentials)?),
+            credentials_synced_at: Some(unix_timestamp()?),
         };
         let profile_dir = self.profile_dir(name);
         create_private_dir(&profile_dir)?;
@@ -472,12 +570,120 @@ impl App {
         status: &AuthStatus,
         credentials: &[u8],
     ) -> Result<Profile> {
-        let profile = self.resolve_active_profile(status)?;
+        let mut profile = self.resolve_active_profile(status)?;
         atomic_write(&self.profile_credentials(&profile.name), credentials, 0o600)?;
+        profile.credential_fingerprint = Some(credential_fingerprint(credentials)?);
+        profile.credentials_synced_at = Some(unix_timestamp()?);
+        self.write_profile(&profile)?;
         self.write_state(&State {
             current: Some(profile.name.clone()),
         })?;
         Ok(profile)
+    }
+
+    /// Spiegelt den Live-Login in das Profil, zu dem er gehoert.
+    ///
+    /// Claude Code rotiert den Refresh-Token bei jedem Refresh. Ohne diesen Abgleich bleibt der
+    /// gespeicherte Snapshot auf einem verbrauchten Token stehen, und ein spaeterer Wechsel
+    /// zurueck endet in `Login expired`.
+    pub fn sync(&self) -> Result<SyncOutcome> {
+        self.ensure_no_auth_override()?;
+        let _lock = self.lock()?;
+        self.sync_locked(IdentitySource::AnyIncludingSwitcherState)
+    }
+
+    fn sync_locked(&self, identity: IdentitySource) -> Result<SyncOutcome> {
+        let status = self.auth_status()?;
+        if !status.logged_in {
+            bail!("Claude Code ist nicht eingeloggt; nutze `claude-account login <name>`");
+        }
+        if identity == IdentitySource::ClaudeOnly && !status.has_identity() {
+            bail!(
+                "Claude kennt die Kontodaten zum aktiven Login noch nicht; \
+                 der Stand wird gesichert, sobald Claude Code einmal gelaufen ist"
+            );
+        }
+        let credentials = read_valid_credentials(&self.paths.credentials)?;
+        let profile = self.resolve_active_profile(&status)?;
+
+        let stored = fs::read(self.profile_credentials(&profile.name)).unwrap_or_default();
+        if stored == credentials {
+            self.refresh_profile_metadata(profile.clone(), &credentials)?;
+            return Ok(SyncOutcome::Unchanged {
+                profile: profile.name,
+            });
+        }
+
+        let synced = self.sync_known_active_with_credentials(&status, &credentials)?;
+        Ok(SyncOutcome::Updated {
+            email: synced.email,
+            profile: synced.name,
+        })
+    }
+
+    /// Ergaenzt Fingerprint und Sync-Zeitpunkt in Profilen, die vor diesem Feature entstanden
+    /// sind, ohne den unveraenderten Credential-Snapshot neu zu schreiben.
+    fn refresh_profile_metadata(&self, mut profile: Profile, credentials: &[u8]) -> Result<()> {
+        let fingerprint = credential_fingerprint(credentials)?;
+        if profile.credential_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+            return Ok(());
+        }
+        profile.credential_fingerprint = Some(fingerprint);
+        profile.credentials_synced_at = Some(unix_timestamp()?);
+        self.write_profile(&profile)
+    }
+
+    /// Beobachtet die aktive Credential-Datei und sichert jede Rotation sofort ins Profil.
+    ///
+    /// Jeder Durchlauf wird protokolliert, auch die folgenlosen: eine stille Ablehnung sieht
+    /// sonst wie ein erfolgreicher Sync aus.
+    pub fn watch(&self, interval_seconds: u64) -> Result<()> {
+        let interval = Duration::from_secs(interval_seconds.clamp(1, 3600));
+        log_event(&format!(
+            "Beobachte {} alle {}s",
+            self.paths.credentials.display(),
+            interval.as_secs()
+        ));
+
+        let mut synced_stamp: Option<CredentialStamp> = None;
+        let mut last_problem: Option<String> = None;
+        loop {
+            let stamp = credential_stamp(&self.paths.credentials);
+            if stamp != synced_stamp {
+                match self.watch_tick() {
+                    Ok(Some(outcome)) => {
+                        synced_stamp = stamp;
+                        last_problem = None;
+                        log_event(&outcome.to_string());
+                    }
+                    // Lock belegt oder Sync abgelehnt: Stand nicht als erledigt merken, damit der
+                    // naechste Durchlauf es erneut versucht. Wiederholungen nicht doppelt loggen.
+                    Ok(None) => {
+                        let message = "Uebersprungen: Switcher wird gerade benutzt".to_owned();
+                        if last_problem.as_deref() != Some(message.as_str()) {
+                            log_event(&message);
+                            last_problem = Some(message);
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        if last_problem.as_deref() != Some(message.as_str()) {
+                            log_problem(&message);
+                            last_problem = Some(message);
+                        }
+                    }
+                }
+            }
+            thread::sleep(interval);
+        }
+    }
+
+    fn watch_tick(&self) -> Result<Option<SyncOutcome>> {
+        self.ensure_no_auth_override()?;
+        let Some(_lock) = self.try_lock()? else {
+            return Ok(None);
+        };
+        self.sync_locked(IdentitySource::ClaudeOnly).map(Some)
     }
 
     /// Ermittelt, zu welchem Profil der gerade aktive Login gehoert.
@@ -631,6 +837,22 @@ impl App {
     }
 
     fn lock(&self) -> Result<File> {
+        let lock = self.open_lock_file()?;
+        FileExt::lock_exclusive(&lock).context("Account-Switcher ist bereits in Benutzung")?;
+        Ok(lock)
+    }
+
+    /// Wie `lock`, wartet aber nicht. Fuer den Watcher: er darf ein offenes Menue nicht blockieren.
+    fn try_lock(&self) -> Result<Option<File>> {
+        let lock = self.open_lock_file()?;
+        match FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => Ok(Some(lock)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error).context("Lock konnte nicht geprueft werden"),
+        }
+    }
+
+    fn open_lock_file(&self) -> Result<File> {
         self.ensure_store()?;
         let lock_path = self.paths.store.join(".lock");
         let lock = OpenOptions::new()
@@ -647,7 +869,6 @@ impl App {
                 )
             })?;
         lock.set_permissions(fs::Permissions::from_mode(0o600))?;
-        FileExt::lock_exclusive(&lock).context("Account-Switcher ist bereits in Benutzung")?;
         Ok(lock)
     }
 
@@ -889,6 +1110,60 @@ fn atomic_write_into_existing_dir(path: &Path, data: &[u8], mode: u32) -> Result
             path.display()
         )
     })
+}
+
+/// sha256 des Refresh-Tokens. Erkennt eine Rotation, ohne den Token selbst irgendwo abzulegen.
+fn credential_fingerprint(credentials: &[u8]) -> Result<String> {
+    let value: Value = serde_json::from_slice(credentials)
+        .context("Claude-Credentials sind kein gueltiges JSON")?;
+    let token = value
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("refreshToken"))
+        .and_then(Value::as_str)
+        .context("Claude-Credentials enthalten keinen Refresh-Token")?;
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn read_refresh_token_expiry(path: &Path) -> Result<Option<i64>> {
+    let data = read_credential_bytes(path)?;
+    let value: Value =
+        serde_json::from_slice(&data).context("Claude-Credentials sind kein gueltiges JSON")?;
+    Ok(value
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("refreshTokenExpiresAt"))
+        .and_then(Value::as_i64)
+        .map(|millis| millis / 1000))
+}
+
+type CredentialStamp = (i64, u64, u64);
+
+/// Fingerabdruck der Datei selbst. Claude Code schreibt ueber `rename`, deshalb gehoert die
+/// Inode dazu: sonst bliebe ein Tausch mit identischer Groesse und Zeit unbemerkt.
+fn credential_stamp(path: &Path) -> Option<CredentialStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.mtime(), metadata.len(), metadata.ino()))
+}
+
+fn format_timestamp(seconds: i64) -> String {
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|value| {
+            value
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| format!("ungueltiger Zeitstempel ({seconds})"))
+}
+
+fn log_event(message: &str) {
+    println!("[{}] {message}", chrono::Local::now().format("%F %T"));
+    let _ = io::stdout().flush();
+}
+
+fn log_problem(message: &str) {
+    eprintln!("[{}] {message}", chrono::Local::now().format("%F %T"));
 }
 
 fn unix_timestamp() -> Result<u64> {
