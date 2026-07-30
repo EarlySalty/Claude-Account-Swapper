@@ -70,8 +70,19 @@ service_installed=0
 
 if [[ -f "$repo_dir/systemd/claude-account-sync.service" ]]; then
   mkdir -p -- "$systemd_user_dir"
+  # Der Dienst braucht die Claude-CLI. Steht sie an einem Ort, den der systemd-PATH nicht
+  # kennt, wird der gefundene Pfad fest eingetragen statt auf die Suche zu hoffen.
+  claude_bin="$(command -v claude 2>/dev/null || true)"
+  if [[ -n "$claude_bin" ]]; then
+    claude_bin_env="Environment=CLAUDE_ACCOUNT_SWITCHER_CLAUDE_BIN=$claude_bin"
+  else
+    claude_bin_env="# Claude-CLI bei der Installation nicht gefunden; der Dienst sucht sie im PATH."
+    printf 'Warnung: Claude-CLI nicht im PATH gefunden; der Hintergrunddienst sucht sie selbst.\n' >&2
+  fi
+
   service_temporary="$(mktemp "${service_unit}.XXXXXX")"
-  sed "s|__BINARY__|$binary|g" "$repo_dir/systemd/claude-account-sync.service" >"$service_temporary"
+  sed -e "s|__BINARY__|$binary|g" -e "s|__CLAUDE_BIN_ENV__|$claude_bin_env|g" \
+    "$repo_dir/systemd/claude-account-sync.service" >"$service_temporary"
   chmod 644 "$service_temporary"
   mv -f -- "$service_temporary" "$service_unit"
 

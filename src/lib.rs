@@ -81,6 +81,19 @@ struct Profile {
     credentials_synced_at: Option<u64>,
 }
 
+/// Woher die Zuordnung "aktiver Login gehoert zu Profil X" stammen darf.
+///
+/// Ein Mensch, der `sync` tippt, weiss was er gerade gewechselt hat; fuer ihn genuegt der
+/// Switcher-Status als Rueckfallebene. Der Hintergrunddienst bekommt diese Rueckfallebene
+/// bewusst nicht: er liefe sonst genau in den Fall, den er verhindern soll, naemlich eine
+/// fremde Session, die die Live-Datei ueberschreibt, waehrend Claudes Identitaets-Cache
+/// direkt nach einem Wechsel noch leer ist. Er wartet lieber, bis Claude die Identitaet kennt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentitySource {
+    AnyIncludingSwitcherState,
+    ClaudeOnly,
+}
+
 /// Ergebnis eines Sync-Durchlaufs. Auch der Fall "nichts zu tun" ist ein Ergebnis und
 /// wird protokolliert - sonst sieht ein stiller Fehlschlag wie Erfolg aus.
 #[derive(Debug)]
@@ -576,13 +589,19 @@ impl App {
     pub fn sync(&self) -> Result<SyncOutcome> {
         self.ensure_no_auth_override()?;
         let _lock = self.lock()?;
-        self.sync_locked()
+        self.sync_locked(IdentitySource::AnyIncludingSwitcherState)
     }
 
-    fn sync_locked(&self) -> Result<SyncOutcome> {
+    fn sync_locked(&self, identity: IdentitySource) -> Result<SyncOutcome> {
         let status = self.auth_status()?;
         if !status.logged_in {
             bail!("Claude Code ist nicht eingeloggt; nutze `claude-account login <name>`");
+        }
+        if identity == IdentitySource::ClaudeOnly && !status.has_identity() {
+            bail!(
+                "Claude kennt die Kontodaten zum aktiven Login noch nicht; \
+                 der Stand wird gesichert, sobald Claude Code einmal gelaufen ist"
+            );
         }
         let credentials = read_valid_credentials(&self.paths.credentials)?;
         let profile = self.resolve_active_profile(&status)?;
@@ -664,7 +683,7 @@ impl App {
         let Some(_lock) = self.try_lock()? else {
             return Ok(None);
         };
-        self.sync_locked().map(Some)
+        self.sync_locked(IdentitySource::ClaudeOnly).map(Some)
     }
 
     /// Ermittelt, zu welchem Profil der gerade aktive Login gehoert.

@@ -4,6 +4,11 @@ Documentation=https://github.com/EarlySalty/Claude-Account-Swapper
 
 [Service]
 Type=simple
+# Der Dienst ruft `claude auth status` auf. Der systemd-User-PATH enthaelt weder ~/.local/bin
+# noch ~/.cargo/bin; ohne diese Zeile findet er die Claude-CLI nicht. Der Installer setzt
+# zusaetzlich den konkret gefundenen Pfad, siehe install.sh.
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+__CLAUDE_BIN_ENV__
 ExecStart=__BINARY__ watch
 Restart=always
 RestartSec=5

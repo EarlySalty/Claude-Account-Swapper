@@ -116,6 +116,8 @@ Eine Ablehnung wird ebenso protokolliert wie ein Erfolg. Meldet der Dienst dauer
 
 Er schreibt niemals in ein Profil, dessen Zuordnung unklar ist. Widersprechen sich Claudes Identitaets-Cache und der zuletzt vom Switcher gesetzte Account, bleibt alles unveraendert und der Grund steht im Journal. Lieber ein nicht gesicherter Stand als fremde Tokens im falschen Profil.
 
+Kennt Claude die Kontodaten noch nicht — der Zustand direkt nach einem Wechsel — wartet der Dienst, statt auf den Switcher-Status zurueckzufallen. Genau in diesem Fenster koennte eine parallel laufende Session die Datei geschrieben haben. Sobald Claude Code einmal gelaufen ist, wird der aktuelle Stand gesichert; verloren geht dabei nichts, es dauert nur laenger. Der manuelle Befehl `claude-account sync` nutzt den Switcher-Status weiterhin als Rueckfallebene, weil dort ein Mensch weiss, was er gerade gewechselt hat.
+
 Ausschalten: `systemctl --user disable --now claude-account-sync.service`. Ohne den Dienst bleibt der manuelle Weg `claude-account sync` nach jeder laengeren Sitzung.
 
 ## Sicherheit

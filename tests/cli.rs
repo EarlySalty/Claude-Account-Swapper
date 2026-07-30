@@ -1012,6 +1012,54 @@ fn watch_keeps_the_active_profile_in_sync_with_rotated_tokens() {
 }
 
 #[test]
+fn watch_waits_instead_of_guessing_while_claude_has_no_identity() {
+    let harness = Harness::new();
+    harness.set_active(
+        "personal@example.test",
+        "access-personal",
+        "refresh-personal",
+    );
+    assert_success(&harness.run(&["save", "personal"]));
+    let saved_before = fs::read(harness.saved_credentials("personal")).expect("personal");
+
+    // Genau die Luecke direkt nach einem Wechsel: Claude kennt die Identitaet noch nicht.
+    // Eine fremde Session koennte die Live-Datei geschrieben haben - der Dienst darf dann
+    // nicht auf den Switcher-Status zurueckfallen und fremde Tokens einsortieren.
+    write_credentials(
+        &harness.active_credentials(),
+        "access-foreign",
+        "refresh-foreign",
+    );
+    harness.set_status_without_identity();
+
+    let mut child = harness
+        .command()
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+
+    assert_eq!(
+        fs::read(harness.saved_credentials("personal")).expect("personal"),
+        saved_before,
+        "ohne bestaetigte Identitaet darf nichts gesichert werden"
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        log.contains("Kontodaten"),
+        "Grund fuers Aussetzen muss im Log stehen: {log}"
+    );
+}
+
+#[test]
 fn watch_logs_every_decision_including_the_ones_without_changes() {
     let harness = Harness::new();
     harness.set_active(
