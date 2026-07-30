@@ -63,6 +63,9 @@ case "$1:$2" in
     if [ "${FAKE_PROMPT_EXIT:-0}" -ne 0 ]; then
       exit "$FAKE_PROMPT_EXIT"
     fi
+    if [ -n "${FAKE_PROMPT_TOUCH_ACTIVE:-}" ]; then
+      /bin/cp "$FAKE_PROMPT_TOUCH_ACTIVE" "$HOME/.claude/.credentials.json"
+    fi
     /bin/sed -e 's/"accessToken":"[^"]*"/"accessToken":"access-renewed"/' \
       -e 's/"refreshToken":"[^"]*"/"refreshToken":"refresh-renewed"/' \
       "$target" >"$target.renewed"
@@ -1204,6 +1207,67 @@ fn keepalive_skips_profiles_that_were_recently_synced() {
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("frisch"),
         "auch das Ueberspringen gehoert ins Log"
+    );
+}
+
+#[test]
+fn keepalive_saves_the_renewed_login_even_if_the_active_one_changes_meanwhile() {
+    let harness = Harness::new();
+    harness.set_active("idle@example.test", "access-idle", "refresh-idle");
+    assert_success(&harness.run(&["save", "idle"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    // Eine beliebige andere Claude-Session verlaengert waehrenddessen ihren eigenen Login.
+    // Das ist alle paar Stunden normal und hat mit der Auffrischung nichts zu tun. Der
+    // erneuerte Token des Profils ist zu diesem Zeitpunkt serverseitig schon rotiert - wer
+    // ihn jetzt verwirft, hat das Profil endgueltig getoetet.
+    let interference = harness.home.join("interference.json");
+    write_credentials(&interference, "access-other", "refresh-other");
+    let output = harness
+        .command()
+        .args(["keepalive", "--max-age-days", "0"])
+        .env("FAKE_PROMPT_TOUCH_ACTIVE", &interference)
+        .output()
+        .expect("keepalive");
+
+    assert_success(&output);
+    let idle = String::from_utf8(fs::read(harness.saved_credentials("idle")).expect("idle"))
+        .expect("utf8");
+    assert!(
+        idle.contains("refresh-renewed"),
+        "der erneuerte Login muss gesichert werden, egal was der aktive Login tut: {idle}"
+    );
+}
+
+#[test]
+fn keepalive_never_renews_the_login_that_is_currently_live() {
+    let harness = Harness::new();
+    harness.set_active("live@example.test", "access-live", "refresh-live");
+    assert_success(&harness.run(&["save", "live"]));
+    let live_before = fs::read(harness.saved_credentials("live")).expect("live");
+
+    // Ein veralteter Switcher-Status zeigt auf ein anderes Profil, obwohl die Tokens von
+    // `live` aktiv sind. Ohne Byte-Vergleich wuerde die Auffrischung den Token rotieren,
+    // den gerade eine laufende Session benutzt.
+    fs::write(
+        harness.store.join("state.json"),
+        br#"{"current":"gibt-es-nicht"}"#,
+    )
+    .expect("state");
+
+    let output = harness.run(&["keepalive", "--max-age-days", "0"]);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read(harness.saved_credentials("live")).expect("live"),
+        live_before,
+        "der aktuell benutzte Login darf nicht aufgefrischt werden"
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        live_before,
+        "und der aktive Login schon gar nicht"
     );
 }
 

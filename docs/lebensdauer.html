@@ -87,7 +87,12 @@
       <li>Claude Code erneuert den Login dabei selbst und schreibt die neuen Tokens in dieses Verzeichnis.</li>
       <li>Das Ergebnis zurueck ins Profil, danach das Arbeitsverzeichnis restlos loeschen.</li>
     </ol>
-    <p>Vor dem Schreiben prueft der Switcher zusaetzlich, dass sich die global aktive Datei waehrenddessen nicht veraendert hat. Tut sie es doch, wird nichts uebernommen.</p>
+    <div class="card warning">
+      <strong>Ab dem erfolgreichen Request darf nichts mehr abbrechen.</strong>
+      <p>In dem Moment ist der alte Token serverseitig bereits tot und der neue existiert nur im Arbeitsverzeichnis. Wer ihn jetzt verwirft &ndash; etwa weil irgendeine unbeteiligte Claude-Session gerade ihren eigenen Login verlaengert hat &ndash; toetet genau das Profil, das gerettet werden sollte. Abgebrochen wird nur noch, wenn sich das Profil selbst veraendert hat, denn dann gehoert die Entscheidung jemand anderem.</p>
+    </div>
+    <p>Welches Profil gerade live ist, entscheidet ein Byte-Vergleich seines Snapshots mit der aktiven Datei, nicht der gespeicherte Switcher-Status. Ein veralteter Status wuerde sonst dazu fuehren, dass die Auffrischung den Token wegrotiert, mit dem eine laufende Session gerade arbeitet.</p>
+    <p>Waehrend des Requests haelt der Switcher sein Lock nicht. Ein Durchlauf kann pro Profil bis zu zwei Minuten dauern; solange darf weder das Menue noch der Hintergrunddienst warten muessen. Gesperrt wird nur zum Lesen des Ausgangszustands und zum Schreiben eines Ergebnisses.</p>
 
     <h3>Warum kein eigener OAuth-Aufruf</h3>
     <p>Der Token-Endpunkt ist <code>https://platform.claude.com/v1/oauth/token</code>. Ein direkter Aufruf von dort ist trotzdem der falsche Weg: generische HTTP-Clients beantwortet Cloudflare mit <code>Error 1010: browser_signature_banned</code>. Die offizielle CLI zu benutzen ist nicht nur robuster gegen solche Sperren, sondern haelt auch den Token-Austausch dort, wo er hingehoert &ndash; ohne nachgebaute Client-ID und ohne eigene Fehlerbehandlung fuer einen fremden Flow.</p>

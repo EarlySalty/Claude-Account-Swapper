@@ -23,7 +23,7 @@ pub const DEFAULT_WATCH_INTERVAL_SECONDS: u64 = 5;
 pub const DEFAULT_KEEPALIVE_MAX_AGE_DAYS: u64 = 7;
 /// Abstand zwischen zwei Auffrischungen im Dauerbetrieb.
 const KEEPALIVE_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
-/// Ein haengender Request darf den Dienst nicht blockieren - er haelt dabei das Lock.
+/// Ein haengender Request wuerde den Dienst sonst dauerhaft anhalten.
 const KEEPALIVE_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 
 #[derive(Debug, Clone)]
@@ -721,24 +721,46 @@ impl App {
     /// global aktive Login wird dabei nicht angefasst.
     pub fn keepalive(&self, max_age_days: u64) -> Result<()> {
         self.ensure_no_auth_override()?;
-        let _lock = self.lock()?;
-        self.keepalive_locked(max_age_days)
+        self.keepalive_run(max_age_days)
     }
 
-    fn keepalive_locked(&self, max_age_days: u64) -> Result<()> {
-        let profiles = self.load_profiles()?;
+    /// Haelt das Lock bewusst nicht ueber den ganzen Durchlauf: ein Request pro Profil kann
+    /// bis zu zwei Minuten dauern, und solange duerfen weder das Menue noch der Watcher warten.
+    /// Gesperrt wird nur zum Lesen des Ausgangszustands und zum Schreiben eines Ergebnisses.
+    fn keepalive_run(&self, max_age_days: u64) -> Result<()> {
+        let (profiles, active, live) = {
+            let _lock = self.lock()?;
+            (
+                self.load_profiles()?,
+                self.load_state()?.current,
+                fs::read(&self.paths.credentials).ok(),
+            )
+        };
         if profiles.is_empty() {
             log_event("Auffrischung: keine Profile gespeichert");
             return Ok(());
         }
-        let active = self.load_state()?.current;
-        let max_age_seconds = max_age_days * 24 * 60 * 60;
+        let max_age_seconds = max_age_days.saturating_mul(24 * 60 * 60);
         let now = unix_timestamp()?;
 
         for profile in profiles {
             if active.as_deref() == Some(profile.name.as_str()) {
                 log_event(&format!(
                     "Auffrischung uebersprungen: {} ist aktiv",
+                    profile.name
+                ));
+                continue;
+            }
+            // Der Switcher-Status kann veraltet sein. Traegt ein Profil genau die Tokens, die
+            // gerade live sind, wuerde die Auffrischung den Login unter einer laufenden Session
+            // wegrotieren - der Byte-Vergleich ist die verlaessliche Aussage, nicht `state.json`.
+            if live.as_deref()
+                == fs::read(self.profile_credentials(&profile.name))
+                    .ok()
+                    .as_deref()
+            {
+                log_event(&format!(
+                    "Auffrischung uebersprungen: {} ist der aktuell benutzte Login",
                     profile.name
                 ));
                 continue;
@@ -794,32 +816,42 @@ impl App {
         }
 
         let renewed = result?;
-        match renewed {
-            None => Ok(RenewOutcome::Expired),
-            Some(credentials) if credentials == snapshot => Ok(RenewOutcome::StillValid),
-            Some(credentials) => {
-                let mut profile = profile.clone();
-                atomic_write(
-                    &self.profile_credentials(&profile.name),
-                    &credentials,
-                    0o600,
-                )?;
-                profile.credential_fingerprint = Some(credential_fingerprint(&credentials)?);
-                profile.credentials_synced_at = Some(unix_timestamp()?);
-                self.write_profile(&profile)?;
-                Ok(RenewOutcome::Renewed)
-            }
+        let credentials = match renewed {
+            None => return Ok(RenewOutcome::Expired),
+            Some(credentials) if credentials == snapshot => return Ok(RenewOutcome::StillValid),
+            Some(credentials) => credentials,
+        };
+
+        // Ab hier gilt: der neue Token existiert nur noch hier, der alte ist serverseitig tot.
+        // Was jetzt nicht gespeichert wird, ist verloren - deshalb wird ab diesem Punkt nichts
+        // mehr abgebrochen, was sich nicht auf dieses Profil bezieht.
+        let _lock = self.lock()?;
+        let unchanged = fs::read(self.profile_credentials(&profile.name))
+            .is_ok_and(|current| current == snapshot);
+        if !unchanged {
+            bail!(
+                "Profil `{}` wurde waehrend der Auffrischung veraendert; \
+                 der erneuerte Login wurde verworfen",
+                profile.name
+            );
         }
+
+        let mut profile = profile.clone();
+        atomic_write(
+            &self.profile_credentials(&profile.name),
+            &credentials,
+            0o600,
+        )?;
+        profile.credential_fingerprint = Some(credential_fingerprint(&credentials)?);
+        profile.credentials_synced_at = Some(unix_timestamp()?);
+        self.write_profile(&profile)?;
+        Ok(RenewOutcome::Renewed)
     }
 
     /// `Ok(None)` heisst: Claude konnte den Login nicht erneuern.
     fn renew_in_workspace(&self, workspace: &Path, snapshot: &[u8]) -> Result<Option<Vec<u8>>> {
         let credentials = workspace.join(".credentials.json");
         atomic_write(&credentials, snapshot, 0o600)?;
-
-        // Der global aktive Login darf sich durch die Auffrischung nicht veraendern. Das ist
-        // durch das eigene Konfigurationsverzeichnis gegeben - hier wird es zusaetzlich geprueft.
-        let active_before = fs::read(&self.paths.credentials).ok();
 
         let mut child = Command::new(&self.paths.claude_bin)
             .args(["-p", "ok", "--model", "haiku", "--strict-mcp-config"])
@@ -842,13 +874,6 @@ impl App {
             bail!(
                 "Claude hat nach {} Sekunden nicht geantwortet",
                 timeout.as_secs()
-            );
-        }
-
-        if fs::read(&self.paths.credentials).ok() != active_before {
-            bail!(
-                "der aktive Login hat sich waehrend der Auffrischung veraendert; \
-                 Profil wurde nicht angefasst"
             );
         }
 
@@ -886,15 +911,9 @@ impl App {
         self.sync_locked(IdentitySource::ClaudeOnly).map(Some)
     }
 
-    /// Wie `keepalive`, blockiert aber nicht auf dem Lock: ein offenes Menue hat Vorrang,
-    /// die naechste Runde kommt in jedem Fall.
     fn keepalive_tick(&self, max_age_days: u64) -> Result<()> {
         self.ensure_no_auth_override()?;
-        let Some(_lock) = self.try_lock()? else {
-            log_event("Auffrischung verschoben: Switcher wird gerade benutzt");
-            return Ok(());
-        };
-        self.keepalive_locked(max_age_days)
+        self.keepalive_run(max_age_days)
     }
 
     /// Ermittelt, zu welchem Profil der gerade aktive Login gehoert.
