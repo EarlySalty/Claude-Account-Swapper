@@ -728,6 +728,13 @@ impl App {
     /// bis zu zwei Minuten dauern, und solange duerfen weder das Menue noch der Watcher warten.
     /// Gesperrt wird nur zum Lesen des Ausgangszustands und zum Schreiben eines Ergebnisses.
     fn keepalive_run(&self, max_age_days: u64) -> Result<()> {
+        // Eigenes Lock, getrennt vom Menue-Lock: zwei gleichzeitige Auffrischungen wuerden
+        // beide mit demselben Snapshot starten, und die zweite liefe in den bereits
+        // verbrauchten Token - das saehe wie ein abgelaufenes Profil aus, ist aber keins.
+        let Some(_keepalive_lock) = self.try_lock_file("keepalive")? else {
+            log_event("Auffrischung laeuft bereits");
+            return Ok(());
+        };
         let (profiles, active, live) = {
             let _lock = self.lock()?;
             (
@@ -754,11 +761,8 @@ impl App {
             // Der Switcher-Status kann veraltet sein. Traegt ein Profil genau die Tokens, die
             // gerade live sind, wuerde die Auffrischung den Login unter einer laufenden Session
             // wegrotieren - der Byte-Vergleich ist die verlaessliche Aussage, nicht `state.json`.
-            if live.as_deref()
-                == fs::read(self.profile_credentials(&profile.name))
-                    .ok()
-                    .as_deref()
-            {
+            let snapshot = fs::read(self.profile_credentials(&profile.name)).ok();
+            if snapshot.is_some() && snapshot.as_deref() == live.as_deref() {
                 log_event(&format!(
                     "Auffrischung uebersprungen: {} ist der aktuell benutzte Login",
                     profile.name
@@ -818,7 +822,16 @@ impl App {
         let renewed = result?;
         let credentials = match renewed {
             None => return Ok(RenewOutcome::Expired),
-            Some(credentials) if credentials == snapshot => return Ok(RenewOutcome::StillValid),
+            // Der Login war noch gueltig, Claude hatte nichts zu erneuern. Der Zeitpunkt wird
+            // trotzdem festgehalten, sonst bekommt dasselbe Profil alle zwoelf Stunden erneut
+            // einen Request.
+            Some(credentials) if credentials == snapshot => {
+                let _lock = self.lock()?;
+                let mut profile = profile.clone();
+                profile.credentials_synced_at = Some(unix_timestamp()?);
+                self.write_profile(&profile)?;
+                return Ok(RenewOutcome::StillValid);
+            }
             Some(credentials) => credentials,
         };
 
@@ -867,14 +880,25 @@ impl App {
                     self.paths.claude_bin.display()
                 )
             })?;
-        let timeout = Duration::from_secs(KEEPALIVE_REQUEST_TIMEOUT_SECONDS);
-        if child.wait_timeout(timeout)?.is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "Claude hat nach {} Sekunden nicht geantwortet",
-                timeout.as_secs()
-            );
+        // Ab dem Start des Prozesses darf nichts mehr ohne Rettungsversuch abbrechen: Claude
+        // rotiert den Token, bevor es antwortet. Ein Timeout oder Fehler nach diesem Punkt
+        // heisst nicht, dass kein neuer Login dasteht - er waere nur unwiederbringlich weg.
+        let timeout = self.keepalive_timeout();
+        match child.wait_timeout(timeout) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                log_problem(&format!(
+                    "Claude hat nach {} Sekunden nicht geantwortet; \
+                     ein bereits erneuerter Login wird trotzdem gesichert",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => log_problem(&format!(
+                "Claude konnte nicht abgewartet werden ({error}); \
+                 ein bereits erneuerter Login wird trotzdem gesichert"
+            )),
         }
 
         let renewed = fs::read(&credentials).with_context(|| {
@@ -884,6 +908,17 @@ impl App {
             )
         })?;
         Ok(validate_credentials(&renewed).ok().map(|()| renewed))
+    }
+
+    /// Testbar und im Notfall operativ anpassbar; der Standard reicht fuer einen Prompt samt
+    /// Retry-Backoff.
+    fn keepalive_timeout(&self) -> Duration {
+        let seconds = env::var("CLAUDE_ACCOUNT_SWITCHER_KEEPALIVE_TIMEOUT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(KEEPALIVE_REQUEST_TIMEOUT_SECONDS);
+        Duration::from_secs(seconds)
     }
 
     fn renew_workspace(&self, name: &str) -> Result<PathBuf> {
@@ -1067,14 +1102,23 @@ impl App {
     }
 
     fn lock(&self) -> Result<File> {
-        let lock = self.open_lock_file()?;
+        let lock = self.open_lock_file(".lock")?;
         FileExt::lock_exclusive(&lock).context("Account-Switcher ist bereits in Benutzung")?;
         Ok(lock)
     }
 
     /// Wie `lock`, wartet aber nicht. Fuer den Watcher: er darf ein offenes Menue nicht blockieren.
     fn try_lock(&self) -> Result<Option<File>> {
-        let lock = self.open_lock_file()?;
+        self.try_lock_path(".lock")
+    }
+
+    /// Eigenes, benanntes Lock fuer Ablaeufe, die sich nur untereinander ausschliessen.
+    fn try_lock_file(&self, name: &str) -> Result<Option<File>> {
+        self.try_lock_path(&format!(".{name}.lock"))
+    }
+
+    fn try_lock_path(&self, file_name: &str) -> Result<Option<File>> {
+        let lock = self.open_lock_file(file_name)?;
         match FileExt::try_lock_exclusive(&lock) {
             Ok(()) => Ok(Some(lock)),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -1082,9 +1126,9 @@ impl App {
         }
     }
 
-    fn open_lock_file(&self) -> Result<File> {
+    fn open_lock_file(&self, file_name: &str) -> Result<File> {
         self.ensure_store()?;
-        let lock_path = self.paths.store.join(".lock");
+        let lock_path = self.paths.store.join(file_name);
         let lock = OpenOptions::new()
             .read(true)
             .write(true)

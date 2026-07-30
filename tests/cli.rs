@@ -66,10 +66,18 @@ case "$1:$2" in
     if [ -n "${FAKE_PROMPT_TOUCH_ACTIVE:-}" ]; then
       /bin/cp "$FAKE_PROMPT_TOUCH_ACTIVE" "$HOME/.claude/.credentials.json"
     fi
+    if [ "${FAKE_PROMPT_NOOP:-0}" -eq 1 ]; then
+      echo ok
+      exit 0
+    fi
+    # Der Token rotiert, bevor die Antwort kommt - ab hier ist der alte serverseitig tot.
     /bin/sed -e 's/"accessToken":"[^"]*"/"accessToken":"access-renewed"/' \
       -e 's/"refreshToken":"[^"]*"/"refreshToken":"refresh-renewed"/' \
       "$target" >"$target.renewed"
     /bin/mv "$target.renewed" "$target"
+    if [ -n "${FAKE_PROMPT_HANG:-}" ]; then
+      sleep "$FAKE_PROMPT_HANG"
+    fi
     echo ok
     ;;
   *)
@@ -1241,6 +1249,58 @@ fn keepalive_saves_the_renewed_login_even_if_the_active_one_changes_meanwhile() 
 }
 
 #[test]
+fn keepalive_rescues_the_renewed_login_when_the_request_runs_into_the_timeout() {
+    let harness = Harness::new();
+    harness.set_active("idle@example.test", "access-idle", "refresh-idle");
+    assert_success(&harness.run(&["save", "idle"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    // Claude rotiert den Token, bevor es antwortet, und haengt danach - etwa in einem
+    // Retry-Backoff. Der alte Token ist zu dem Zeitpunkt schon tot; wer den neuen wegen des
+    // Timeouts wegwirft, macht das Profil unrettbar.
+    let output = harness
+        .command()
+        .args(["keepalive", "--max-age-days", "0"])
+        .env("FAKE_PROMPT_HANG", "30")
+        .env("CLAUDE_ACCOUNT_SWITCHER_KEEPALIVE_TIMEOUT", "1")
+        .output()
+        .expect("keepalive");
+
+    assert_success(&output);
+    let idle = String::from_utf8(fs::read(harness.saved_credentials("idle")).expect("idle"))
+        .expect("utf8");
+    assert!(
+        idle.contains("refresh-renewed"),
+        "der rotierte Token muss trotz Timeout gesichert werden: {idle}"
+    );
+}
+
+#[test]
+fn keepalive_does_not_hunt_a_profile_that_needs_no_renewal() {
+    let harness = Harness::new();
+    harness.set_active("frisch@example.test", "access-frisch", "refresh-frisch");
+    assert_success(&harness.run(&["save", "frisch"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    // Erster Lauf: faellig, aber Claude sieht keinen Grund zu erneuern (Token unveraendert).
+    let mut command = harness.command();
+    command.args(["keepalive", "--max-age-days", "0"]);
+    command.env("FAKE_PROMPT_NOOP", "1");
+    assert_success(&command.output().expect("keepalive"));
+
+    // Zweiter Lauf mit normaler Altersgrenze: das Profil gilt jetzt als frisch geprueft.
+    let output = harness.run(&["keepalive"]);
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Tage alt"),
+        "ein gerade geprueftes Profil darf nicht erneut beschossen werden: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn keepalive_never_renews_the_login_that_is_currently_live() {
     let harness = Harness::new();
     harness.set_active("live@example.test", "access-live", "refresh-live");
@@ -1281,11 +1341,13 @@ fn keepalive_leaves_no_working_directory_behind() {
 
     assert_success(&harness.run(&["keepalive", "--max-age-days", "0"]));
 
+    // Ein Arbeitsverzeichnis haelt eine Kopie aktiver Zugangsdaten; nur `accounts` darf bleiben.
     let leftovers: Vec<_> = fs::read_dir(&harness.store)
         .expect("store")
         .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name != "accounts" && name != "state.json" && name != ".lock")
+        .filter(|name| name != "accounts")
         .collect();
     assert!(
         leftovers.is_empty(),
