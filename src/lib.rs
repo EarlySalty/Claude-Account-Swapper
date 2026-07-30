@@ -12,11 +12,19 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use wait_timeout::ChildExt;
 
 const MAX_CREDENTIAL_SIZE: u64 = 1024 * 1024;
 /// Ab dieser Restlaufzeit des Refresh-Tokens warnt `list`.
 const REFRESH_TOKEN_WARN_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const DEFAULT_WATCH_INTERVAL_SECONDS: u64 = 5;
+/// Nach so vielen Tagen ohne Nutzung frischt `keepalive` ein Profil auf. Der Refresh-Token
+/// selbst gilt rund 30 Tage; sieben Tage lassen genug Luft fuer ausgefallene Durchlaeufe.
+pub const DEFAULT_KEEPALIVE_MAX_AGE_DAYS: u64 = 7;
+/// Abstand zwischen zwei Auffrischungen im Dauerbetrieb.
+const KEEPALIVE_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
+/// Ein haengender Request wuerde den Dienst sonst dauerhaft anhalten.
+const KEEPALIVE_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -92,6 +100,25 @@ struct Profile {
 enum IdentitySource {
     AnyIncludingSwitcherState,
     ClaudeOnly,
+}
+
+/// Ergebnis einer Auffrischung eines untaetigen Profils.
+#[derive(Debug)]
+enum RenewOutcome {
+    Renewed,
+    StillValid,
+    Expired,
+    /// Der Request ist gescheitert und hat nichts erneuert. Das Profil bleibt unangetastet -
+    /// vor allem gilt es nicht als geprueft, sonst laeuft seine echte Frist still weiter.
+    RequestFailed(String),
+}
+
+/// Was ein Auffrischungsversuch hinterlassen hat.
+struct RenewalAttempt {
+    /// `None` heisst: Claude hat den Login geleert, er ist nicht mehr zu erneuern.
+    credentials: Option<Vec<u8>>,
+    /// Gefuellt, wenn der Aufruf selbst schiefging.
+    failure: Option<String>,
 }
 
 /// Ergebnis eines Sync-Durchlaufs. Auch der Fall "nichts zu tun" ist ein Ergebnis und
@@ -637,17 +664,35 @@ impl App {
     ///
     /// Jeder Durchlauf wird protokolliert, auch die folgenlosen: eine stille Ablehnung sieht
     /// sonst wie ein erfolgreicher Sync aus.
-    pub fn watch(&self, interval_seconds: u64) -> Result<()> {
+    pub fn watch(&self, interval_seconds: u64, keepalive_max_age_days: Option<u64>) -> Result<()> {
         let interval = Duration::from_secs(interval_seconds.clamp(1, 3600));
         log_event(&format!(
             "Beobachte {} alle {}s",
             self.paths.credentials.display(),
             interval.as_secs()
         ));
+        match keepalive_max_age_days {
+            Some(days) => log_event(&format!(
+                "Untaetige Profile werden nach {days} Tagen aufgefrischt"
+            )),
+            None => log_event("Auffrischung untaetiger Profile ist abgeschaltet"),
+        }
 
         let mut synced_stamp: Option<CredentialStamp> = None;
         let mut last_problem: Option<String> = None;
+        let mut next_keepalive = SystemTime::now();
         loop {
+            if let Some(max_age_days) = keepalive_max_age_days
+                && SystemTime::now() >= next_keepalive
+            {
+                next_keepalive =
+                    SystemTime::now() + Duration::from_secs(KEEPALIVE_INTERVAL_SECONDS);
+                match self.keepalive_tick(max_age_days) {
+                    Ok(()) => {}
+                    Err(error) => log_problem(&format!("Auffrischung fehlgeschlagen: {error:#}")),
+                }
+            }
+
             let stamp = credential_stamp(&self.paths.credentials);
             if stamp != synced_stamp {
                 match self.watch_tick() {
@@ -678,12 +723,261 @@ impl App {
         }
     }
 
+    /// Haelt Profile am Leben, die gerade nicht aktiv sind.
+    ///
+    /// Der Refresh-Token laeuft rund 30 Tage nach seiner letzten Nutzung ab. Ein Profil, das
+    /// so lange nicht dran war, ist danach nur noch per Browser-Login zu retten. Dagegen hilft
+    /// nur, es zu benutzen: jedes faellige Profil bekommt einen minimalen Request in einem
+    /// eigenen Konfigurationsverzeichnis, bei dem Claude Code den Login selbst erneuert. Der
+    /// global aktive Login wird dabei nicht angefasst.
+    pub fn keepalive(&self, max_age_days: u64) -> Result<()> {
+        self.ensure_no_auth_override()?;
+        self.keepalive_run(max_age_days)
+    }
+
+    /// Haelt das Lock bewusst nicht ueber den ganzen Durchlauf: ein Request pro Profil kann
+    /// bis zu zwei Minuten dauern, und solange duerfen weder das Menue noch der Watcher warten.
+    /// Gesperrt wird nur zum Lesen des Ausgangszustands und zum Schreiben eines Ergebnisses.
+    fn keepalive_run(&self, max_age_days: u64) -> Result<()> {
+        // Eigenes Lock, getrennt vom Menue-Lock: zwei gleichzeitige Auffrischungen wuerden
+        // beide mit demselben Snapshot starten, und die zweite liefe in den bereits
+        // verbrauchten Token - das saehe wie ein abgelaufenes Profil aus, ist aber keins.
+        let Some(_keepalive_lock) = self.try_lock_file("keepalive")? else {
+            log_event("Auffrischung laeuft bereits");
+            return Ok(());
+        };
+        let (profiles, active) = {
+            let _lock = self.lock()?;
+            (self.load_profiles()?, self.load_state()?.current)
+        };
+        if profiles.is_empty() {
+            log_event("Auffrischung: keine Profile gespeichert");
+            return Ok(());
+        }
+        let max_age_seconds = max_age_days.saturating_mul(24 * 60 * 60);
+        let now = unix_timestamp()?;
+
+        for profile in profiles {
+            if active.as_deref() == Some(profile.name.as_str()) {
+                log_event(&format!(
+                    "Auffrischung uebersprungen: {} ist aktiv",
+                    profile.name
+                ));
+                continue;
+            }
+            // Der Switcher-Status kann veraltet sein. Traegt ein Profil genau die Tokens, die
+            // gerade live sind, wuerde die Auffrischung den Login unter einer laufenden Session
+            // wegrotieren - der Byte-Vergleich ist die verlaessliche Aussage, nicht `state.json`.
+            // Beide Seiten werden pro Profil frisch gelesen: ein Durchlauf dauert lange genug,
+            // dass der Nutzer zwischendurch auf ein spaeter drankommendes Profil wechseln kann.
+            let live = fs::read(&self.paths.credentials).ok();
+            let snapshot = fs::read(self.profile_credentials(&profile.name)).ok();
+            if snapshot.is_some() && snapshot == live {
+                log_event(&format!(
+                    "Auffrischung uebersprungen: {} ist der aktuell benutzte Login",
+                    profile.name
+                ));
+                continue;
+            }
+            let age = profile
+                .credentials_synced_at
+                .map_or(u64::MAX, |synced| now.saturating_sub(synced));
+            if age < max_age_seconds {
+                log_event(&format!(
+                    "Auffrischung uebersprungen: {} ist {} Tage alt",
+                    profile.name,
+                    age / (24 * 60 * 60)
+                ));
+                continue;
+            }
+            match self.renew_profile(&profile) {
+                Ok(RenewOutcome::Renewed) => log_event(&format!(
+                    "Aufgefrischt: {} ({})",
+                    profile.name, profile.email
+                )),
+                Ok(RenewOutcome::StillValid) => log_event(&format!(
+                    "Auffrischung nicht noetig: {} ist noch gueltig",
+                    profile.name
+                )),
+                Ok(RenewOutcome::Expired) => log_problem(&format!(
+                    "Abgelaufen: {} ({}) braucht einen neuen Login - \
+                     `claude-account login {}`",
+                    profile.name, profile.email, profile.name
+                )),
+                Ok(RenewOutcome::RequestFailed(reason)) => log_problem(&format!(
+                    "Auffrischung von {} ohne Wirkung: {reason} - \
+                     naechster Versuch beim naechsten Durchlauf",
+                    profile.name
+                )),
+                Err(error) => log_problem(&format!(
+                    "Auffrischung fehlgeschlagen: {} - {error:#}",
+                    profile.name
+                )),
+            }
+        }
+        Ok(())
+    }
+
+    /// Laesst Claude Code den Login eines Profils in einem eigenen Konfigurationsverzeichnis
+    /// erneuern. Geschrieben wird nur, wenn danach ein vollstaendiger Login dasteht: schlaegt
+    /// der Refresh fehl, leert Claude Code die Datei, und ein leerer Stand darf den letzten
+    /// bekannten niemals ueberschreiben.
+    fn renew_profile(&self, profile: &Profile) -> Result<RenewOutcome> {
+        let snapshot = read_valid_credentials(&self.profile_credentials(&profile.name))?;
+        let workspace = self.renew_workspace(&profile.name)?;
+        let result = self.renew_in_workspace(&workspace, &snapshot);
+        // Das Verzeichnis haelt eine Kopie aktiver Zugangsdaten; es verschwindet in jedem Fall.
+        if let Err(error) = fs::remove_dir_all(&workspace) {
+            log_problem(&format!(
+                "Arbeitsverzeichnis konnte nicht entfernt werden: {} - {error}",
+                workspace.display()
+            ));
+        }
+
+        let attempt = result?;
+        let credentials = match attempt.credentials {
+            None => return Ok(RenewOutcome::Expired),
+            // Unveraendert heisst: Claude hat nichts erneuert. Bei einem gescheiterten Aufruf
+            // ist das kein Gesundheitszeugnis, sondern ein Fehlschlag - das Profil darf dann
+            // nicht als geprueft gelten, sonst laeuft seine echte Frist still weiter, waehrend
+            // das Journal gruen meldet.
+            Some(credentials) if credentials == snapshot => {
+                if let Some(failure) = attempt.failure {
+                    return Ok(RenewOutcome::RequestFailed(failure));
+                }
+                let _lock = self.lock()?;
+                let mut profile = profile.clone();
+                profile.credentials_synced_at = Some(unix_timestamp()?);
+                self.write_profile(&profile)?;
+                return Ok(RenewOutcome::StillValid);
+            }
+            Some(credentials) => credentials,
+        };
+
+        // Der Aufruf ging schief, hat aber trotzdem einen neuen Login hinterlassen: Claude
+        // rotiert, bevor es antwortet. Der Vorfall gehoert ins Journal, gesichert wird er
+        // trotzdem - sonst waere der Token unwiederbringlich weg.
+        if let Some(failure) = attempt.failure {
+            log_problem(&format!(
+                "{failure}; der bereits erneuerte Login von `{}` wird trotzdem gesichert",
+                profile.name
+            ));
+        }
+
+        // Ab hier gilt: der neue Token existiert nur noch hier, der alte ist serverseitig tot.
+        // Was jetzt nicht gespeichert wird, ist verloren - deshalb wird ab diesem Punkt nichts
+        // mehr abgebrochen, was sich nicht auf dieses Profil bezieht.
+        let _lock = self.lock()?;
+        let unchanged = fs::read(self.profile_credentials(&profile.name))
+            .is_ok_and(|current| current == snapshot);
+        if !unchanged {
+            bail!(
+                "Profil `{}` wurde waehrend der Auffrischung veraendert; \
+                 der erneuerte Login wurde verworfen",
+                profile.name
+            );
+        }
+
+        let mut profile = profile.clone();
+        atomic_write(
+            &self.profile_credentials(&profile.name),
+            &credentials,
+            0o600,
+        )?;
+        profile.credential_fingerprint = Some(credential_fingerprint(&credentials)?);
+        profile.credentials_synced_at = Some(unix_timestamp()?);
+        self.write_profile(&profile)?;
+        Ok(RenewOutcome::Renewed)
+    }
+
+    /// `Ok(None)` heisst: Claude konnte den Login nicht erneuern.
+    fn renew_in_workspace(&self, workspace: &Path, snapshot: &[u8]) -> Result<RenewalAttempt> {
+        let credentials = workspace.join(".credentials.json");
+        atomic_write(&credentials, snapshot, 0o600)?;
+
+        let mut child = Command::new(&self.paths.claude_bin)
+            .args(["-p", "ok", "--model", "haiku", "--strict-mcp-config"])
+            .env("CLAUDE_CONFIG_DIR", workspace)
+            .current_dir(workspace)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Claude konnte nicht gestartet werden: {}",
+                    self.paths.claude_bin.display()
+                )
+            })?;
+        // Ab dem Start des Prozesses darf nichts mehr ohne Rettungsversuch abbrechen: Claude
+        // rotiert den Token, bevor es antwortet. Ein Timeout oder Fehler nach diesem Punkt
+        // heisst nicht, dass kein neuer Login dasteht - er waere nur unwiederbringlich weg.
+        let timeout = self.keepalive_timeout();
+        let failure = match child.wait_timeout(timeout) {
+            Ok(Some(status)) if status.success() => None,
+            Ok(Some(status)) => Some(format!("Claude endete mit {status}")),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Some(format!(
+                    "Claude hat nach {} Sekunden nicht geantwortet",
+                    timeout.as_secs()
+                ))
+            }
+            Err(error) => Some(format!("Claude konnte nicht abgewartet werden: {error}")),
+        };
+
+        let renewed = fs::read(&credentials).with_context(|| {
+            format!(
+                "erneuerte Credentials konnten nicht gelesen werden: {}",
+                credentials.display()
+            )
+        })?;
+        Ok(RenewalAttempt {
+            credentials: validate_credentials(&renewed).ok().map(|()| renewed),
+            failure,
+        })
+    }
+
+    /// Testbar und im Notfall operativ anpassbar; der Standard reicht fuer einen Prompt samt
+    /// Retry-Backoff.
+    fn keepalive_timeout(&self) -> Duration {
+        let seconds = env::var("CLAUDE_ACCOUNT_SWITCHER_KEEPALIVE_TIMEOUT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(KEEPALIVE_REQUEST_TIMEOUT_SECONDS);
+        Duration::from_secs(seconds)
+    }
+
+    fn renew_workspace(&self, name: &str) -> Result<PathBuf> {
+        let workspace = self
+            .paths
+            .store
+            .join(format!(".renew-{name}-{}", std::process::id()));
+        if workspace.exists() {
+            fs::remove_dir_all(&workspace).with_context(|| {
+                format!(
+                    "altes Arbeitsverzeichnis konnte nicht entfernt werden: {}",
+                    workspace.display()
+                )
+            })?;
+        }
+        create_private_dir(&workspace)?;
+        Ok(workspace)
+    }
+
     fn watch_tick(&self) -> Result<Option<SyncOutcome>> {
         self.ensure_no_auth_override()?;
         let Some(_lock) = self.try_lock()? else {
             return Ok(None);
         };
         self.sync_locked(IdentitySource::ClaudeOnly).map(Some)
+    }
+
+    fn keepalive_tick(&self, max_age_days: u64) -> Result<()> {
+        self.ensure_no_auth_override()?;
+        self.keepalive_run(max_age_days)
     }
 
     /// Ermittelt, zu welchem Profil der gerade aktive Login gehoert.
@@ -837,14 +1131,23 @@ impl App {
     }
 
     fn lock(&self) -> Result<File> {
-        let lock = self.open_lock_file()?;
+        let lock = self.open_lock_file(".lock")?;
         FileExt::lock_exclusive(&lock).context("Account-Switcher ist bereits in Benutzung")?;
         Ok(lock)
     }
 
     /// Wie `lock`, wartet aber nicht. Fuer den Watcher: er darf ein offenes Menue nicht blockieren.
     fn try_lock(&self) -> Result<Option<File>> {
-        let lock = self.open_lock_file()?;
+        self.try_lock_path(".lock")
+    }
+
+    /// Eigenes, benanntes Lock fuer Ablaeufe, die sich nur untereinander ausschliessen.
+    fn try_lock_file(&self, name: &str) -> Result<Option<File>> {
+        self.try_lock_path(&format!(".{name}.lock"))
+    }
+
+    fn try_lock_path(&self, file_name: &str) -> Result<Option<File>> {
+        let lock = self.open_lock_file(file_name)?;
         match FileExt::try_lock_exclusive(&lock) {
             Ok(()) => Ok(Some(lock)),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -852,9 +1155,9 @@ impl App {
         }
     }
 
-    fn open_lock_file(&self) -> Result<File> {
+    fn open_lock_file(&self, file_name: &str) -> Result<File> {
         self.ensure_store()?;
-        let lock_path = self.paths.store.join(".lock");
+        let lock_path = self.paths.store.join(file_name);
         let lock = OpenOptions::new()
             .read(true)
             .write(true)

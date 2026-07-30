@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use claude_account_swapper::{App, DEFAULT_WATCH_INTERVAL_SECONDS};
+use claude_account_swapper::{App, DEFAULT_KEEPALIVE_MAX_AGE_DAYS, DEFAULT_WATCH_INTERVAL_SECONDS};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,6 +34,18 @@ enum AccountCommand {
         /// Pruefintervall in Sekunden
         #[arg(long, default_value_t = DEFAULT_WATCH_INTERVAL_SECONDS)]
         interval: u64,
+        /// Untaetige Profile nach so vielen Tagen auffrischen
+        #[arg(long, default_value_t = DEFAULT_KEEPALIVE_MAX_AGE_DAYS)]
+        keepalive_max_age_days: u64,
+        /// Untaetige Profile gar nicht auffrischen
+        #[arg(long)]
+        no_keepalive: bool,
+    },
+    /// Untaetige Profile auffrischen, damit ihr Login nicht ablaeuft
+    Keepalive {
+        /// Erst Profile auffrischen, die so lange nicht gesichert wurden
+        #[arg(long, default_value_t = DEFAULT_KEEPALIVE_MAX_AGE_DAYS)]
+        max_age_days: u64,
     },
 }
 
@@ -47,7 +59,12 @@ fn run() -> Result<()> {
         Some(AccountCommand::List) => app.list(),
         Some(AccountCommand::Status) => app.status(),
         Some(AccountCommand::Sync) => app.sync().map(|outcome| println!("{outcome}")),
-        Some(AccountCommand::Watch { interval }) => app.watch(interval),
+        Some(AccountCommand::Watch {
+            interval,
+            keepalive_max_age_days,
+            no_keepalive,
+        }) => app.watch(interval, (!no_keepalive).then_some(keepalive_max_age_days)),
+        Some(AccountCommand::Keepalive { max_age_days }) => app.keepalive(max_age_days),
         None => app.interactive(),
     }
 }

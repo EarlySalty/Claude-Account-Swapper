@@ -51,6 +51,35 @@ case "$1:$2" in
       /bin/cp "$FAKE_LOGIN_STATUS" "$FAKE_CLAUDE_STATUS"
     fi
     ;;
+  -p:*)
+    # Bildet einen echten Request nach: Claude Code erneuert dabei den Login in dem
+    # Konfigurationsverzeichnis, das gerade gilt. Ein verbrauchter Token wird geleert.
+    target="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+    if /bin/grep -q "refresh-dead" "$target" 2>/dev/null; then
+      printf '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}' >"$target"
+      echo "Failed to authenticate: OAuth session expired and could not be refreshed"
+      exit 0
+    fi
+    if [ "${FAKE_PROMPT_EXIT:-0}" -ne 0 ]; then
+      exit "$FAKE_PROMPT_EXIT"
+    fi
+    if [ -n "${FAKE_PROMPT_TOUCH_ACTIVE:-}" ]; then
+      /bin/cp "$FAKE_PROMPT_TOUCH_ACTIVE" "$HOME/.claude/.credentials.json"
+    fi
+    if [ "${FAKE_PROMPT_NOOP:-0}" -eq 1 ]; then
+      echo ok
+      exit 0
+    fi
+    # Der Token rotiert, bevor die Antwort kommt - ab hier ist der alte serverseitig tot.
+    /bin/sed -e 's/"accessToken":"[^"]*"/"accessToken":"access-renewed"/' \
+      -e 's/"refreshToken":"[^"]*"/"refreshToken":"refresh-renewed"/' \
+      "$target" >"$target.renewed"
+    /bin/mv "$target.renewed" "$target"
+    if [ -n "${FAKE_PROMPT_HANG:-}" ]; then
+      sleep "$FAKE_PROMPT_HANG"
+    fi
+    echo ok
+    ;;
   *)
     exit 64
     ;;
@@ -1096,6 +1125,276 @@ fn watch_logs_every_decision_including_the_ones_without_changes() {
     assert!(
         !log.contains("refresh-personal"),
         "Log darf keine Token enthalten: {log}"
+    );
+}
+
+#[test]
+fn keepalive_renews_an_idle_profile_without_touching_the_active_login() {
+    let harness = Harness::new();
+    harness.set_active("idle@example.test", "access-idle", "refresh-idle");
+    assert_success(&harness.run(&["save", "idle"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+    let active_before = fs::read(harness.active_credentials()).expect("active");
+    let aktiv_before = fs::read(harness.saved_credentials("aktiv")).expect("aktiv");
+
+    let output = harness.run(&["keepalive", "--max-age-days", "0"]);
+
+    assert_success(&output);
+    let idle = String::from_utf8(fs::read(harness.saved_credentials("idle")).expect("idle"))
+        .expect("utf8");
+    assert!(
+        idle.contains("refresh-renewed"),
+        "das untaetige Profil haette erneuert werden muessen: {idle}"
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        active_before,
+        "der aktive Login darf sich nicht aendern"
+    );
+    assert_eq!(
+        fs::read(harness.saved_credentials("aktiv")).expect("aktiv"),
+        aktiv_before,
+        "das aktive Profil versorgt der Watcher, nicht die Auffrischung"
+    );
+    assert_eq!(
+        fs::metadata(harness.saved_credentials("idle"))
+            .expect("idle metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn keepalive_keeps_an_expired_profile_untouched_and_says_so() {
+    let harness = Harness::new();
+    harness.set_active("tot@example.test", "access-dead", "refresh-dead");
+    assert_success(&harness.run(&["save", "tot"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+    let dead_before = fs::read(harness.saved_credentials("tot")).expect("tot");
+
+    let output = harness.run(&["keepalive", "--max-age-days", "0"]);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read(harness.saved_credentials("tot")).expect("tot"),
+        dead_before,
+        "ein abgelaufenes Profil darf nicht mit leeren Tokens ueberschrieben werden"
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        log.contains("tot") && log.contains("neuen Login"),
+        "der Fehlschlag muss benannt werden: {log}"
+    );
+}
+
+#[test]
+fn keepalive_skips_profiles_that_were_recently_synced() {
+    let harness = Harness::new();
+    harness.set_active("frisch@example.test", "access-frisch", "refresh-frisch");
+    assert_success(&harness.run(&["save", "frisch"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+    let frisch_before = fs::read(harness.saved_credentials("frisch")).expect("frisch");
+
+    let output = harness.run(&["keepalive"]);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read(harness.saved_credentials("frisch")).expect("frisch"),
+        frisch_before,
+        "gerade gesicherte Profile brauchen keinen Request"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("frisch"),
+        "auch das Ueberspringen gehoert ins Log"
+    );
+}
+
+#[test]
+fn keepalive_saves_the_renewed_login_even_if_the_active_one_changes_meanwhile() {
+    let harness = Harness::new();
+    harness.set_active("idle@example.test", "access-idle", "refresh-idle");
+    assert_success(&harness.run(&["save", "idle"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    // Eine beliebige andere Claude-Session verlaengert waehrenddessen ihren eigenen Login.
+    // Das ist alle paar Stunden normal und hat mit der Auffrischung nichts zu tun. Der
+    // erneuerte Token des Profils ist zu diesem Zeitpunkt serverseitig schon rotiert - wer
+    // ihn jetzt verwirft, hat das Profil endgueltig getoetet.
+    let interference = harness.home.join("interference.json");
+    write_credentials(&interference, "access-other", "refresh-other");
+    let output = harness
+        .command()
+        .args(["keepalive", "--max-age-days", "0"])
+        .env("FAKE_PROMPT_TOUCH_ACTIVE", &interference)
+        .output()
+        .expect("keepalive");
+
+    assert_success(&output);
+    let idle = String::from_utf8(fs::read(harness.saved_credentials("idle")).expect("idle"))
+        .expect("utf8");
+    assert!(
+        idle.contains("refresh-renewed"),
+        "der erneuerte Login muss gesichert werden, egal was der aktive Login tut: {idle}"
+    );
+}
+
+#[test]
+fn keepalive_rescues_the_renewed_login_when_the_request_runs_into_the_timeout() {
+    let harness = Harness::new();
+    harness.set_active("idle@example.test", "access-idle", "refresh-idle");
+    assert_success(&harness.run(&["save", "idle"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    // Claude rotiert den Token, bevor es antwortet, und haengt danach - etwa in einem
+    // Retry-Backoff. Der alte Token ist zu dem Zeitpunkt schon tot; wer den neuen wegen des
+    // Timeouts wegwirft, macht das Profil unrettbar.
+    let output = harness
+        .command()
+        .args(["keepalive", "--max-age-days", "0"])
+        .env("FAKE_PROMPT_HANG", "30")
+        .env("CLAUDE_ACCOUNT_SWITCHER_KEEPALIVE_TIMEOUT", "1")
+        .output()
+        .expect("keepalive");
+
+    assert_success(&output);
+    let idle = String::from_utf8(fs::read(harness.saved_credentials("idle")).expect("idle"))
+        .expect("utf8");
+    assert!(
+        idle.contains("refresh-renewed"),
+        "der rotierte Token muss trotz Timeout gesichert werden: {idle}"
+    );
+}
+
+#[test]
+fn keepalive_reports_a_failed_request_instead_of_calling_it_valid() {
+    let harness = Harness::new();
+    harness.set_active("idle@example.test", "access-idle", "refresh-idle");
+    assert_success(&harness.run(&["save", "idle"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    // Ein alter Sicherungszeitpunkt, wie ihn ein laenger untaetiges Profil traegt.
+    let profile_path = harness.store.join("accounts/idle/profile.json");
+    let mut profile: serde_json::Value =
+        serde_json::from_slice(&fs::read(&profile_path).expect("profile")).expect("json");
+    profile["credentials_synced_at"] = json!(1_700_000_000_u64);
+    fs::write(&profile_path, serde_json::to_vec(&profile).expect("json")).expect("write profile");
+
+    // Claude bricht ab, ohne etwas zu erneuern - Netzfehler, Rate-Limit, was auch immer.
+    // Der Snapshot ist unveraendert, aber die 30-Tage-Uhr laeuft weiter. Wer das als
+    // "noch gueltig" verbucht, laesst den Account still sterben und meldet dabei gruen.
+    let output = harness
+        .command()
+        .args(["keepalive", "--max-age-days", "0"])
+        .env("FAKE_PROMPT_EXIT", "1")
+        .output()
+        .expect("keepalive");
+
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        log.contains("idle") && !log.contains("noch gueltig"),
+        "ein gescheiterter Request darf nicht als gueltig gemeldet werden: {log}"
+    );
+    assert_eq!(
+        read_profile(&harness, "idle")
+            .get("credentials_synced_at")
+            .and_then(|value| value.as_u64()),
+        Some(1_700_000_000),
+        "nach einem Fehlschlag darf die Altersuhr nicht zurueckgesetzt werden"
+    );
+}
+
+#[test]
+fn keepalive_does_not_hunt_a_profile_that_needs_no_renewal() {
+    let harness = Harness::new();
+    harness.set_active("frisch@example.test", "access-frisch", "refresh-frisch");
+    assert_success(&harness.run(&["save", "frisch"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    // Erster Lauf: faellig, aber Claude sieht keinen Grund zu erneuern (Token unveraendert).
+    let mut command = harness.command();
+    command.args(["keepalive", "--max-age-days", "0"]);
+    command.env("FAKE_PROMPT_NOOP", "1");
+    assert_success(&command.output().expect("keepalive"));
+
+    // Zweiter Lauf mit normaler Altersgrenze: das Profil gilt jetzt als frisch geprueft.
+    let output = harness.run(&["keepalive"]);
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Tage alt"),
+        "ein gerade geprueftes Profil darf nicht erneut beschossen werden: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn keepalive_never_renews_the_login_that_is_currently_live() {
+    let harness = Harness::new();
+    harness.set_active("live@example.test", "access-live", "refresh-live");
+    assert_success(&harness.run(&["save", "live"]));
+    let live_before = fs::read(harness.saved_credentials("live")).expect("live");
+
+    // Ein veralteter Switcher-Status zeigt auf ein anderes Profil, obwohl die Tokens von
+    // `live` aktiv sind. Ohne Byte-Vergleich wuerde die Auffrischung den Token rotieren,
+    // den gerade eine laufende Session benutzt.
+    fs::write(
+        harness.store.join("state.json"),
+        br#"{"current":"gibt-es-nicht"}"#,
+    )
+    .expect("state");
+
+    let output = harness.run(&["keepalive", "--max-age-days", "0"]);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read(harness.saved_credentials("live")).expect("live"),
+        live_before,
+        "der aktuell benutzte Login darf nicht aufgefrischt werden"
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("active"),
+        live_before,
+        "und der aktive Login schon gar nicht"
+    );
+}
+
+#[test]
+fn keepalive_leaves_no_working_directory_behind() {
+    let harness = Harness::new();
+    harness.set_active("idle@example.test", "access-idle", "refresh-idle");
+    assert_success(&harness.run(&["save", "idle"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    assert_success(&harness.run(&["keepalive", "--max-age-days", "0"]));
+
+    // Ein Arbeitsverzeichnis haelt eine Kopie aktiver Zugangsdaten; nur `accounts` darf bleiben.
+    let leftovers: Vec<_> = fs::read_dir(&harness.store)
+        .expect("store")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "accounts")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "Arbeitsverzeichnisse mit Credentials duerfen nicht liegen bleiben: {leftovers:?}"
     );
 }
 

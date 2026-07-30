@@ -89,7 +89,8 @@ cd Claude-Account-Swapper
         <tr><td><code>list</code></td><td>Listet Profile, letzten Sicherungsstand und Token-Ablauf.</td></tr>
         <tr><td><code>status</code></td><td>Fragt Claude nach dem tatsaechlich aktiven Login.</td></tr>
         <tr><td><code>sync</code></td><td>Sichert von Claude verlaengerte Tokens einmalig ins aktive Profil.</td></tr>
-        <tr><td><code>watch</code></td><td>Macht dasselbe dauerhaft. <code>--interval &lt;sekunden&gt;</code>, Standard 5.</td></tr>
+        <tr><td><code>watch</code></td><td>Macht dasselbe dauerhaft und frischt untaetige Profile auf. <code>--interval &lt;sekunden&gt;</code>, Standard 5.</td></tr>
+        <tr><td><code>keepalive</code></td><td>Benutzt untaetige Profile, damit ihr Login nicht abläuft. <code>--max-age-days</code>, Standard 7.</td></tr>
         <tr><td><code>claude-account</code></td><td>Öffnet dasselbe Hauptmenü wie der Desktop-Starter.</td></tr>
       </tbody>
     </table>
@@ -108,6 +109,7 @@ cd Claude-Account-Swapper
     <p>Die Folgen waren <em>Login expired &middot; Please run /login</em> in Claude Code und ein Switcher, der die Tokens des neuen Kontos in das Profil des alten zurueckschrieb, weil <code>claude auth status</code> denselben veralteten Cache liest. Der Switcher entfernt darum beide Felder bei jedem Wechsel und laesst alle uebrigen Einstellungen in <code>~/.claude.json</code> unangetastet.</p>
 
     <h2>Warum Accounts ohne Hintergrunddienst ablaufen</h2>
+    <p>Die vollstaendige Analyse mit allen gemessenen Details steht unter <a href="lebensdauer.html">Warum Claude-Logins ablaufen</a>. Kurzfassung:</p>
     <p>Claude Code verlaengert seinen Login selbststaendig und tauscht dabei den Refresh-Token gegen einen neuen. Der alte ist danach verbraucht. Der Switcher hat den Profil-Snapshot frueher nur bei <code>save</code>, <code>switch</code> und <code>login</code> geschrieben &ndash; jede Verlaengerung dazwischen fehlte im Profil.</p>
     <p>Beim Wechsel zurueck landete dann der verbrauchte Token wieder in <code>~/.claude/.credentials.json</code>, und Claude Code meldete <em>Login expired &middot; Please run /login</em>. Der Wechsel selbst funktionierte dabei die ganze Zeit; veraltet war der gespeicherte Stand.</p>
     <p>Der Dienst <code>claude-account watch</code> beobachtet die aktive Credential-Datei und schreibt jede Verlaengerung sofort in das Profil, zu dem sie gehoert.</p>
@@ -130,6 +132,15 @@ claude-account list</code></pre>
 [2026-07-30 18:41:53] Aktualisiert: privat (du@example.com)
 [2026-07-30 18:42:03] Uebersprungen: Switcher wird gerade benutzt</code></pre>
     <p>Meldet der Dienst dauerhaft <code>ist nicht gespeichert</code> oder <code>passt zu mehreren Profilen</code>, gehoert der aktive Login zu keinem eindeutigen Profil. Dann einmal <code>claude-account save &lt;name&gt;</code> ausfuehren.</p>
+
+    <h3>Untaetige Profile am Leben halten</h3>
+    <p>Ein Snapshot kann perfekt gepflegt und trotzdem wertlos sein: der Refresh-Token laeuft rund 30 Tage nach seiner letzten Nutzung ab. Dagegen hilft nur, das Profil zu benutzen.</p>
+    <p>Der Dienst frischt darum alle zwoelf Stunden jedes Profil auf, das laenger als sieben Tage nicht gesichert wurde. Dafuer bekommt es einen minimalen Request in einem eigenen Konfigurationsverzeichnis &ndash; der aktiv eingeloggte Account bleibt unberuehrt, und vor dem Schreiben wird geprueft, dass er sich nicht veraendert hat. Manuell geht dasselbe mit <code>claude-account keepalive</code>.</p>
+    <pre><code>[2026-07-30 11:12:53] Untaetige Profile werden nach 7 Tagen aufgefrischt
+[2026-07-30 11:12:53] Auffrischung uebersprungen: privat ist aktiv
+[2026-07-30 11:12:55] Aufgefrischt: arbeit (du@example.com)
+[2026-07-30 11:12:57] Abgelaufen: alt (alt@example.com) braucht einen neuen Login</code></pre>
+    <p>Abschalten mit <code>watch --no-keepalive</code>. Ist ein Profil bereits abgelaufen, wird es nicht angefasst und nur gemeldet &ndash; retten kann es dann nur noch <code>claude-account login &lt;name&gt;</code>.</p>
 
     <h3>Was der Dienst nicht tut</h3>
     <p>Er schreibt nie in ein Profil, dessen Zuordnung unklar ist. Widersprechen sich Claudes Identitaets-Cache und der zuletzt vom Switcher gesetzte Account, bleibt alles unveraendert und der Grund steht im Journal &ndash; lieber ein nicht gesicherter Stand als fremde Tokens im falschen Profil.</p>
