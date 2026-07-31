@@ -1,5 +1,11 @@
 # Changelog
 
+## #7 — Fehlgeschlagene Prüfungen sagen jetzt, woran es lag
+
+Scheiterte die Prüfung eines gespeicherten Zugangs, stand in der Meldung nur „Claude endete mit exit status: 1". Ein erschöpftes Kontingent, ein toter Zugang und eine gestörte Verbindung sahen damit identisch aus — und keiner davon war behebbar, ohne zu raten.
+
+Die Meldung enthält ab jetzt Claudes eigene Begründung. Sieht ein Teil davon wie ein Zugangsschlüssel aus, wird er vorher entfernt, damit nichts Vertrauliches im Protokoll landet.
+
 ## #6 — Ein Wechsel reißt keine laufende Sitzung mehr ab
 
 Offene Claude-Sitzungen und IDE-Integrationen übernehmen den Account beim nächsten Befehl von selbst — auch mitten in der Arbeit. Genau deshalb traf ein Wechsel auf einen verbrauchten Zugang alle auf einmal: überall stand plötzlich „401 OAuth access token has expired".
