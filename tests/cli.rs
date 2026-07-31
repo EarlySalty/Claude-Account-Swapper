@@ -61,6 +61,9 @@ case "$1:$2" in
       exit 0
     fi
     if [ "${FAKE_PROMPT_EXIT:-0}" -ne 0 ]; then
+      if [ -n "${FAKE_PROMPT_STDERR:-}" ]; then
+        echo "$FAKE_PROMPT_STDERR" >&2
+      fi
       exit "$FAKE_PROMPT_EXIT"
     fi
     if [ -n "${FAKE_PROMPT_TOUCH_ACTIVE:-}" ]; then
@@ -1316,6 +1319,66 @@ fn keepalive_reports_a_failed_request_instead_of_calling_it_valid() {
             .and_then(|value| value.as_u64()),
         Some(1_700_000_000),
         "nach einem Fehlschlag darf die Altersuhr nicht zurueckgesetzt werden"
+    );
+}
+
+#[test]
+fn a_failed_request_reports_what_claude_wrote_to_stderr() {
+    let harness = Harness::new();
+    harness.set_active("idle@example.test", "access-idle", "refresh-idle");
+    assert_success(&harness.run(&["save", "idle"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    // Ohne Claudes eigene Begruendung ist "endete mit exit status: 1" nicht diagnostizierbar:
+    // Rate-Limit, abgelaufener Login und Netzfehler sehen identisch aus. Der Grund steht auf
+    // stderr und muss bis in die Meldung durchkommen.
+    let output = harness
+        .command()
+        .args(["keepalive", "--max-age-days", "0"])
+        .env("FAKE_PROMPT_EXIT", "1")
+        .env("FAKE_PROMPT_STDERR", "Claude AI usage limit reached")
+        .output()
+        .expect("keepalive");
+
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        log.contains("Claude AI usage limit reached"),
+        "der Grund von Claude muss in der Meldung stehen: {log}"
+    );
+}
+
+#[test]
+fn a_reported_reason_never_carries_a_token_into_the_log() {
+    let harness = Harness::new();
+    harness.set_active("idle@example.test", "access-idle", "refresh-idle");
+    assert_success(&harness.run(&["save", "idle"]));
+    harness.set_active("aktiv@example.test", "access-aktiv", "refresh-aktiv");
+    assert_success(&harness.run(&["save", "aktiv"]));
+
+    // Fehlermeldungen zitieren gelegentlich den Wert, an dem sie gescheitert sind. Im Journal
+    // stuende der dann dauerhaft - und das Journal liest jeder, der Logs anschaut.
+    let secret = "sk-ant-oat01-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let output = harness
+        .command()
+        .args(["keepalive", "--max-age-days", "0"])
+        .env("FAKE_PROMPT_EXIT", "1")
+        .env("FAKE_PROMPT_STDERR", format!("invalid bearer {secret}"))
+        .output()
+        .expect("keepalive");
+
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !log.contains(secret) && log.contains("invalid bearer"),
+        "der Grund gehoert ins Log, der Token nicht: {log}"
     );
 }
 

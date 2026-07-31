@@ -28,6 +28,10 @@ const KEEPALIVE_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 /// Restlaufzeit, ab der ein Access-Token vor einem Wechsel als sicher gilt. Darunter muesste
 /// Claude Code refreshen, und genau dabei kann ein verbrauchter Login auffliegen.
 const ACCESS_TOKEN_MIN_REMAINING_SECONDS: i64 = 5 * 60;
+/// Genug fuer einen ganzen Satz Fehlermeldung, zu wenig fuer eine gekippte Ausgabe.
+const STDERR_REASON_MAX_CHARS: usize = 300;
+/// Ab dieser Laenge ist ein zusammenhaengendes Wort kein Satzteil mehr, sondern ein Token.
+const SECRET_WORD_MIN_CHARS: usize = 40;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -1025,13 +1029,24 @@ impl App {
         let credentials = workspace.join(".credentials.json");
         atomic_write(&credentials, snapshot, 0o600)?;
 
+        // Claudes Begruendung wird in eine Datei geschrieben, nicht in eine Pipe: der Prozess
+        // wird mit Timeout abgewartet, und eine volllaufende Pipe wuerde ihn genau dort haengen
+        // lassen. Die Datei verschwindet mit dem Arbeitsverzeichnis.
+        let stderr_log = workspace.join("claude-stderr.log");
+        let stderr_sink = File::create(&stderr_log).with_context(|| {
+            format!(
+                "Fehlerausgabe konnte nicht angelegt werden: {}",
+                stderr_log.display()
+            )
+        })?;
+
         let mut child = Command::new(&self.paths.claude_bin)
             .args(["-p", "ok", "--model", "haiku", "--strict-mcp-config"])
             .env("CLAUDE_CONFIG_DIR", workspace)
             .current_dir(workspace)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr_sink))
             .spawn()
             .with_context(|| {
                 format!(
@@ -1056,6 +1071,12 @@ impl App {
             }
             Err(error) => Some(format!("Claude konnte nicht abgewartet werden: {error}")),
         };
+        // Ohne Claudes eigene Worte sind Rate-Limit, toter Refresh-Token und Netzfehler
+        // dieselbe Zeile - und damit nicht behebbar.
+        let failure = failure.map(|failure| match claude_reason(&stderr_log) {
+            Some(reason) => format!("{failure}: {reason}"),
+            None => failure,
+        });
 
         let renewed = fs::read(&credentials).with_context(|| {
             format!(
@@ -1619,6 +1640,45 @@ fn log_event(message: &str) {
 
 fn log_problem(message: &str) {
     eprintln!("[{}] {message}", chrono::Local::now().format("%F %T"));
+}
+
+/// Holt aus Claudes Fehlerausgabe die Zeile, die den Abbruch erklaert.
+///
+/// Genommen wird die letzte nicht-leere Zeile: Fortschrittsrauschen und Stacktraces stehen
+/// davor, die eigentliche Ursache zuletzt. Die Laenge ist begrenzt, damit eine Logzeile nicht
+/// eine ganze Ausgabe ins Journal kippt.
+fn claude_reason(path: &Path) -> Option<String> {
+    let output = fs::read_to_string(path).ok()?;
+    let line = output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let redacted = redact_secrets(line);
+    let mut reason: String = redacted.chars().take(STDERR_REASON_MAX_CHARS).collect();
+    if redacted.chars().count() > STDERR_REASON_MAX_CHARS {
+        reason.push_str(" ...");
+    }
+    Some(reason)
+}
+
+/// Ersetzt alles, was wie ein Token aussieht. Fehlermeldungen zitieren gelegentlich den Wert,
+/// der sie ausgeloest hat; im Journal steht er dann dauerhaft.
+fn redact_secrets(line: &str) -> String {
+    line.split_inclusive(char::is_whitespace)
+        .map(|word| {
+            let trimmed = word.trim_end();
+            if trimmed.len() >= SECRET_WORD_MIN_CHARS
+                && trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                word.replace(trimmed, "[entfernt]")
+            } else {
+                word.to_string()
+            }
+        })
+        .collect()
 }
 
 fn unix_timestamp() -> Result<u64> {
