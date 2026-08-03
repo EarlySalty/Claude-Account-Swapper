@@ -1721,3 +1721,326 @@ fn switch_to_the_active_account_never_rotates_the_live_login() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Bereits aktiv"));
 }
+
+/// Ein lokaler Ersatz fuer die Auslastungs-API. Antwortet je nach Access-Token, damit ein Test
+/// mehrere Accounts mit unterschiedlicher Auslastung nebeneinander stellen kann.
+struct UsageServer {
+    url: String,
+    server: std::sync::Arc<tiny_http::Server>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UsageServer {
+    fn start(responses: Vec<(&str, u16, String)>) -> Self {
+        let server = std::sync::Arc::new(
+            tiny_http::Server::http("127.0.0.1:0").expect("usage server startet"),
+        );
+        let url = format!("http://{}/usage", server.server_addr());
+        let responses: Vec<(String, u16, String)> = responses
+            .into_iter()
+            .map(|(token, status, body)| (token.to_owned(), status, body))
+            .collect();
+        let listener = std::sync::Arc::clone(&server);
+        let worker = std::thread::spawn(move || {
+            for request in listener.incoming_requests() {
+                let token = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("Authorization"))
+                    .map(|header| {
+                        header
+                            .value
+                            .as_str()
+                            .trim_start_matches("Bearer ")
+                            .to_owned()
+                    })
+                    .unwrap_or_default();
+                let (status, body) = responses
+                    .iter()
+                    .find(|(expected, _, _)| *expected == token)
+                    .map(|(_, status, body)| (*status, body.clone()))
+                    .unwrap_or_else(|| (401, r#"{"error":"unbekannter Token"}"#.to_owned()));
+                let response = tiny_http::Response::from_string(body).with_status_code(status);
+                let _ = request.respond(response);
+            }
+        });
+        Self {
+            url,
+            server,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for UsageServer {
+    fn drop(&mut self) {
+        self.server.unblock();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn usage_body(five: f64, seven: f64) -> String {
+    usage_body_with_resets(five, seven, "2026-08-03T20:00:00Z", "2026-08-09T02:00:00Z")
+}
+
+fn usage_body_with_resets(five: f64, seven: f64, five_reset: &str, seven_reset: &str) -> String {
+    json!({
+        "five_hour": {"utilization": five, "resets_at": five_reset, "limit_dollars": null},
+        "seven_day": {"utilization": seven, "resets_at": seven_reset},
+        "seven_day_opus": null,
+        "limits": [{"kind": "session", "percent": five, "severity": "normal"}]
+    })
+    .to_string()
+}
+
+/// Legt zwei gespeicherte Accounts an; `work` ist danach aktiv.
+fn harness_with_two_accounts() -> Harness {
+    let harness = Harness::new();
+    harness.set_active("personal@example.test", "access-personal", "refresh-p");
+    harness.write_claude_json("personal@example.test");
+    assert_success(&harness.run(&["save", "personal"]));
+
+    harness.set_active("work@example.test", "access-work", "refresh-w");
+    harness.write_claude_json("work@example.test");
+    assert_success(&harness.run(&["save", "work"]));
+    harness
+}
+
+#[test]
+fn auto_switches_to_the_account_with_free_limits() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(100.0, 40.0)),
+        ("access-personal", 200, usage_body(12.0, 30.0)),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Wechsel zu personal"), "{stdout}");
+    assert!(
+        stdout.contains("5h 100%"),
+        "Begruendung ohne Zahlen: {stdout}"
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(harness.store.join("state.json")).expect("state"))
+            .expect("state json");
+    assert_eq!(
+        state.get("current").and_then(|v| v.as_str()),
+        Some("personal")
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("live"),
+        fs::read(harness.saved_credentials("personal")).expect("snapshot"),
+        "der Login von personal muss live sein"
+    );
+}
+
+#[test]
+fn auto_keeps_the_active_account_below_the_threshold() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(97.0, 40.0)),
+        ("access-personal", 200, usage_body(0.0, 0.0)),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Kein Wechsel"), "{stdout}");
+    assert!(stdout.contains("5h 97%"), "{stdout}");
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("live"),
+        fs::read(harness.saved_credentials("work")).expect("snapshot"),
+        "es darf nichts gewechselt worden sein"
+    );
+}
+
+#[test]
+fn auto_dry_run_reports_without_switching() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(100.0, 40.0)),
+        ("access-personal", 200, usage_body(5.0, 5.0)),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Wuerde wechseln zu personal"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("live"),
+        fs::read(harness.saved_credentials("work")).expect("snapshot"),
+        "dry-run darf nichts anfassen"
+    );
+}
+
+#[test]
+fn auto_ignores_an_account_whose_weekly_limit_is_full() {
+    let harness = Harness::new();
+    harness.set_active("personal@example.test", "access-personal", "refresh-p");
+    harness.write_claude_json("personal@example.test");
+    assert_success(&harness.run(&["save", "personal"]));
+    harness.set_active("spare@example.test", "access-spare", "refresh-s");
+    harness.write_claude_json("spare@example.test");
+    assert_success(&harness.run(&["save", "spare"]));
+    harness.set_active("work@example.test", "access-work", "refresh-w");
+    harness.write_claude_json("work@example.test");
+    assert_success(&harness.run(&["save", "work"]));
+
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(100.0, 40.0)),
+        // Frei im Fuenf-Stunden-Fenster, aber das Wochenlimit ist voll: kein Ziel.
+        ("access-personal", 200, usage_body(1.0, 99.0)),
+        ("access-spare", 200, usage_body(60.0, 60.0)),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Wuerde wechseln zu spare"), "{stdout}");
+}
+
+#[test]
+fn auto_picks_the_earliest_reset_when_every_account_is_full() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        (
+            "access-work",
+            200,
+            usage_body_with_resets(100.0, 40.0, "2026-08-03T23:00:00Z", "2026-08-09T02:00:00Z"),
+        ),
+        (
+            "access-personal",
+            200,
+            usage_body_with_resets(100.0, 40.0, "2026-08-03T20:00:00Z", "2026-08-09T02:00:00Z"),
+        ),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Wuerde wechseln zu personal"), "{stdout}");
+    assert!(stdout.contains("alle Accounts sind voll"), "{stdout}");
+}
+
+#[test]
+fn auto_reports_an_unreachable_usage_api_and_switches_nothing() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 500, r#"{"error":"kaputt"}"#.to_owned()),
+        ("access-personal", 200, usage_body(1.0, 1.0)),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HTTP 500"),
+        "Fehler muss sichtbar sein: {stderr}"
+    );
+    assert!(
+        stderr.contains("Kein Wechsel"),
+        "die Nicht-Entscheidung muss protokolliert sein: {stderr}"
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("live"),
+        fs::read(harness.saved_credentials("work")).expect("snapshot"),
+        "ohne Zahlen darf nicht gewechselt werden"
+    );
+}
+
+#[test]
+fn auto_never_leaks_the_access_token_into_its_output() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![("access-personal", 200, usage_body(1.0, 1.0))]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto"])
+        .output()
+        .expect("auto");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !text.contains("access-work") && !text.contains("access-personal"),
+        "Access-Token darf nirgends auftauchen: {text}"
+    );
+}
+
+#[test]
+fn usage_lists_every_account_and_shows_failures() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(42.0, 17.0)),
+        ("access-personal", 503, r#"{"error":"weg"}"#.to_owned()),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["usage"])
+        .output()
+        .expect("usage");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("42.0%"), "{stdout}");
+    assert!(stdout.contains("17.0%"), "{stdout}");
+    assert!(
+        stdout.contains("nicht abrufbar") && stdout.contains("HTTP 503"),
+        "ein Ausfall muss sichtbar sein: {stdout}"
+    );
+}
+
+#[test]
+fn auto_rejects_an_impossible_threshold() {
+    let harness = harness_with_two_accounts();
+    let output = harness.run(&["auto", "--threshold", "140"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("zwischen 0 und 100"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

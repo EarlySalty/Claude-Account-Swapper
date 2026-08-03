@@ -14,6 +14,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use wait_timeout::ChildExt;
 
+pub mod usage;
+
+use usage::{Decision, Usage};
+
 const MAX_CREDENTIAL_SIZE: u64 = 1024 * 1024;
 /// Ab dieser Restlaufzeit des Refresh-Tokens warnt `list`.
 const REFRESH_TOKEN_WARN_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -23,6 +27,9 @@ pub const DEFAULT_WATCH_INTERVAL_SECONDS: u64 = 5;
 pub const DEFAULT_KEEPALIVE_MAX_AGE_DAYS: u64 = 7;
 /// Abstand zwischen zwei Auffrischungen im Dauerbetrieb.
 const KEEPALIVE_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
+/// Abstand zwischen zwei Limitpruefungen im Dauerbetrieb. Die Abfrage kostet kein Kontingent,
+/// eine Minute reicht aber: zwischen 98% und dem harten Limit liegt mehr als ein Request.
+const USAGE_CHECK_INTERVAL_SECONDS: u64 = 60;
 /// Ein haengender Request wuerde den Dienst sonst dauerhaft anhalten.
 const KEEPALIVE_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 /// Restlaufzeit, ab der ein Access-Token vor einem Wechsel als sicher gilt. Darunter muesste
@@ -768,7 +775,12 @@ impl App {
     ///
     /// Jeder Durchlauf wird protokolliert, auch die folgenlosen: eine stille Ablehnung sieht
     /// sonst wie ein erfolgreicher Sync aus.
-    pub fn watch(&self, interval_seconds: u64, keepalive_max_age_days: Option<u64>) -> Result<()> {
+    pub fn watch(
+        &self,
+        interval_seconds: u64,
+        keepalive_max_age_days: Option<u64>,
+        auto_switch_threshold: Option<f64>,
+    ) -> Result<()> {
         let interval = Duration::from_secs(interval_seconds.clamp(1, 3600));
         log_event(&format!(
             "Beobachte {} alle {}s",
@@ -781,10 +793,18 @@ impl App {
             )),
             None => log_event("Auffrischung untaetiger Profile ist abgeschaltet"),
         }
+        match auto_switch_threshold {
+            Some(threshold) => log_event(&format!(
+                "Auslastung wird alle {USAGE_CHECK_INTERVAL_SECONDS}s geprueft; \
+                 ab {threshold:.0}% wird der Account gewechselt"
+            )),
+            None => log_event("Automatischer Wechsel bei vollem Limit ist abgeschaltet"),
+        }
 
         let mut synced_stamp: Option<CredentialStamp> = None;
         let mut last_problem: Option<String> = None;
         let mut next_keepalive = SystemTime::now();
+        let mut next_usage_check = SystemTime::now();
         loop {
             if let Some(max_age_days) = keepalive_max_age_days
                 && SystemTime::now() >= next_keepalive
@@ -794,6 +814,16 @@ impl App {
                 match self.keepalive_tick(max_age_days) {
                     Ok(()) => {}
                     Err(error) => log_problem(&format!("Auffrischung fehlgeschlagen: {error:#}")),
+                }
+            }
+
+            if let Some(threshold) = auto_switch_threshold
+                && SystemTime::now() >= next_usage_check
+            {
+                next_usage_check =
+                    SystemTime::now() + Duration::from_secs(USAGE_CHECK_INTERVAL_SECONDS);
+                if let Err(error) = self.auto_switch_tick(threshold) {
+                    log_problem(&format!("Limitpruefung fehlgeschlagen: {error:#}"));
                 }
             }
 
@@ -920,6 +950,160 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Zeigt die Auslastung jedes gespeicherten Accounts.
+    ///
+    /// Ein Profil, dessen Auslastung nicht zu holen ist, wird als solches gemeldet und nicht
+    /// stillschweigend uebergangen - sonst sieht eine Luecke aus wie ein leerer Account.
+    pub fn usage(&self) -> Result<()> {
+        let profiles = self.load_profiles()?;
+        if profiles.is_empty() {
+            println!("Keine Accounts gespeichert. Starte mit: claude-account save <name>");
+            return Ok(());
+        }
+        let active = self.active_profile_name().ok();
+        for profile in &profiles {
+            let marker = if active.as_deref() == Some(profile.name.as_str()) {
+                "*"
+            } else {
+                " "
+            };
+            println!("{marker} {} - {}", profile.name, profile.email);
+            match self.profile_usage(profile, active.as_deref(), true) {
+                Ok(usage) => {
+                    println!(
+                        "    5h:  {:>5.1}%  {}",
+                        usage.five_hour.utilization,
+                        describe_reset(usage.five_hour.resets_at)
+                    );
+                    println!(
+                        "    7d:  {:>5.1}%  {}",
+                        usage.seven_day.utilization,
+                        describe_reset(usage.seven_day.resets_at)
+                    );
+                }
+                Err(error) => println!("    Auslastung nicht abrufbar: {error:#}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Wechselt den Account, wenn das Limit des aktiven Logins erreicht ist.
+    ///
+    /// `dry_run` entscheidet nur ueber die Ausfuehrung, nicht ueber die Auskunft: die
+    /// Entscheidung samt Zahlen wird in jedem Fall protokolliert.
+    pub fn auto_switch(&self, threshold: f64, dry_run: bool) -> Result<Decision> {
+        self.ensure_no_auth_override()?;
+        if !(0.0..=100.0).contains(&threshold) {
+            bail!("Schwelle muss zwischen 0 und 100 liegen");
+        }
+        let profiles = self.load_profiles()?;
+        if profiles.is_empty() {
+            bail!("Keine Accounts gespeichert; nutze `claude-account save <name>`");
+        }
+        let active = self.active_profile_name()?;
+
+        let mut usages = Vec::new();
+        for profile in &profiles {
+            match self.profile_usage(profile, Some(active.as_str()), true) {
+                Ok(usage) => {
+                    log_event(&format!(
+                        "Auslastung {}: 5h {:.0}%, 7d {:.0}%",
+                        profile.name, usage.five_hour.utilization, usage.seven_day.utilization
+                    ));
+                    usages.push((profile.name.clone(), usage));
+                }
+                // Ein Account, dessen Auslastung unbekannt ist, darf nicht gewaehlt werden:
+                // ein Wechsel auf gut Glueck kann in einem ebenfalls vollen Limit landen.
+                Err(error) => log_problem(&format!(
+                    "Auslastung von {} nicht abrufbar, faellt als Ziel aus: {error:#}",
+                    profile.name
+                )),
+            }
+        }
+
+        let decision = usage::pick_target(&active, &usages, threshold);
+        match &decision {
+            Decision::Stay { reason } => log_event(&format!("Kein Wechsel: {reason}")),
+            Decision::NoCandidate { reason } => log_problem(&format!("Kein Wechsel: {reason}")),
+            Decision::SwitchTo { name, reason } if dry_run => {
+                log_event(&format!("Wuerde wechseln zu {name}: {reason}"));
+            }
+            Decision::SwitchTo { name, reason } => {
+                log_event(&format!("Wechsel zu {name}: {reason}"));
+                self.switch_checked(name, true)?;
+            }
+        }
+        Ok(decision)
+    }
+
+    /// Der Name des Profils, das gerade aktiv ist.
+    fn active_profile_name(&self) -> Result<String> {
+        let status = self.auth_status()?;
+        Ok(self.resolve_active_profile(&status)?.name)
+    }
+
+    /// Holt die Auslastung eines Profils.
+    ///
+    /// Der Token stammt aus der Live-Datei, sobald das Profil der aktuell benutzte Login ist -
+    /// sein Snapshot kann aelter sein, und ein abgelaufener Token aus dem Snapshot wuerde eine
+    /// Auffrischung ausloesen, die den laufenden Login unter offenen Sessions wegrotiert.
+    fn profile_usage(
+        &self,
+        profile: &Profile,
+        active: Option<&str>,
+        allow_renew: bool,
+    ) -> Result<Usage> {
+        let live = fs::read(&self.paths.credentials).ok();
+        let snapshot = fs::read(self.profile_credentials(&profile.name)).ok();
+        let is_live = active == Some(profile.name.as_str())
+            || (snapshot.is_some() && snapshot == live && live.is_some());
+
+        let credentials = if is_live {
+            live.or(snapshot)
+                .context("weder aktiver Login noch Snapshot lesbar")?
+        } else {
+            snapshot.context("kein gespeicherter Login vorhanden")?
+        };
+
+        let credentials = if needs_refresh(&credentials) {
+            if is_live {
+                bail!(
+                    "Access-Token des aktiven Logins ist abgelaufen; \
+                     Claude Code erneuert ihn beim naechsten Request"
+                );
+            }
+            if !allow_renew {
+                bail!("Access-Token ist abgelaufen");
+            }
+            match self.renew_snapshot(profile, Locking::Acquire)? {
+                RenewResult::Renewed(credentials) | RenewResult::StillValid(credentials) => {
+                    credentials
+                }
+                RenewResult::Expired => bail!(
+                    "gespeicherter Login ist verbraucht - `claude-account login {}`",
+                    profile.name
+                ),
+                RenewResult::RequestFailed(reason) => {
+                    bail!("Login liess sich nicht auffrischen: {reason}")
+                }
+            }
+        } else {
+            credentials
+        };
+
+        usage::fetch(&read_access_token(&credentials)?)
+    }
+
+    fn auto_switch_tick(&self, threshold: f64) -> Result<()> {
+        // Eigenes Lock: zwei ueberlappende Pruefungen wuerden dieselben Zahlen zweimal holen
+        // und im schlimmsten Fall zweimal hintereinander wechseln.
+        let Some(_lock) = self.try_lock_file("autoswitch")? else {
+            log_event("Limitpruefung laeuft bereits");
+            return Ok(());
+        };
+        self.auto_switch(threshold, false).map(|_| ())
     }
 
     fn renew_profile(&self, profile: &Profile) -> Result<RenewOutcome> {
@@ -1602,6 +1786,22 @@ fn needs_refresh(credentials: &[u8]) -> bool {
     expires_at / 1000 <= now as i64 + ACCESS_TOKEN_MIN_REMAINING_SECONDS
 }
 
+/// Liest den Access-Token aus einem Credential-Stand.
+///
+/// Der Rueckgabewert ist ein Geheimnis: er darf nur in einen Authorization-Header, nie in ein
+/// Log, ein Kommandozeilenargument oder eine Fehlermeldung.
+fn read_access_token(credentials: &[u8]) -> Result<String> {
+    let value: Value = serde_json::from_slice(credentials)
+        .context("Claude-Credentials sind kein gueltiges JSON")?;
+    value
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("accessToken"))
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .context("Claude-Credentials enthalten keinen Access-Token")
+}
+
 fn read_refresh_token_expiry(path: &Path) -> Result<Option<i64>> {
     let data = read_credential_bytes(path)?;
     let value: Value =
@@ -1620,6 +1820,15 @@ type CredentialStamp = (i64, u64, u64);
 fn credential_stamp(path: &Path) -> Option<CredentialStamp> {
     let metadata = fs::metadata(path).ok()?;
     Some((metadata.mtime(), metadata.len(), metadata.ino()))
+}
+
+/// Ein Fenster ohne Reset-Zeitpunkt wurde noch nicht angebrochen; das gehoert so in die
+/// Ausgabe und nicht als leere Stelle.
+fn describe_reset(resets_at: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    match resets_at {
+        Some(resets_at) => format!("frei ab {}", format_timestamp(resets_at.timestamp())),
+        None => "kein laufendes Fenster".to_owned(),
+    }
 }
 
 fn format_timestamp(seconds: i64) -> String {

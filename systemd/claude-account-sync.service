@@ -9,6 +9,8 @@ Type=simple
 # zusaetzlich den konkret gefundenen Pfad, siehe install.sh.
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
 __CLAUDE_BIN_ENV__
+# `watch` sichert rotierte Tokens, frischt untaetige Profile auf und wechselt bei vollem
+# Fuenf-Stunden-Limit selbst den Account. Wer den Wechsel nicht will: `watch --no-auto-switch`.
 ExecStart=__BINARY__ watch
 Restart=always
 RestartSec=5
