@@ -73,6 +73,8 @@ Ohne Argument öffnet `claude-account` dasselbe Hauptmenü wie der Desktop-Start
 | `claude-account switch <name>` | Wechselt atomar zum gespeicherten Account, nachdem der gespeicherte Login geprueft wurde. `--no-check` ueberspringt die Pruefung. Alias: `use`. |
 | `claude-account list` | Zeigt alle Profile, den letzten Sicherungsstand und den Token-Ablauf. |
 | `claude-account status` | Zeigt den von Claude bestaetigten aktiven Account. |
+| `claude-account usage` | Zeigt fuer jedes Profil die Auslastung des Fuenf-Stunden- und des Wochenfensters samt Reset-Zeitpunkt. |
+| `claude-account auto` | Wechselt auf den Account mit den meisten freien Kontingenten, wenn das aktive Limit voll ist. `--threshold <prozent>`, Standard 98. `--dry-run` zeigt nur die Entscheidung. |
 | `claude-account sync` | Sichert von Claude rotierte Tokens einmalig ins aktive Profil. |
 | `claude-account watch` | Macht dasselbe dauerhaft und frischt untaetige Profile auf; laeuft als Hintergrunddienst. `--interval <sekunden>`, Standard 5. |
 | `claude-account keepalive` | Benutzt untaetige Profile, damit ihr Login nicht abläuft. `--max-age-days <tage>`, Standard 7. |
@@ -133,6 +135,20 @@ Der Dienst frischt darum alle zwoelf Stunden jedes Profil auf, das laenger als s
 ```
 
 Manuell: `claude-account keepalive`. Abschalten: `watch --no-keepalive`. Ein bereits abgelaufenes Profil wird nicht angefasst, sondern nur gemeldet — retten kann es dann nur noch `claude-account login <name>`.
+
+### Bei vollem Limit selbst wechseln
+
+Anthropic meldet die Auslastung zum Login, nicht zum Geraet. Damit laesst sich auch die Auslastung eines Accounts lesen, der gerade nicht aktiv ist — und genau das macht einen Wechsel moeglich, bevor die Arbeit steht. Die Abfrage verbraucht selbst kein Kontingent.
+
+Der Dienst prueft darum jede Minute alle Profile. Erreicht das Fuenf-Stunden-Fenster des aktiven Accounts 98 Prozent, wechselt er auf den Account mit der niedrigsten Auslastung. Ein Account, dessen Wochenlimit voll ist, faellt dabei aus, auch wenn sein kurzes Fenster leer ist. Ist kein Account frei, gewinnt der mit dem fruehesten Reset — wobei ein Account erst dann als frei gilt, wenn *alle* seine vollen Fenster zurueckgesetzt sind.
+
+```text
+[2026-08-03 18:38:35] Auslastung privat: 5h 96%, 7d 37%
+[2026-08-03 18:38:35] Auslastung arbeit: 5h 100%, 7d 76%
+[2026-08-03 18:38:35] Wuerde wechseln zu arbeit: alle Accounts sind voll; `privat` (5h 96%, 7d 37%, Schwelle 90%) wartet laenger als `arbeit` (5h 100%, 7d 76%, Schwelle 90%, frei ab 2026-08-03 21:39)
+```
+
+Ein Account, dessen Auslastung sich nicht abrufen laesst, wird als Ziel ausgeschlossen und mit Grund gemeldet: ein Wechsel auf gut Glueck kann im naechsten vollen Limit landen. Schwelle aendern: `watch --auto-switch-threshold 95`. Abschalten: `watch --no-auto-switch`. Einzeln pruefen: `claude-account usage`, `claude-account auto --dry-run`.
 
 ### Was der Dienst nicht tut
 

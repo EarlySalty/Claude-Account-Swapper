@@ -1,5 +1,13 @@
 # Changelog
 
+## #8 — Wechselt von selbst, bevor das Limit zuschlägt
+
+Bisher merkte man erst mitten in der Arbeit, dass das Fünf-Stunden-Kontingent aufgebraucht war — und musste dann von Hand suchen, welcher der gespeicherten Accounts überhaupt noch Luft hat.
+
+Der Hintergrunddienst liest jetzt einmal pro Minute die Auslastung aller gespeicherten Accounts und wechselt ab 98 Prozent selbstständig auf den mit den meisten freien Kontingenten. Ist gerade keiner frei, wird der genommen, dessen Limit am frühesten wieder zurückgesetzt wird; das Wochenlimit zählt dabei genauso wie das Fünf-Stunden-Fenster. Jede Entscheidung steht mit ihren Zahlen im Protokoll, auch die gegen einen Wechsel.
+
+Die Auslastung lässt sich mit `claude-account usage` jederzeit ansehen, die Entscheidung mit `claude-account auto --dry-run` durchspielen. Abschalten: `watch --no-auto-switch`.
+
 ## #7 — Fehlgeschlagene Prüfungen sagen jetzt, woran es lag
 
 Scheiterte die Prüfung eines gespeicherten Zugangs, stand in der Meldung nur „Claude endete mit exit status: 1". Ein erschöpftes Kontingent, ein toter Zugang und eine gestörte Verbindung sahen damit identisch aus — und keiner davon war behebbar, ohne zu raten.

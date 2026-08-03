@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use claude_account_swapper::usage::DEFAULT_SWITCH_THRESHOLD;
 use claude_account_swapper::{App, DEFAULT_KEEPALIVE_MAX_AGE_DAYS, DEFAULT_WATCH_INTERVAL_SECONDS};
 
 #[derive(Debug, Parser)]
@@ -30,6 +31,17 @@ enum AccountCommand {
     },
     /// Gespeicherte Accounts anzeigen
     List,
+    /// Nutzungslimits aller gespeicherten Accounts anzeigen
+    Usage,
+    /// Bei vollem Limit auf den Account mit den meisten freien Kontingenten wechseln
+    Auto {
+        /// Ab dieser Auslastung in Prozent gilt ein Limit als verbraucht
+        #[arg(long, default_value_t = DEFAULT_SWITCH_THRESHOLD)]
+        threshold: f64,
+        /// Entscheidung nur anzeigen, nicht wechseln
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Aktiven Claude-Login anzeigen
     Status,
     /// Von Claude rotierte Tokens einmalig ins aktive Profil sichern
@@ -45,6 +57,12 @@ enum AccountCommand {
         /// Untaetige Profile gar nicht auffrischen
         #[arg(long)]
         no_keepalive: bool,
+        /// Ab dieser Auslastung in Prozent wird automatisch gewechselt
+        #[arg(long, default_value_t = DEFAULT_SWITCH_THRESHOLD)]
+        auto_switch_threshold: f64,
+        /// Bei vollem Limit nicht automatisch wechseln
+        #[arg(long)]
+        no_auto_switch: bool,
     },
     /// Untaetige Profile auffrischen, damit ihr Login nicht ablaeuft
     Keepalive {
@@ -63,12 +81,22 @@ fn run() -> Result<()> {
         Some(AccountCommand::Switch { name, no_check }) => app.switch_checked(&name, !no_check),
         Some(AccountCommand::List) => app.list(),
         Some(AccountCommand::Status) => app.status(),
+        Some(AccountCommand::Usage) => app.usage(),
+        Some(AccountCommand::Auto { threshold, dry_run }) => {
+            app.auto_switch(threshold, dry_run).map(|_| ())
+        }
         Some(AccountCommand::Sync) => app.sync().map(|outcome| println!("{outcome}")),
         Some(AccountCommand::Watch {
             interval,
             keepalive_max_age_days,
             no_keepalive,
-        }) => app.watch(interval, (!no_keepalive).then_some(keepalive_max_age_days)),
+            auto_switch_threshold,
+            no_auto_switch,
+        }) => app.watch(
+            interval,
+            (!no_keepalive).then_some(keepalive_max_age_days),
+            (!no_auto_switch).then_some(auto_switch_threshold),
+        ),
         Some(AccountCommand::Keepalive { max_age_days }) => app.keepalive(max_age_days),
         None => app.interactive(),
     }
