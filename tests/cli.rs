@@ -2044,3 +2044,160 @@ fn auto_rejects_an_impossible_threshold() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn limit_stores_its_own_stops_in_the_profile() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["limit", "personal", "--five-hour", "80"]));
+    assert_success(&harness.run(&["limit", "personal", "--seven-day", "50", "--hard"]));
+
+    let profile = read_profile(&harness, "personal");
+    let limits = profile.get("limits").expect("limits");
+    assert_eq!(limits.get("five_hour").and_then(|v| v.as_f64()), Some(80.0));
+    assert_eq!(limits.get("seven_day").and_then(|v| v.as_f64()), Some(50.0));
+    assert_eq!(limits.get("hard").and_then(|v| v.as_bool()), Some(true));
+
+    assert_success(&harness.run(&["limit", "personal", "--clear"]));
+    let profile = read_profile(&harness, "personal");
+    let limits = profile.get("limits").expect("limits");
+    assert!(limits.get("five_hour").is_none(), "{limits}");
+    assert!(limits.get("seven_day").is_none(), "{limits}");
+}
+
+#[test]
+fn saving_an_account_again_keeps_its_limits() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["limit", "work", "--five-hour", "70"]));
+
+    // Erneutes Speichern sichert Tokens; die Konfiguration darf es nicht zuruecksetzen.
+    assert_success(&harness.run(&["save", "work"]));
+    let profile = read_profile(&harness, "work");
+    assert_eq!(
+        profile
+            .get("limits")
+            .and_then(|limits| limits.get("five_hour"))
+            .and_then(|v| v.as_f64()),
+        Some(70.0)
+    );
+}
+
+#[test]
+fn auto_leaves_an_account_at_its_own_stop() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["limit", "work", "--five-hour", "80"]));
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(85.0, 20.0)),
+        ("access-personal", 200, usage_body(90.0, 20.0)),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Ohne eigene Grenze bliebe `work` bei 85% stehen; mit ihr wechselt er auf den
+    // absolut voelleren, aber unbegrenzten Account.
+    assert!(stdout.contains("Wuerde wechseln zu personal"), "{stdout}");
+    assert!(stdout.contains("5h 85%/80%"), "{stdout}");
+}
+
+#[test]
+fn auto_never_switches_onto_an_account_beyond_its_own_stop() {
+    let harness = Harness::new();
+    harness.set_active("personal@example.test", "access-personal", "refresh-p");
+    harness.write_claude_json("personal@example.test");
+    assert_success(&harness.run(&["save", "personal"]));
+    harness.set_active("spare@example.test", "access-spare", "refresh-s");
+    harness.write_claude_json("spare@example.test");
+    assert_success(&harness.run(&["save", "spare"]));
+    harness.set_active("work@example.test", "access-work", "refresh-w");
+    harness.write_claude_json("work@example.test");
+    assert_success(&harness.run(&["save", "work"]));
+    assert_success(&harness.run(&["limit", "personal", "--five-hour", "30"]));
+
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(100.0, 20.0)),
+        // Absolut der freieste, aber ueber seiner eigenen Grenze.
+        ("access-personal", 200, usage_body(40.0, 20.0)),
+        ("access-spare", 200, usage_body(70.0, 20.0)),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Wuerde wechseln zu spare"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn auto_breaks_into_a_soft_reserve_when_nothing_else_is_left() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["limit", "personal", "--five-hour", "30"]));
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(100.0, 20.0)),
+        ("access-personal", 200, usage_body(40.0, 20.0)),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Wuerde wechseln zu personal"), "{stdout}");
+    assert!(stdout.contains("Reserve"), "{stdout}");
+}
+
+#[test]
+fn auto_respects_a_hard_stop_even_with_nothing_else_left() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["limit", "personal", "--five-hour", "30", "--hard"]));
+    let server = UsageServer::start(vec![
+        (
+            "access-work",
+            200,
+            usage_body_with_resets(100.0, 20.0, "2026-08-03T20:00:00Z", "2026-08-09T02:00:00Z"),
+        ),
+        (
+            "access-personal",
+            200,
+            usage_body_with_resets(40.0, 20.0, "2026-08-03T23:00:00Z", "2026-08-09T02:00:00Z"),
+        ),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Kein Wechsel"), "{stdout}");
+}
+
+#[test]
+fn limit_rejects_impossible_values_and_unknown_profiles() {
+    let harness = harness_with_two_accounts();
+    let output = harness.run(&["limit", "work", "--five-hour", "150"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("zwischen 0 und 100"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = harness.run(&["limit", "gibtsnicht", "--five-hour", "50"]);
+    assert!(!output.status.success());
+}

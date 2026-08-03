@@ -1,5 +1,13 @@
 # Changelog
 
+## #9 — Jeder Account kann seine eigene Grenze bekommen
+
+Bisher galt für alle Accounts dieselbe Schwelle. Wer einem Account einen Teil seines Kontingents freihalten wollte — etwa das Wochenlimit für etwas Bestimmtes — konnte das nicht ausdrücken.
+
+Ab jetzt lässt sich pro Account festlegen, ab wie viel Prozent er verlassen wird, getrennt für das Fünf-Stunden- und das Wochenfenster. Eine gesetzte Grenze schützt den Account auch davor, als Ziel gewählt zu werden — sonst wäre die Reserve wertlos. Ist am Ende kein Account mehr unter seiner Grenze, wird eine Reserve angebrochen, statt die Arbeit stehenzulassen; im Protokoll steht dann genau das. Wer das nicht will, macht die Grenze hart: dann wird lieber gewartet.
+
+Gesetzt wird sie mit `claude-account limit <name> --five-hour 80 --seven-day 50`, entfernt mit `--clear`. Erneutes Speichern eines Accounts lässt die Grenzen unangetastet.
+
 ## #8 — Wechselt von selbst, bevor das Limit zuschlägt
 
 Bisher merkte man erst mitten in der Arbeit, dass das Fünf-Stunden-Kontingent aufgebraucht war — und musste dann von Hand suchen, welcher der gespeicherten Accounts überhaupt noch Luft hat.

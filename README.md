@@ -75,6 +75,7 @@ Ohne Argument öffnet `claude-account` dasselbe Hauptmenü wie der Desktop-Start
 | `claude-account status` | Zeigt den von Claude bestaetigten aktiven Account. |
 | `claude-account usage` | Zeigt fuer jedes Profil die Auslastung des Fuenf-Stunden- und des Wochenfensters samt Reset-Zeitpunkt. |
 | `claude-account auto` | Wechselt auf den Account mit den meisten freien Kontingenten, wenn das aktive Limit voll ist. `--threshold <prozent>`, Standard 98. `--dry-run` zeigt nur die Entscheidung. |
+| `claude-account limit <name>` | Setzt die eigene Grenze eines Accounts: `--five-hour <prozent>`, `--seven-day <prozent>`. `--hard` verbietet das Anbrechen, `--soft` erlaubt es wieder, `--clear` entfernt die Grenzen. |
 | `claude-account sync` | Sichert von Claude rotierte Tokens einmalig ins aktive Profil. |
 | `claude-account watch` | Macht dasselbe dauerhaft und frischt untaetige Profile auf; laeuft als Hintergrunddienst. `--interval <sekunden>`, Standard 5. |
 | `claude-account keepalive` | Benutzt untaetige Profile, damit ihr Login nicht abläuft. `--max-age-days <tage>`, Standard 7. |
@@ -149,6 +150,26 @@ Der Dienst prueft darum jede Minute alle Profile. Erreicht das Fuenf-Stunden-Fen
 ```
 
 Ein Account, dessen Auslastung sich nicht abrufen laesst, wird als Ziel ausgeschlossen und mit Grund gemeldet: ein Wechsel auf gut Glueck kann im naechsten vollen Limit landen. Schwelle aendern: `watch --auto-switch-threshold 95`. Abschalten: `watch --no-auto-switch`. Einzeln pruefen: `claude-account usage`, `claude-account auto --dry-run`.
+
+#### Eigene Grenzen pro Account
+
+Die globale Schwelle sagt „bis hierhin darf jeder Account". Soll ein einzelner Account frueher in Ruhe gelassen werden — etwa weil sein Wochenkontingent fuer etwas anderes freibleiben soll — bekommt er eine eigene Grenze:
+
+```bash
+claude-account limit arbeit --five-hour 80 --seven-day 50
+claude-account limit reserve --seven-day 20 --hard
+claude-account limit arbeit --clear
+```
+
+Beide Angaben sind unabhaengig; was nicht gesetzt ist, faellt auf die globale Schwelle zurueck. Eine Grenze wirkt in beide Richtungen: der Account wird bei Erreichen verlassen **und** nicht mehr als Ziel gewaehlt. Ohne diese zweite Haelfte waere die Reserve wertlos — der naechste Wechsel wuerde sie sofort wieder anbrechen.
+
+Genau daraus folgt der Notfall: waeren alle Accounts ueber ihren eigenen Grenzen, gaebe es kein Ziel mehr, obwohl ueberall noch Kontingent liegt. Deshalb laeuft die Auswahl in drei Stufen.
+
+1. Ein Account unter seiner eigenen Grenze — der freieste gewinnt.
+2. Gibt es keinen: ein Account mit echtem Restkontingent. Seine Reserve wird angebrochen, und das steht so im Protokoll.
+3. Gibt es auch den nicht: der Account, der am fruehesten wieder frei wird.
+
+`--hard` nimmt einen Account aus Stufe 2 heraus: seine Grenze wird nie angebrochen, dann wird lieber gewartet. Erneutes `claude-account save` sichert nur Tokens und laesst die Grenzen stehen. `claude-account list` und `claude-account usage` zeigen sie mit an.
 
 ### Was der Dienst nicht tut
 

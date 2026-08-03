@@ -16,7 +16,7 @@ use wait_timeout::ChildExt;
 
 pub mod usage;
 
-use usage::{Decision, Usage};
+use usage::{Candidate, Decision, Stops, Usage};
 
 const MAX_CREDENTIAL_SIZE: u64 = 1024 * 1024;
 /// Ab dieser Restlaufzeit des Refresh-Tokens warnt `list`.
@@ -106,6 +106,9 @@ struct Profile {
     /// wochenlang gelten und trotzdem verbraucht sein. Nur der gescheiterte Versuch beweist es.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     login_failed_at: Option<u64>,
+    /// Eigene Nutzungsgrenzen dieses Accounts. Fehlen sie, gilt die globale Schwelle.
+    #[serde(default)]
+    limits: Stops,
 }
 
 /// Woher die Zuordnung "aktiver Login gehoert zu Profil X" stammen darf.
@@ -413,7 +416,12 @@ impl App {
                 .as_deref()
                 .map(|value| format!(" [{value}]"))
                 .unwrap_or_default();
-            println!("{marker} {} - {}{plan}", profile.name, profile.email);
+            println!(
+                "{marker} {} - {}{plan}{}",
+                profile.name,
+                profile.email,
+                describe_stops(&profile.limits)
+            );
             for line in self.snapshot_report(&profile) {
                 println!("    {line}");
             }
@@ -662,8 +670,9 @@ impl App {
         let email = status.email()?.to_owned();
         let credentials = read_valid_credentials(&self.paths.credentials)?;
 
-        if let Ok(existing) = self.load_profile(name)
-            && !status.matches(&existing)
+        let existing = self.load_profile(name).ok();
+        if let Some(existing) = &existing
+            && !status.matches(existing)
         {
             bail!(
                 "Profil `{name}` gehoert zu {}; waehle einen anderen Namen",
@@ -681,6 +690,8 @@ impl App {
             credential_fingerprint: Some(credential_fingerprint(&credentials)?),
             credentials_synced_at: Some(unix_timestamp()?),
             login_failed_at: None,
+            // Ein erneutes `save` sichert Tokens, es setzt keine Konfiguration zurueck.
+            limits: existing.map(|existing| existing.limits).unwrap_or_default(),
         };
         let profile_dir = self.profile_dir(name);
         create_private_dir(&profile_dir)?;
@@ -969,7 +980,12 @@ impl App {
             } else {
                 " "
             };
-            println!("{marker} {} - {}", profile.name, profile.email);
+            println!(
+                "{marker} {} - {}{}",
+                profile.name,
+                profile.email,
+                describe_stops(&profile.limits)
+            );
             match self.profile_usage(profile, active.as_deref(), true) {
                 Ok(usage) => {
                     println!(
@@ -985,6 +1001,55 @@ impl App {
                 }
                 Err(error) => println!("    Auslastung nicht abrufbar: {error:#}"),
             }
+        }
+        Ok(())
+    }
+
+    /// Setzt oder loescht die eigenen Nutzungsgrenzen eines Accounts.
+    ///
+    /// `None` bei beiden Werten und `clear` heisst loeschen; ansonsten wird nur ueberschrieben,
+    /// was angegeben ist - sonst wuerde ein Aufruf fuer das Wochenfenster die Grenze fuer das
+    /// Fuenf-Stunden-Fenster stillschweigend mitnehmen.
+    pub fn set_limits(
+        &self,
+        name: &str,
+        five_hour: Option<f64>,
+        seven_day: Option<f64>,
+        hard: Option<bool>,
+        clear: bool,
+    ) -> Result<()> {
+        validate_name(name)?;
+        for value in [five_hour, seven_day].into_iter().flatten() {
+            if !(0.0..=100.0).contains(&value) {
+                bail!("Grenzen muessen zwischen 0 und 100 liegen");
+            }
+        }
+        let _lock = self.lock()?;
+        let mut profile = self.load_profile(name)?;
+        if clear {
+            profile.limits = Stops::default();
+        } else {
+            if let Some(five_hour) = five_hour {
+                profile.limits.five_hour = Some(five_hour);
+            }
+            if let Some(seven_day) = seven_day {
+                profile.limits.seven_day = Some(seven_day);
+            }
+            if let Some(hard) = hard {
+                profile.limits.hard = hard;
+            }
+        }
+        self.write_profile(&profile)?;
+        match profile.limits.is_set() {
+            true => println!(
+                "Grenzen fuer {}: {}",
+                profile.name,
+                describe_stops(&profile.limits).trim_start_matches(", ")
+            ),
+            false => println!(
+                "{} hat keine eigenen Grenzen mehr; es gilt die globale Schwelle",
+                profile.name
+            ),
         }
         Ok(())
     }
@@ -1009,10 +1074,17 @@ impl App {
             match self.profile_usage(profile, Some(active.as_str()), true) {
                 Ok(usage) => {
                     log_event(&format!(
-                        "Auslastung {}: 5h {:.0}%, 7d {:.0}%",
-                        profile.name, usage.five_hour.utilization, usage.seven_day.utilization
+                        "Auslastung {}: 5h {:.0}%, 7d {:.0}%{}",
+                        profile.name,
+                        usage.five_hour.utilization,
+                        usage.seven_day.utilization,
+                        describe_stops(&profile.limits)
                     ));
-                    usages.push((profile.name.clone(), usage));
+                    usages.push(Candidate {
+                        name: profile.name.clone(),
+                        usage,
+                        stops: profile.limits,
+                    });
                 }
                 // Ein Account, dessen Auslastung unbekannt ist, darf nicht gewaehlt werden:
                 // ein Wechsel auf gut Glueck kann in einem ebenfalls vollen Limit landen.
@@ -1820,6 +1892,25 @@ type CredentialStamp = (i64, u64, u64);
 fn credential_stamp(path: &Path) -> Option<CredentialStamp> {
     let metadata = fs::metadata(path).ok()?;
     Some((metadata.mtime(), metadata.len(), metadata.ino()))
+}
+
+/// Die eigenen Grenzen eines Accounts als Anhang fuer eine Logzeile. Leer, wenn keine gesetzt
+/// sind - dann gilt die globale Schwelle, und die steht ohnehin in jeder Begruendung.
+fn describe_stops(stops: &Stops) -> String {
+    if !stops.is_set() {
+        return String::new();
+    }
+    let mut text = String::from(", Grenze");
+    if let Some(five_hour) = stops.five_hour {
+        text.push_str(&format!(" 5h {five_hour:.0}%"));
+    }
+    if let Some(seven_day) = stops.seven_day {
+        text.push_str(&format!(" 7d {seven_day:.0}%"));
+    }
+    if stops.hard {
+        text.push_str(" (hart)");
+    }
+    text
 }
 
 /// Ein Fenster ohne Reset-Zeitpunkt wurde noch nicht angebrochen; das gehoert so in die

@@ -33,6 +33,25 @@ enum AccountCommand {
     List,
     /// Nutzungslimits aller gespeicherten Accounts anzeigen
     Usage,
+    /// Eigene Nutzungsgrenzen eines Accounts setzen oder loeschen
+    Limit {
+        name: String,
+        /// Grenze fuer das Fuenf-Stunden-Fenster in Prozent
+        #[arg(long)]
+        five_hour: Option<f64>,
+        /// Grenze fuer das Wochenfenster in Prozent
+        #[arg(long)]
+        seven_day: Option<f64>,
+        /// Grenze auch dann einhalten, wenn sonst kein Account mehr frei ist
+        #[arg(long, conflicts_with = "soft")]
+        hard: bool,
+        /// Grenze im Notfall anbrechen duerfen (Standard)
+        #[arg(long)]
+        soft: bool,
+        /// Alle eigenen Grenzen dieses Accounts entfernen
+        #[arg(long, conflicts_with_all = ["five_hour", "seven_day", "hard", "soft"])]
+        clear: bool,
+    },
     /// Bei vollem Limit auf den Account mit den meisten freien Kontingenten wechseln
     Auto {
         /// Ab dieser Auslastung in Prozent gilt ein Limit als verbraucht
@@ -82,6 +101,22 @@ fn run() -> Result<()> {
         Some(AccountCommand::List) => app.list(),
         Some(AccountCommand::Status) => app.status(),
         Some(AccountCommand::Usage) => app.usage(),
+        Some(AccountCommand::Limit {
+            name,
+            five_hour,
+            seven_day,
+            hard,
+            soft,
+            clear,
+        }) => app.set_limits(
+            &name,
+            five_hour,
+            seven_day,
+            // Nur eine ausdrueckliche Angabe aendert die Haerte; sonst bliebe sie bei jedem
+            // spaeteren Setzen einer Zahl stillschweigend auf weich zurueckfallen.
+            hard.then_some(true).or(soft.then_some(false)),
+            clear,
+        ),
         Some(AccountCommand::Auto { threshold, dry_run }) => {
             app.auto_switch(threshold, dry_run).map(|_| ())
         }
