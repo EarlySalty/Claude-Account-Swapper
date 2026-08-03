@@ -8,6 +8,8 @@ Ab jetzt lässt sich pro Account festlegen, ab wie viel Prozent er verlassen wir
 
 Gesetzt wird sie mit `claude-account limit <name> --five-hour 80 --seven-day 50`, entfernt mit `--clear`. Erneutes Speichern eines Accounts lässt die Grenzen unangetastet.
 
+Außerdem fragt die Prüfung jetzt sparsamer: solange der aktive Account unter seiner Grenze liegt, werden die anderen gar nicht erst abgerufen. Zahlen werden gemerkt und tragen bis zu einer halben Stunde weiter, falls die Abfrage einmal blockiert — mit Altersangabe in jeder Zeile, die darauf beruht.
+
 ## #8 — Wechselt von selbst, bevor das Limit zuschlägt
 
 Bisher merkte man erst mitten in der Arbeit, dass das Fünf-Stunden-Kontingent aufgebraucht war — und musste dann von Hand suchen, welcher der gespeicherten Accounts überhaupt noch Luft hat.

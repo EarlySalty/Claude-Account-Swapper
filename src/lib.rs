@@ -16,7 +16,7 @@ use wait_timeout::ChildExt;
 
 pub mod usage;
 
-use usage::{Candidate, Decision, Stops, Usage};
+use usage::{CachedUsage, Candidate, Decision, Stops, Usage};
 
 const MAX_CREDENTIAL_SIZE: u64 = 1024 * 1024;
 /// Ab dieser Restlaufzeit des Refresh-Tokens warnt `list`.
@@ -30,6 +30,14 @@ const KEEPALIVE_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
 /// Abstand zwischen zwei Limitpruefungen im Dauerbetrieb. Die Abfrage kostet kein Kontingent,
 /// eine Minute reicht aber: zwischen 98% und dem harten Limit liegt mehr als ein Request.
 const USAGE_CHECK_INTERVAL_SECONDS: u64 = 60;
+/// Bis zu diesem Alter gilt eine gemerkte Auslastung als aktuell und wird ohne neue Anfrage
+/// benutzt. Knapp unter dem Pruefintervall, damit der Dienst nicht seinen eigenen Wert
+/// wiederverwendet, ein zusaetzlicher Aufruf von Hand aber ohne Anfrage auskommt.
+const USAGE_CACHE_FRESH_SECONDS: u64 = 45;
+/// Darueber hinaus ist ein gemerkter Stand nur noch Notnagel, wenn die Anfrage scheitert.
+/// Ein Fuenf-Stunden-Fenster bewegt sich in 30 Minuten nicht so weit, dass die Entscheidung
+/// dadurch unbrauchbar wuerde - eine ausgefallene Bewertung dagegen schon.
+const USAGE_CACHE_MAX_AGE_SECONDS: u64 = 30 * 60;
 /// Ein haengender Request wuerde den Dienst sonst dauerhaft anhalten.
 const KEEPALIVE_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 /// Restlaufzeit, ab der ein Access-Token vor einem Wechsel als sicher gilt. Darunter muesste
@@ -1069,29 +1077,24 @@ impl App {
         }
         let active = self.active_profile_name()?;
 
+        let Some(active_profile) = profiles.iter().find(|profile| profile.name == active) else {
+            bail!("aktives Profil `{active}` wurde nicht gefunden");
+        };
         let mut usages = Vec::new();
-        for profile in &profiles {
-            match self.profile_usage(profile, Some(active.as_str()), true) {
-                Ok(usage) => {
-                    log_event(&format!(
-                        "Auslastung {}: 5h {:.0}%, 7d {:.0}%{}",
-                        profile.name,
-                        usage.five_hour.utilization,
-                        usage.seven_day.utilization,
-                        describe_stops(&profile.limits)
-                    ));
-                    usages.push(Candidate {
-                        name: profile.name.clone(),
-                        usage,
-                        stops: profile.limits,
-                    });
-                }
-                // Ein Account, dessen Auslastung unbekannt ist, darf nicht gewaehlt werden:
-                // ein Wechsel auf gut Glueck kann in einem ebenfalls vollen Limit landen.
-                Err(error) => log_problem(&format!(
-                    "Auslastung von {} nicht abrufbar, faellt als Ziel aus: {error:#}",
-                    profile.name
-                )),
+        if let Some(candidate) = self.candidate(active_profile, Some(active.as_str())) {
+            // Solange der aktive Account unter seiner Grenze liegt, aendert keine weitere Zahl
+            // das Ergebnis. Die Abfrage ist selbst ratenbegrenzt; jede vermeidbare Anfrage
+            // erhoeht die Wahrscheinlichkeit, im entscheidenden Moment keine Antwort zu haben.
+            if candidate.within_stops(threshold) {
+                let decision = usage::pick_target(&active, &[candidate], threshold);
+                log_event(&format!("Kein Wechsel: {}", decision.reason()));
+                return Ok(decision);
+            }
+            usages.push(candidate);
+        }
+        for profile in profiles.iter().filter(|profile| profile.name != active) {
+            if let Some(candidate) = self.candidate(profile, Some(active.as_str())) {
+                usages.push(candidate);
             }
         }
 
@@ -1108,6 +1111,100 @@ impl App {
             }
         }
         Ok(decision)
+    }
+
+    /// Baut den Bewertungskandidaten zu einem Profil und protokolliert dabei, worauf die
+    /// spaetere Entscheidung beruht. `None` heisst: dieser Account faellt als Ziel aus - ein
+    /// Wechsel auf gut Glueck kann in einem ebenfalls vollen Limit landen.
+    fn candidate(&self, profile: &Profile, active: Option<&str>) -> Option<Candidate> {
+        let (usage, age) = match self.profile_usage_cached(profile, active) {
+            Ok(value) => value,
+            Err(error) => {
+                log_problem(&format!(
+                    "Auslastung von {} nicht abrufbar, faellt als Ziel aus: {error:#}",
+                    profile.name
+                ));
+                return None;
+            }
+        };
+        log_event(&format!(
+            "Auslastung {}: 5h {:.0}%, 7d {:.0}%{}{}",
+            profile.name,
+            usage.five_hour.utilization,
+            usage.seven_day.utilization,
+            describe_stops(&profile.limits),
+            match age {
+                0..=USAGE_CACHE_FRESH_SECONDS => String::new(),
+                age => format!(" (Stand von vor {} min)", age / 60),
+            }
+        ));
+        Some(Candidate {
+            name: profile.name.clone(),
+            usage,
+            stops: profile.limits,
+        })
+    }
+
+    /// Die Auslastung eines Profils samt Alter des gelieferten Standes in Sekunden.
+    ///
+    /// Ein junger gemerkter Stand wird ohne Anfrage benutzt, ein aelterer nur dann, wenn die
+    /// Anfrage scheitert. Beides zusammen haelt die Bewertung auch dann am Leben, wenn der
+    /// Endpunkt gerade mit `429` antwortet - und der Aufrufer erfaehrt, wie alt die Zahl ist.
+    fn profile_usage_cached(
+        &self,
+        profile: &Profile,
+        active: Option<&str>,
+    ) -> Result<(Usage, u64)> {
+        let now = unix_timestamp()?;
+        let cached = self.read_cached_usage(&profile.name);
+        let age = |cached: &CachedUsage| now.saturating_sub(cached.fetched_at);
+        if let Some(cached) = cached.filter(|cached| age(cached) <= USAGE_CACHE_FRESH_SECONDS) {
+            return Ok((cached.usage, age(&cached)));
+        }
+
+        match self.profile_usage(profile, active, true) {
+            Ok(usage) => {
+                self.write_cached_usage(&profile.name, usage, now);
+                Ok((usage, 0))
+            }
+            Err(error) => {
+                match cached.filter(|cached| age(cached) <= USAGE_CACHE_MAX_AGE_SECONDS) {
+                    Some(cached) => {
+                        log_problem(&format!(
+                            "Auslastung von {} nicht abrufbar ({error:#}); \
+                         der gemerkte Stand von vor {} min wird benutzt",
+                            profile.name,
+                            age(&cached) / 60
+                        ));
+                        Ok((cached.usage, age(&cached)))
+                    }
+                    None => Err(error),
+                }
+            }
+        }
+    }
+
+    fn usage_cache_path(&self, name: &str) -> PathBuf {
+        self.profile_dir(name).join("usage.json")
+    }
+
+    /// Ein unlesbarer oder veralteter Cache ist kein Fehler, sondern nur kein Cache.
+    fn read_cached_usage(&self, name: &str) -> Option<CachedUsage> {
+        let data = fs::read(self.usage_cache_path(name)).ok()?;
+        serde_json::from_slice(&data).ok()
+    }
+
+    /// Der Cache haelt nur Prozentwerte und Zeitpunkte, keine Zugangsdaten.
+    fn write_cached_usage(&self, name: &str, usage: Usage, fetched_at: u64) {
+        let cached = CachedUsage { usage, fetched_at };
+        let written = serde_json::to_vec(&cached)
+            .map_err(anyhow::Error::from)
+            .and_then(|payload| atomic_write(&self.usage_cache_path(name), &payload, 0o600));
+        if let Err(error) = written {
+            log_problem(&format!(
+                "Auslastung von {name} konnte nicht gemerkt werden: {error:#}"
+            ));
+        }
     }
 
     /// Der Name des Profils, das gerade aktiv ist.

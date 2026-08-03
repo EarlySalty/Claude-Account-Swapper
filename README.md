@@ -171,6 +171,15 @@ Genau daraus folgt der Notfall: waeren alle Accounts ueber ihren eigenen Grenzen
 
 `--hard` nimmt einen Account aus Stufe 2 heraus: seine Grenze wird nie angebrochen, dann wird lieber gewartet. Erneutes `claude-account save` sichert nur Tokens und laesst die Grenzen stehen. `claude-account list` und `claude-account usage` zeigen sie mit an.
 
+#### Wenn die Auslastungs-Abfrage selbst blockiert
+
+Der Endpunkt ist ratenbegrenzt und antwortet unter Last mit `429`. Ohne Gegenmassnahme faellt dann ausgerechnet der Account als Ziel aus, der bewertet werden muesste. Deshalb zwei Vorkehrungen:
+
+- Solange der aktive Account unter seiner Grenze liegt, werden die anderen gar nicht erst abgefragt. Im Normalbetrieb ist das eine Anfrage pro Minute statt einer pro Account.
+- Jede gelesene Auslastung wird gemerkt. Ein Stand aus den letzten 45 Sekunden wird ohne neue Anfrage benutzt; scheitert eine Anfrage, traegt ein Stand bis zu 30 Minuten weiter. Sein Alter steht dann in jeder Zeile, die darauf beruht. Aeltere Zahlen werden verworfen — sie wuerden einen Wechsel auf einen laengst vollen Account begruenden.
+
+Gemerkt werden nur Prozentwerte und Zeitpunkte, keine Zugangsdaten.
+
 ### Was der Dienst nicht tut
 
 Er schreibt niemals in ein Profil, dessen Zuordnung unklar ist. Widersprechen sich Claudes Identitaets-Cache und der zuletzt vom Switcher gesetzte Account, bleibt alles unveraendert und der Grund steht im Journal. Lieber ein nicht gesicherter Stand als fremde Tokens im falschen Profil.

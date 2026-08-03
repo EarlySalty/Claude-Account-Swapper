@@ -2201,3 +2201,144 @@ fn limit_rejects_impossible_values_and_unknown_profiles() {
     let output = harness.run(&["limit", "gibtsnicht", "--five-hour", "50"]);
     assert!(!output.status.success());
 }
+
+fn write_cached_usage(harness: &Harness, name: &str, five: f64, seven: f64, age_seconds: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let payload = json!({
+        "five_hour": {"utilization": five, "resets_at": "2026-08-03T20:00:00Z"},
+        "seven_day": {"utilization": seven, "resets_at": "2026-08-09T02:00:00Z"},
+        "fetched_at": now - age_seconds
+    });
+    fs::write(
+        harness.store.join("accounts").join(name).join("usage.json"),
+        serde_json::to_vec(&payload).expect("usage json"),
+    )
+    .expect("write usage cache");
+}
+
+/// Der Endpunkt ist selbst ratenbegrenzt. Faellt er mit 429 aus, darf nicht ausgerechnet der
+/// Account als Ziel wegfallen, der bewertet werden muss - dafuer gibt es den gemerkten Stand.
+#[test]
+fn auto_falls_back_to_the_remembered_usage_when_the_api_rate_limits() {
+    let harness = harness_with_two_accounts();
+    write_cached_usage(&harness, "work", 100.0, 20.0, 300);
+    write_cached_usage(&harness, "personal", 5.0, 5.0, 300);
+    let server = UsageServer::start(vec![
+        (
+            "access-work",
+            429,
+            r#"{"error":{"type":"rate_limit_error"}}"#.to_owned(),
+        ),
+        (
+            "access-personal",
+            429,
+            r#"{"error":{"type":"rate_limit_error"}}"#.to_owned(),
+        ),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("Wuerde wechseln zu personal"), "{stdout}");
+    assert!(
+        stdout.contains("Stand von vor 5 min"),
+        "das Alter muss dranstehen: {stdout}"
+    );
+    assert!(
+        stderr.contains("HTTP 429"),
+        "der Ausfall muss sichtbar sein: {stderr}"
+    );
+}
+
+/// Zu alte gemerkte Zahlen sind schlechter als keine: sie wuerden einen Wechsel auf einen
+/// laengst vollen Account begruenden.
+#[test]
+fn auto_ignores_a_stale_remembered_usage() {
+    let harness = harness_with_two_accounts();
+    write_cached_usage(&harness, "work", 100.0, 20.0, 60 * 60 * 3);
+    write_cached_usage(&harness, "personal", 5.0, 5.0, 60 * 60 * 3);
+    let server = UsageServer::start(vec![
+        ("access-work", 429, r#"{"error":{}}"#.to_owned()),
+        ("access-personal", 429, r#"{"error":{}}"#.to_owned()),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Kein Wechsel"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("live"),
+        fs::read(harness.saved_credentials("work")).expect("snapshot"),
+        "mit veralteten Zahlen darf nicht gewechselt werden"
+    );
+}
+
+/// Ein junger gemerkter Stand spart die Anfrage komplett - der Endpunkt wird gar nicht erst
+/// belastet. Der Test beweist es, indem der Server jede Anfrage mit 500 quittieren wuerde.
+#[test]
+fn auto_uses_a_fresh_remembered_usage_without_asking_again() {
+    let harness = harness_with_two_accounts();
+    write_cached_usage(&harness, "work", 10.0, 10.0, 5);
+    let server = UsageServer::start(vec![("access-work", 500, r#"{"error":{}}"#.to_owned())]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Kein Wechsel"), "{stdout}");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("HTTP 500"),
+        "es haette gar keine Anfrage geben duerfen: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Solange der aktive Account unter seiner Grenze ist, werden die anderen gar nicht erst
+/// abgefragt: jede vermeidbare Anfrage erhoeht das Risiko, spaeter keine Antwort zu bekommen.
+#[test]
+fn auto_asks_no_other_account_while_the_active_one_is_fine() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(10.0, 10.0)),
+        ("access-personal", 500, r#"{"error":{}}"#.to_owned()),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("HTTP 500"),
+        "personal haette nicht abgefragt werden duerfen: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("Auslastung personal"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

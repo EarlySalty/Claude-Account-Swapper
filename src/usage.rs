@@ -19,7 +19,7 @@ const REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
 /// Ein Limitfenster: wie voll es ist und wann es sich zuruecksetzt.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Bucket {
     /// Auslastung in Prozent.
     pub utilization: f64,
@@ -29,10 +29,24 @@ pub struct Bucket {
 }
 
 /// Die beiden Fenster, die ueber die Nutzbarkeit eines Accounts entscheiden.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     pub five_hour: Bucket,
     pub seven_day: Bucket,
+}
+
+/// Eine gemerkte Auslastung samt Abfragezeitpunkt.
+///
+/// Der Endpunkt ist selbst ratenbegrenzt und antwortet unter Last mit `429`. Ohne einen
+/// gemerkten Stand faellt dann ausgerechnet der Account als Ziel aus, der am dringendsten
+/// bewertet werden muesste. Ein Wert von vor ein paar Minuten ist dafuer allemal besser als
+/// gar keiner - solange sein Alter mitgemeldet wird.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct CachedUsage {
+    #[serde(flatten)]
+    pub usage: Usage,
+    /// Unix-Sekunden der Abfrage, die diesen Stand geliefert hat.
+    pub fetched_at: u64,
 }
 
 /// Wie weit ein einzelner Account benutzt werden darf.
@@ -79,7 +93,7 @@ pub struct Candidate {
 
 impl Candidate {
     /// Der Account ist unter seinen *eigenen* Grenzen - er darf regulaer benutzt werden.
-    fn within_stops(&self, threshold: f64) -> bool {
+    pub fn within_stops(&self, threshold: f64) -> bool {
         self.usage.is_free_with(
             self.stops.five_hour_or(threshold),
             self.stops.seven_day_or(threshold),
