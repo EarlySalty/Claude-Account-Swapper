@@ -16,7 +16,7 @@ use wait_timeout::ChildExt;
 
 pub mod usage;
 
-use usage::{Decision, Usage};
+use usage::{CachedUsage, Candidate, Decision, Stops, Usage};
 
 const MAX_CREDENTIAL_SIZE: u64 = 1024 * 1024;
 /// Ab dieser Restlaufzeit des Refresh-Tokens warnt `list`.
@@ -30,6 +30,14 @@ const KEEPALIVE_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
 /// Abstand zwischen zwei Limitpruefungen im Dauerbetrieb. Die Abfrage kostet kein Kontingent,
 /// eine Minute reicht aber: zwischen 98% und dem harten Limit liegt mehr als ein Request.
 const USAGE_CHECK_INTERVAL_SECONDS: u64 = 60;
+/// Bis zu diesem Alter gilt eine gemerkte Auslastung als aktuell und wird ohne neue Anfrage
+/// benutzt. Knapp unter dem Pruefintervall, damit der Dienst nicht seinen eigenen Wert
+/// wiederverwendet, ein zusaetzlicher Aufruf von Hand aber ohne Anfrage auskommt.
+const USAGE_CACHE_FRESH_SECONDS: u64 = 45;
+/// Darueber hinaus ist ein gemerkter Stand nur noch Notnagel, wenn die Anfrage scheitert.
+/// Ein Fuenf-Stunden-Fenster bewegt sich in 30 Minuten nicht so weit, dass die Entscheidung
+/// dadurch unbrauchbar wuerde - eine ausgefallene Bewertung dagegen schon.
+const USAGE_CACHE_MAX_AGE_SECONDS: u64 = 30 * 60;
 /// Ein haengender Request wuerde den Dienst sonst dauerhaft anhalten.
 const KEEPALIVE_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 /// Restlaufzeit, ab der ein Access-Token vor einem Wechsel als sicher gilt. Darunter muesste
@@ -106,6 +114,9 @@ struct Profile {
     /// wochenlang gelten und trotzdem verbraucht sein. Nur der gescheiterte Versuch beweist es.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     login_failed_at: Option<u64>,
+    /// Eigene Nutzungsgrenzen dieses Accounts. Fehlen sie, gilt die globale Schwelle.
+    #[serde(default)]
+    limits: Stops,
 }
 
 /// Woher die Zuordnung "aktiver Login gehoert zu Profil X" stammen darf.
@@ -413,7 +424,12 @@ impl App {
                 .as_deref()
                 .map(|value| format!(" [{value}]"))
                 .unwrap_or_default();
-            println!("{marker} {} - {}{plan}", profile.name, profile.email);
+            println!(
+                "{marker} {} - {}{plan}{}",
+                profile.name,
+                profile.email,
+                describe_stops(&profile.limits)
+            );
             for line in self.snapshot_report(&profile) {
                 println!("    {line}");
             }
@@ -662,8 +678,9 @@ impl App {
         let email = status.email()?.to_owned();
         let credentials = read_valid_credentials(&self.paths.credentials)?;
 
-        if let Ok(existing) = self.load_profile(name)
-            && !status.matches(&existing)
+        let existing = self.load_profile(name).ok();
+        if let Some(existing) = &existing
+            && !status.matches(existing)
         {
             bail!(
                 "Profil `{name}` gehoert zu {}; waehle einen anderen Namen",
@@ -681,6 +698,8 @@ impl App {
             credential_fingerprint: Some(credential_fingerprint(&credentials)?),
             credentials_synced_at: Some(unix_timestamp()?),
             login_failed_at: None,
+            // Ein erneutes `save` sichert Tokens, es setzt keine Konfiguration zurueck.
+            limits: existing.map(|existing| existing.limits).unwrap_or_default(),
         };
         let profile_dir = self.profile_dir(name);
         create_private_dir(&profile_dir)?;
@@ -969,7 +988,12 @@ impl App {
             } else {
                 " "
             };
-            println!("{marker} {} - {}", profile.name, profile.email);
+            println!(
+                "{marker} {} - {}{}",
+                profile.name,
+                profile.email,
+                describe_stops(&profile.limits)
+            );
             match self.profile_usage(profile, active.as_deref(), true) {
                 Ok(usage) => {
                     println!(
@@ -989,6 +1013,55 @@ impl App {
         Ok(())
     }
 
+    /// Setzt oder loescht die eigenen Nutzungsgrenzen eines Accounts.
+    ///
+    /// `None` bei beiden Werten und `clear` heisst loeschen; ansonsten wird nur ueberschrieben,
+    /// was angegeben ist - sonst wuerde ein Aufruf fuer das Wochenfenster die Grenze fuer das
+    /// Fuenf-Stunden-Fenster stillschweigend mitnehmen.
+    pub fn set_limits(
+        &self,
+        name: &str,
+        five_hour: Option<f64>,
+        seven_day: Option<f64>,
+        hard: Option<bool>,
+        clear: bool,
+    ) -> Result<()> {
+        validate_name(name)?;
+        for value in [five_hour, seven_day].into_iter().flatten() {
+            if !(0.0..=100.0).contains(&value) {
+                bail!("Grenzen muessen zwischen 0 und 100 liegen");
+            }
+        }
+        let _lock = self.lock()?;
+        let mut profile = self.load_profile(name)?;
+        if clear {
+            profile.limits = Stops::default();
+        } else {
+            if let Some(five_hour) = five_hour {
+                profile.limits.five_hour = Some(five_hour);
+            }
+            if let Some(seven_day) = seven_day {
+                profile.limits.seven_day = Some(seven_day);
+            }
+            if let Some(hard) = hard {
+                profile.limits.hard = hard;
+            }
+        }
+        self.write_profile(&profile)?;
+        match profile.limits.is_set() {
+            true => println!(
+                "Grenzen fuer {}: {}",
+                profile.name,
+                describe_stops(&profile.limits).trim_start_matches(", ")
+            ),
+            false => println!(
+                "{} hat keine eigenen Grenzen mehr; es gilt die globale Schwelle",
+                profile.name
+            ),
+        }
+        Ok(())
+    }
+
     /// Wechselt den Account, wenn das Limit des aktiven Logins erreicht ist.
     ///
     /// `dry_run` entscheidet nur ueber die Ausfuehrung, nicht ueber die Auskunft: die
@@ -1004,22 +1077,24 @@ impl App {
         }
         let active = self.active_profile_name()?;
 
+        let Some(active_profile) = profiles.iter().find(|profile| profile.name == active) else {
+            bail!("aktives Profil `{active}` wurde nicht gefunden");
+        };
         let mut usages = Vec::new();
-        for profile in &profiles {
-            match self.profile_usage(profile, Some(active.as_str()), true) {
-                Ok(usage) => {
-                    log_event(&format!(
-                        "Auslastung {}: 5h {:.0}%, 7d {:.0}%",
-                        profile.name, usage.five_hour.utilization, usage.seven_day.utilization
-                    ));
-                    usages.push((profile.name.clone(), usage));
-                }
-                // Ein Account, dessen Auslastung unbekannt ist, darf nicht gewaehlt werden:
-                // ein Wechsel auf gut Glueck kann in einem ebenfalls vollen Limit landen.
-                Err(error) => log_problem(&format!(
-                    "Auslastung von {} nicht abrufbar, faellt als Ziel aus: {error:#}",
-                    profile.name
-                )),
+        if let Some(candidate) = self.candidate(active_profile, Some(active.as_str())) {
+            // Solange der aktive Account unter seiner Grenze liegt, aendert keine weitere Zahl
+            // das Ergebnis. Die Abfrage ist selbst ratenbegrenzt; jede vermeidbare Anfrage
+            // erhoeht die Wahrscheinlichkeit, im entscheidenden Moment keine Antwort zu haben.
+            if candidate.within_stops(threshold) {
+                let decision = usage::pick_target(&active, &[candidate], threshold);
+                log_event(&format!("Kein Wechsel: {}", decision.reason()));
+                return Ok(decision);
+            }
+            usages.push(candidate);
+        }
+        for profile in profiles.iter().filter(|profile| profile.name != active) {
+            if let Some(candidate) = self.candidate(profile, Some(active.as_str())) {
+                usages.push(candidate);
             }
         }
 
@@ -1036,6 +1111,100 @@ impl App {
             }
         }
         Ok(decision)
+    }
+
+    /// Baut den Bewertungskandidaten zu einem Profil und protokolliert dabei, worauf die
+    /// spaetere Entscheidung beruht. `None` heisst: dieser Account faellt als Ziel aus - ein
+    /// Wechsel auf gut Glueck kann in einem ebenfalls vollen Limit landen.
+    fn candidate(&self, profile: &Profile, active: Option<&str>) -> Option<Candidate> {
+        let (usage, age) = match self.profile_usage_cached(profile, active) {
+            Ok(value) => value,
+            Err(error) => {
+                log_problem(&format!(
+                    "Auslastung von {} nicht abrufbar, faellt als Ziel aus: {error:#}",
+                    profile.name
+                ));
+                return None;
+            }
+        };
+        log_event(&format!(
+            "Auslastung {}: 5h {:.0}%, 7d {:.0}%{}{}",
+            profile.name,
+            usage.five_hour.utilization,
+            usage.seven_day.utilization,
+            describe_stops(&profile.limits),
+            match age {
+                0..=USAGE_CACHE_FRESH_SECONDS => String::new(),
+                age => format!(" (Stand von vor {} min)", age / 60),
+            }
+        ));
+        Some(Candidate {
+            name: profile.name.clone(),
+            usage,
+            stops: profile.limits,
+        })
+    }
+
+    /// Die Auslastung eines Profils samt Alter des gelieferten Standes in Sekunden.
+    ///
+    /// Ein junger gemerkter Stand wird ohne Anfrage benutzt, ein aelterer nur dann, wenn die
+    /// Anfrage scheitert. Beides zusammen haelt die Bewertung auch dann am Leben, wenn der
+    /// Endpunkt gerade mit `429` antwortet - und der Aufrufer erfaehrt, wie alt die Zahl ist.
+    fn profile_usage_cached(
+        &self,
+        profile: &Profile,
+        active: Option<&str>,
+    ) -> Result<(Usage, u64)> {
+        let now = unix_timestamp()?;
+        let cached = self.read_cached_usage(&profile.name);
+        let age = |cached: &CachedUsage| now.saturating_sub(cached.fetched_at);
+        if let Some(cached) = cached.filter(|cached| age(cached) <= USAGE_CACHE_FRESH_SECONDS) {
+            return Ok((cached.usage, age(&cached)));
+        }
+
+        match self.profile_usage(profile, active, true) {
+            Ok(usage) => {
+                self.write_cached_usage(&profile.name, usage, now);
+                Ok((usage, 0))
+            }
+            Err(error) => {
+                match cached.filter(|cached| age(cached) <= USAGE_CACHE_MAX_AGE_SECONDS) {
+                    Some(cached) => {
+                        log_problem(&format!(
+                            "Auslastung von {} nicht abrufbar ({error:#}); \
+                         der gemerkte Stand von vor {} min wird benutzt",
+                            profile.name,
+                            age(&cached) / 60
+                        ));
+                        Ok((cached.usage, age(&cached)))
+                    }
+                    None => Err(error),
+                }
+            }
+        }
+    }
+
+    fn usage_cache_path(&self, name: &str) -> PathBuf {
+        self.profile_dir(name).join("usage.json")
+    }
+
+    /// Ein unlesbarer oder veralteter Cache ist kein Fehler, sondern nur kein Cache.
+    fn read_cached_usage(&self, name: &str) -> Option<CachedUsage> {
+        let data = fs::read(self.usage_cache_path(name)).ok()?;
+        serde_json::from_slice(&data).ok()
+    }
+
+    /// Der Cache haelt nur Prozentwerte und Zeitpunkte, keine Zugangsdaten.
+    fn write_cached_usage(&self, name: &str, usage: Usage, fetched_at: u64) {
+        let cached = CachedUsage { usage, fetched_at };
+        let written = serde_json::to_vec(&cached)
+            .map_err(anyhow::Error::from)
+            .and_then(|payload| atomic_write(&self.usage_cache_path(name), &payload, 0o600));
+        if let Err(error) = written {
+            log_problem(&format!(
+                "Auslastung von {name} konnte nicht gemerkt werden: {error:#}"
+            ));
+        }
     }
 
     /// Der Name des Profils, das gerade aktiv ist.
@@ -1820,6 +1989,25 @@ type CredentialStamp = (i64, u64, u64);
 fn credential_stamp(path: &Path) -> Option<CredentialStamp> {
     let metadata = fs::metadata(path).ok()?;
     Some((metadata.mtime(), metadata.len(), metadata.ino()))
+}
+
+/// Die eigenen Grenzen eines Accounts als Anhang fuer eine Logzeile. Leer, wenn keine gesetzt
+/// sind - dann gilt die globale Schwelle, und die steht ohnehin in jeder Begruendung.
+fn describe_stops(stops: &Stops) -> String {
+    if !stops.is_set() {
+        return String::new();
+    }
+    let mut text = String::from(", Grenze");
+    if let Some(five_hour) = stops.five_hour {
+        text.push_str(&format!(" 5h {five_hour:.0}%"));
+    }
+    if let Some(seven_day) = stops.seven_day {
+        text.push_str(&format!(" 7d {seven_day:.0}%"));
+    }
+    if stops.hard {
+        text.push_str(" (hart)");
+    }
+    text
 }
 
 /// Ein Fenster ohne Reset-Zeitpunkt wurde noch nicht angebrochen; das gehoert so in die

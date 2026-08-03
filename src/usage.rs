@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Standardschwelle, ab der ein Fuenf-Stunden-Fenster als verbraucht gilt.
@@ -19,7 +19,7 @@ const REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
 /// Ein Limitfenster: wie voll es ist und wann es sich zuruecksetzt.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Bucket {
     /// Auslastung in Prozent.
     pub utilization: f64,
@@ -29,16 +29,125 @@ pub struct Bucket {
 }
 
 /// Die beiden Fenster, die ueber die Nutzbarkeit eines Accounts entscheiden.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     pub five_hour: Bucket,
     pub seven_day: Bucket,
 }
 
+/// Eine gemerkte Auslastung samt Abfragezeitpunkt.
+///
+/// Der Endpunkt ist selbst ratenbegrenzt und antwortet unter Last mit `429`. Ohne einen
+/// gemerkten Stand faellt dann ausgerechnet der Account als Ziel aus, der am dringendsten
+/// bewertet werden muesste. Ein Wert von vor ein paar Minuten ist dafuer allemal besser als
+/// gar keiner - solange sein Alter mitgemeldet wird.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct CachedUsage {
+    #[serde(flatten)]
+    pub usage: Usage,
+    /// Unix-Sekunden der Abfrage, die diesen Stand geliefert hat.
+    pub fetched_at: u64,
+}
+
+/// Wie weit ein einzelner Account benutzt werden darf.
+///
+/// Ohne Eintrag gilt die globale Schwelle. Wer einem Account eine Reserve lassen will - etwa
+/// weil das Wochenkontingent fuer einen bestimmten Zweck freibleiben soll - setzt hier einen
+/// niedrigeren Wert; der Account wird dann schon vorher verlassen.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct Stops {
+    /// Grenze fuer das Fuenf-Stunden-Fenster in Prozent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<f64>,
+    /// Grenze fuer das Wochenfenster in Prozent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day: Option<f64>,
+    /// Harte Grenze: dieser Account wird auch dann nicht angebrochen, wenn sonst gar kein
+    /// Account mehr frei ist. Ohne das Kennzeichen ist die Grenze eine Reserve, die im
+    /// Notfall genutzt wird - protokolliert, damit es nicht unbemerkt passiert.
+    #[serde(default)]
+    pub hard: bool,
+}
+
+impl Stops {
+    fn five_hour_or(&self, fallback: f64) -> f64 {
+        self.five_hour.unwrap_or(fallback)
+    }
+
+    fn seven_day_or(&self, fallback: f64) -> f64 {
+        self.seven_day.unwrap_or(fallback)
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.five_hour.is_some() || self.seven_day.is_some()
+    }
+}
+
+/// Ein Account, dessen Auslastung gelesen werden konnte, samt seiner eigenen Grenzen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidate {
+    pub name: String,
+    pub usage: Usage,
+    pub stops: Stops,
+}
+
+impl Candidate {
+    /// Der Account ist unter seinen *eigenen* Grenzen - er darf regulaer benutzt werden.
+    pub fn within_stops(&self, threshold: f64) -> bool {
+        self.usage.is_free_with(
+            self.stops.five_hour_or(threshold),
+            self.stops.seven_day_or(threshold),
+        )
+    }
+
+    /// Der Account hat noch echtes Kontingent, seine eigene Reserve waere aber angebrochen.
+    /// Bei einer harten Grenze gibt es diesen Fall nicht.
+    fn within_global_limit(&self, threshold: f64) -> bool {
+        !self.stops.hard && self.usage.is_free_with(threshold, threshold)
+    }
+
+    /// Wann dieser Account wieder benutzbar wird. Eine harte Grenze verschiebt den Zeitpunkt,
+    /// eine weiche nicht: die duerfte man ja notfalls anbrechen.
+    fn unblocked_at(&self, threshold: f64) -> Option<DateTime<Utc>> {
+        if self.stops.hard {
+            self.usage.unblocked_at_with(
+                self.stops.five_hour_or(threshold),
+                self.stops.seven_day_or(threshold),
+            )
+        } else {
+            self.usage.unblocked_at_with(threshold, threshold)
+        }
+    }
+
+    fn describe(&self, threshold: f64) -> String {
+        let five_stop = self.stops.five_hour_or(threshold);
+        let seven_stop = self.stops.seven_day_or(threshold);
+        let mut text = format!(
+            "5h {:.0}%/{:.0}%, 7d {:.0}%/{:.0}%",
+            self.usage.five_hour.utilization,
+            five_stop,
+            self.usage.seven_day.utilization,
+            seven_stop
+        );
+        if self.stops.is_set() {
+            text.push_str(if self.stops.hard {
+                ", eigene Grenze (hart)"
+            } else {
+                ", eigene Grenze"
+            });
+        }
+        text
+    }
+}
+
 impl Usage {
     /// Beide Fenster liegen unter der Schwelle - der Account ist benutzbar.
-    fn is_free(&self, threshold: f64) -> bool {
-        self.five_hour.utilization < threshold && self.seven_day.utilization < threshold
+    pub fn is_free(&self, threshold: f64) -> bool {
+        self.is_free_with(threshold, threshold)
+    }
+
+    fn is_free_with(&self, five_hour: f64, seven_day: f64) -> bool {
+        self.five_hour.utilization < five_hour && self.seven_day.utilization < seven_day
     }
 
     /// Wann dieser Account frei wird: der spaeteste Reset unter den Fenstern, die ihn gerade
@@ -48,9 +157,9 @@ impl Usage {
     /// `None` heisst "nicht datierbar" - entweder blockiert nichts, oder ein blockierendes
     /// Fenster nennt keinen Zeitpunkt. Beides schliesst den Account als Wartekandidaten aus:
     /// ein unbekannter Zeitpunkt darf nie als der fruehere durchgehen.
-    fn unblocked_at(&self, threshold: f64) -> Option<DateTime<Utc>> {
+    fn unblocked_at_with(&self, five_hour: f64, seven_day: f64) -> Option<DateTime<Utc>> {
         let mut blocked: Option<DateTime<Utc>> = None;
-        for bucket in [self.five_hour, self.seven_day] {
+        for (bucket, threshold) in [(self.five_hour, five_hour), (self.seven_day, seven_day)] {
             if bucket.utilization >= threshold {
                 let resets_at = bucket.resets_at?;
                 blocked = Some(match blocked {
@@ -87,12 +196,12 @@ impl Decision {
 /// Rein und ohne Seiteneffekte: `accounts` enthaelt jeden Account, dessen Auslastung wirklich
 /// gelesen werden konnte - unerreichbare Accounts fehlen hier bewusst, damit sie nie gewaehlt
 /// werden. Fehlt darin der aktive Account, wird nicht geraten, sondern gar nicht gewechselt.
-pub fn pick_target(active: &str, accounts: &[(String, Usage)], threshold: f64) -> Decision {
-    let Some(active_usage) = accounts
-        .iter()
-        .find(|(name, _)| name == active)
-        .map(|(_, usage)| *usage)
-    else {
+/// Die Auswahl laeuft in drei Stufen, weil eine enge eigene Grenze sonst jeden Wechsel
+/// verhindern wuerde: erst Accounts unter ihrer eigenen Grenze, dann - falls es keinen gibt -
+/// Accounts mit echtem Restkontingent, deren Reserve dafuer angebrochen wird, und zuletzt der
+/// Account, der am fruehesten wieder frei ist.
+pub fn pick_target(active: &str, accounts: &[Candidate], threshold: f64) -> Decision {
+    let Some(current) = accounts.iter().find(|candidate| candidate.name == active) else {
         return Decision::NoCandidate {
             reason: format!(
                 "Auslastung von `{active}` ist unbekannt; ohne sie wird nicht gewechselt"
@@ -100,71 +209,106 @@ pub fn pick_target(active: &str, accounts: &[(String, Usage)], threshold: f64) -
         };
     };
 
-    if active_usage.is_free(threshold) {
+    if current.within_stops(threshold) {
         return Decision::Stay {
             reason: format!(
-                "`{active}` ist unter der Schwelle ({})",
-                describe(&active_usage, threshold)
+                "`{active}` ist unter seiner Grenze ({})",
+                current.describe(threshold)
             ),
         };
     }
 
-    let free: Vec<&(String, Usage)> = accounts
-        .iter()
-        .filter(|(name, usage)| name != active && usage.is_free(threshold))
-        .collect();
-    if let Some((name, usage)) =
-        free.into_iter()
-            .min_by(|(left_name, left), (right_name, right)| {
-                compare_utilization(left, right).then_with(|| left_name.cmp(right_name))
-            })
-    {
+    if let Some(target) = best(
+        accounts
+            .iter()
+            .filter(|candidate| candidate.name != active && candidate.within_stops(threshold)),
+    ) {
         return Decision::SwitchTo {
-            name: name.clone(),
+            name: target.name.clone(),
             reason: format!(
-                "`{active}` ist voll ({}); `{name}` ist frei ({})",
-                describe(&active_usage, threshold),
-                describe(usage, threshold)
+                "`{active}` hat seine Grenze erreicht ({}); `{}` ist frei ({})",
+                current.describe(threshold),
+                target.name,
+                target.describe(threshold)
             ),
         };
     }
 
-    // Kein freier Account. Dann gewinnt der, der am fruehesten wieder frei wird - warten muss
-    // man ohnehin, die Frage ist nur, wo am kuerzesten.
-    let mut soonest: Vec<(&String, &Usage, DateTime<Utc>)> = accounts
+    // Kein Account unter seiner eigenen Grenze. Wer noch echtes Kontingent hat, kommt jetzt
+    // trotzdem in Frage - seine Reserve wird angebrochen, und genau das steht auch so im Log.
+    // Der aktive Account ist hier bewusst dabei: bringt ein Wechsel nichts, bleibt er stehen.
+    if let Some(target) = best(
+        accounts
+            .iter()
+            .filter(|candidate| candidate.within_global_limit(threshold)),
+    ) {
+        if target.name == active {
+            return Decision::Stay {
+                reason: format!(
+                    "kein Account ist unter seiner Grenze; `{active}` ({}) hat noch am meisten \
+                     Kontingent, seine Reserve wird angebrochen",
+                    current.describe(threshold)
+                ),
+            };
+        }
+        return Decision::SwitchTo {
+            name: target.name.clone(),
+            reason: format!(
+                "kein Account ist unter seiner Grenze; `{active}` ({}) wird verlassen, \
+                 die Reserve von `{}` ({}) wird angebrochen",
+                current.describe(threshold),
+                target.name,
+                target.describe(threshold)
+            ),
+        };
+    }
+
+    // Auch kein Restkontingent. Dann gewinnt der, der am fruehesten wieder frei wird - warten
+    // muss man ohnehin, die Frage ist nur, wo am kuerzesten.
+    let mut soonest: Vec<(&Candidate, DateTime<Utc>)> = accounts
         .iter()
-        .filter_map(|(name, usage)| {
-            usage
+        .filter_map(|candidate| {
+            candidate
                 .unblocked_at(threshold)
-                .map(|unblocked| (name, usage, unblocked))
+                .map(|unblocked| (candidate, unblocked))
         })
         .collect();
-    soonest.sort_by(|(left_name, _, left), (right_name, _, right)| {
-        left.cmp(right).then_with(|| left_name.cmp(right_name))
+    soonest.sort_by(|(left, left_at), (right, right_at)| {
+        left_at
+            .cmp(right_at)
+            .then_with(|| left.name.cmp(&right.name))
     });
-    let Some((name, usage, unblocked)) = soonest.first() else {
+    let Some((target, unblocked)) = soonest.first() else {
         return Decision::NoCandidate {
             reason: format!("`{active}` ist voll, aber kein Account meldet ein Reset-Fenster"),
         };
     };
 
-    if *name == active {
+    if target.name == active {
         return Decision::Stay {
             reason: format!(
                 "alle Accounts sind voll; `{active}` ({}) wird als erster wieder frei",
-                describe(&active_usage, threshold)
+                current.describe(threshold)
             ),
         };
     }
     Decision::SwitchTo {
-        name: (*name).clone(),
+        name: target.name.clone(),
         reason: format!(
-            "alle Accounts sind voll; `{active}` ({}) wartet laenger als `{name}` ({}, frei ab {})",
-            describe(&active_usage, threshold),
-            describe(usage, threshold),
+            "alle Accounts sind voll; `{active}` ({}) wartet laenger als `{}` ({}, frei ab {})",
+            current.describe(threshold),
+            target.name,
+            target.describe(threshold),
             unblocked.with_timezone(&chrono::Local).format("%F %H:%M")
         ),
     }
+}
+
+/// Der freieste Account einer Auswahl - deterministisch auch bei Gleichstand.
+fn best<'a>(candidates: impl Iterator<Item = &'a Candidate>) -> Option<&'a Candidate> {
+    candidates.min_by(|left, right| {
+        compare_utilization(&left.usage, &right.usage).then_with(|| left.name.cmp(&right.name))
+    })
 }
 
 /// Weniger verbrauchtes Fuenf-Stunden-Fenster gewinnt; bei Gleichstand das freiere Wochenfenster.
@@ -178,15 +322,6 @@ fn compare_utilization(left: &Usage, right: &Usage) -> Ordering {
                 .utilization
                 .total_cmp(&right.seven_day.utilization)
         })
-}
-
-/// Die Zahlen, auf denen eine Entscheidung beruht. Ohne sie ist ein Fehlurteil im Log nicht
-/// nachvollziehbar.
-fn describe(usage: &Usage, threshold: f64) -> String {
-    format!(
-        "5h {:.0}%, 7d {:.0}%, Schwelle {threshold:.0}%",
-        usage.five_hour.utilization, usage.seven_day.utilization
-    )
 }
 
 /// Fragt die Auslastung zu einem Access-Token ab.
@@ -289,10 +424,33 @@ mod tests {
         }
     }
 
-    fn accounts(entries: &[(&str, Usage)]) -> Vec<(String, Usage)> {
+    fn accounts(entries: &[(&str, Usage)]) -> Vec<Candidate> {
         entries
             .iter()
-            .map(|(name, usage)| ((*name).to_owned(), *usage))
+            .map(|(name, usage)| Candidate {
+                name: (*name).to_owned(),
+                usage: *usage,
+                stops: Stops::default(),
+            })
+            .collect()
+    }
+
+    fn stops(five: Option<f64>, seven: Option<f64>, hard: bool) -> Stops {
+        Stops {
+            five_hour: five,
+            seven_day: seven,
+            hard,
+        }
+    }
+
+    fn accounts_with_stops(entries: &[(&str, Usage, Stops)]) -> Vec<Candidate> {
+        entries
+            .iter()
+            .map(|(name, usage, stops)| Candidate {
+                name: (*name).to_owned(),
+                usage: *usage,
+                stops: *stops,
+            })
             .collect()
     }
 
@@ -311,8 +469,8 @@ mod tests {
             pick_target("a", &accounts, 98.0),
             Decision::SwitchTo {
                 name: "b".to_owned(),
-                reason: "`a` ist voll (5h 98%, 7d 10%, Schwelle 98%); `b` ist frei \
-                         (5h 5%, 7d 5%, Schwelle 98%)"
+                reason: "`a` hat seine Grenze erreicht (5h 98%/98%, 7d 10%/98%); \
+                         `b` ist frei (5h 5%/98%, 7d 5%/98%)"
                     .to_owned(),
             }
         );
@@ -499,15 +657,153 @@ mod tests {
                 resets_at: None,
             },
         };
-        let accounts = vec![
+        let accounts = accounts(&[
             (
-                "aktiv".to_owned(),
+                "aktiv",
                 usage_at(100.0, 10.0, "2026-08-03T23:00:00Z", "2026-08-09T02:00:00Z"),
             ),
-            ("unklar".to_owned(), unklar),
-        ];
+            ("unklar", unklar),
+        ]);
         let decision = pick_target("aktiv", &accounts, 98.0);
         assert!(matches!(decision, Decision::Stay { .. }), "{decision:?}");
+    }
+
+    #[test]
+    fn eine_eigene_grenze_verlaesst_den_account_frueher() {
+        let accounts = accounts_with_stops(&[
+            ("a", usage(85.0, 20.0), stops(Some(80.0), None, false)),
+            ("b", usage(50.0, 20.0), Stops::default()),
+        ]);
+        let decision = pick_target("a", &accounts, 98.0);
+        match &decision {
+            Decision::SwitchTo { name, reason } => {
+                assert_eq!(name, "b");
+                assert!(reason.contains("5h 85%/80%"), "{reason}");
+            }
+            other => panic!("unerwartet: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eine_eigene_wochengrenze_wirkt_genauso() {
+        let accounts = accounts_with_stops(&[
+            ("a", usage(10.0, 55.0), stops(None, Some(50.0), false)),
+            ("b", usage(60.0, 60.0), Stops::default()),
+        ]);
+        match pick_target("a", &accounts, 98.0) {
+            Decision::SwitchTo { name, .. } => assert_eq!(name, "b"),
+            other => panic!("unerwartet: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ein_account_unter_seiner_grenze_bleibt_stehen() {
+        let accounts = accounts_with_stops(&[
+            ("a", usage(79.0, 20.0), stops(Some(80.0), None, false)),
+            ("b", usage(0.0, 0.0), Stops::default()),
+        ]);
+        assert!(matches!(
+            pick_target("a", &accounts, 98.0),
+            Decision::Stay { .. }
+        ));
+    }
+
+    /// Eine eigene Grenze schuetzt einen Account auch davor, als *Ziel* gewaehlt zu werden -
+    /// sonst waere die Reserve wertlos.
+    #[test]
+    fn ein_account_ueber_seiner_grenze_wird_nicht_als_ziel_gewaehlt() {
+        let accounts = accounts_with_stops(&[
+            ("a", usage(100.0, 20.0), Stops::default()),
+            (
+                "geschont",
+                usage(60.0, 20.0),
+                stops(Some(50.0), None, false),
+            ),
+            ("normal", usage(70.0, 20.0), Stops::default()),
+        ]);
+        match pick_target("a", &accounts, 98.0) {
+            Decision::SwitchTo { name, .. } => assert_eq!(name, "normal"),
+            other => panic!("unerwartet: {other:?}"),
+        }
+    }
+
+    /// Wenn kein Account mehr unter seiner Grenze ist, darf eine weiche Reserve angebrochen
+    /// werden - sonst wuerde eine enge Konfiguration jede Arbeit blockieren, obwohl noch
+    /// Kontingent da ist. Der Vorgang wird als solcher benannt.
+    #[test]
+    fn ohne_freien_account_wird_eine_weiche_reserve_angebrochen() {
+        let accounts = accounts_with_stops(&[
+            ("a", usage(100.0, 20.0), Stops::default()),
+            ("reserve", usage(60.0, 20.0), stops(Some(50.0), None, false)),
+        ]);
+        match pick_target("a", &accounts, 98.0) {
+            Decision::SwitchTo { name, reason } => {
+                assert_eq!(name, "reserve");
+                assert!(reason.contains("Reserve"), "{reason}");
+            }
+            other => panic!("unerwartet: {other:?}"),
+        }
+    }
+
+    /// Eine harte Grenze wird auch dann nicht angebrochen, wenn sonst nichts mehr frei ist -
+    /// im selben Aufbau wuerde eine weiche sofort genutzt. Der Account wartet also lieber.
+    #[test]
+    fn eine_harte_grenze_wird_nie_angebrochen_eine_weiche_schon() {
+        let aktiv = usage_at(100.0, 20.0, "2026-08-03T20:00:00Z", "2026-08-09T02:00:00Z");
+        let ziel = usage_at(60.0, 20.0, "2026-08-03T23:00:00Z", "2026-08-09T02:00:00Z");
+
+        let hart = accounts_with_stops(&[
+            ("a", aktiv, Stops::default()),
+            ("ziel", ziel, stops(Some(50.0), None, true)),
+        ]);
+        let decision = pick_target("a", &hart, 98.0);
+        assert!(matches!(decision, Decision::Stay { .. }), "{decision:?}");
+
+        let weich = accounts_with_stops(&[
+            ("a", aktiv, Stops::default()),
+            ("ziel", ziel, stops(Some(50.0), None, false)),
+        ]);
+        match pick_target("a", &weich, 98.0) {
+            Decision::SwitchTo { name, reason } => {
+                assert_eq!(name, "ziel");
+                assert!(reason.contains("Reserve"), "{reason}");
+            }
+            other => panic!("unerwartet: {other:?}"),
+        }
+    }
+
+    /// Der aktive Account behaelt seine eigene Reserve, solange kein anderer besser dasteht.
+    #[test]
+    fn ohne_besseres_ziel_bleibt_der_aktive_account_in_seiner_reserve() {
+        let accounts = accounts_with_stops(&[
+            ("a", usage(60.0, 20.0), stops(Some(50.0), None, false)),
+            ("b", usage(90.0, 20.0), stops(Some(50.0), None, false)),
+        ]);
+        let decision = pick_target("a", &accounts, 98.0);
+        assert!(matches!(decision, Decision::Stay { .. }), "{decision:?}");
+        assert!(decision.reason().contains("Reserve"), "{decision:?}");
+    }
+
+    /// Eine harte Grenze verschiebt auch die Wartezeit: der Account ist erst wieder nutzbar,
+    /// wenn sein eigenes Fenster zurueckgesetzt ist, nicht schon bei 98 Prozent.
+    #[test]
+    fn eine_harte_grenze_zaehlt_auch_fuer_die_wartezeit() {
+        let accounts = accounts_with_stops(&[
+            (
+                "a",
+                usage_at(100.0, 20.0, "2026-08-03T23:00:00Z", "2026-08-09T02:00:00Z"),
+                Stops::default(),
+            ),
+            (
+                "tabu",
+                usage_at(60.0, 20.0, "2026-08-03T20:00:00Z", "2026-08-09T02:00:00Z"),
+                stops(Some(50.0), None, true),
+            ),
+        ]);
+        match pick_target("a", &accounts, 98.0) {
+            Decision::SwitchTo { name, .. } => assert_eq!(name, "tabu"),
+            other => panic!("unerwartet: {other:?}"),
+        }
     }
 
     #[test]
