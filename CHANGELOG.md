@@ -1,5 +1,15 @@
 # Changelog
 
+## #11 — Das Fünf-Stunden-Fenster startet von selbst, und Aufträge warten darauf
+
+Das Fenster beginnt nicht mit dem Reset, sondern mit der ersten Anfrage danach. Wer nachts um vier nicht am Rechner sitzt, verschiebt damit seine ganzen fünf Stunden — und musste sich bisher selbst einen Wecker stellen, um irgendetwas zu tippen.
+
+Ab jetzt kann der Hintergrunddienst das übernehmen. Sobald die Auslastung kein laufendes Fenster mehr meldet, schickt er von selbst eine kurze Nachricht los und eröffnet es damit zum frühestmöglichen Zeitpunkt; danach steht im Protokoll, bis wann das neue Fenster läuft — meldet die Schnittstelle weiterhin keines, wird das als Fehlschlag gemeldet statt stillschweigend übergangen.
+
+Zusätzlich lassen sich Aufträge hinterlegen, die genau dann anlaufen: ein Prompt mit Arbeitsverzeichnis, einmalig oder in jedem neuen Fenster. Auch eine frühere Sitzung lässt sich auswählen — sie wird dann im Hintergrund fortgesetzt, sobald wieder Kontingent da ist. Ein Auftrag, der bei laufendem Fenster angelegt wird, nimmt niemandem das gerade genutzte Kontingent weg, sondern wartet auf das nächste. Läuft er, steht der Grund im Protokoll; wartet er, ebenfalls. Ein gescheiterter Lauf verbraucht den Auftrag nicht, sondern behält ihn mit der Begründung.
+
+Beides wird im Menü unter „Automatik und Aufgaben" ein- und ausgeschaltet und wirkt sofort, ohne den Dienst neu zu starten. Das Menü kennt außerdem endlich die Auslastungsübersicht und die eigenen Grenzen pro Account, die es bisher nur auf der Kommandozeile gab.
+
 ## #10 — Der automatische Wechsel wird jetzt eingeschaltet, statt vorausgesetzt
 
 Ein Wechsel zieht jede laufende Sitzung mit. So etwas gehört nicht standardmäßig an — auch wenn es meistens das Richtige tut.

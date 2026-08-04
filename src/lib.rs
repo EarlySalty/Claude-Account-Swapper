@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,8 +15,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use wait_timeout::ChildExt;
 
+pub mod config;
+pub mod jobs;
 pub mod usage;
 
+use config::Config;
+use jobs::{Job, JobKind, Readiness};
 use usage::{CachedUsage, Candidate, Decision, Stops, Usage};
 
 const MAX_CREDENTIAL_SIZE: u64 = 1024 * 1024;
@@ -47,6 +52,11 @@ const ACCESS_TOKEN_MIN_REMAINING_SECONDS: i64 = 5 * 60;
 const STDERR_REASON_MAX_CHARS: usize = 300;
 /// Ab dieser Laenge ist ein zusammenhaengendes Wort kein Satzteil mehr, sondern ein Token.
 const SECRET_WORD_MIN_CHARS: usize = 40;
+/// So viele Zeilen einer Sitzungsdatei reichen, um Arbeitsverzeichnis und erste Frage zu finden.
+/// Die Dateien werden megabytegross; sie fuer eine Auswahlliste ganz zu lesen waere Verschwendung.
+const SESSION_SCAN_LINES: usize = 60;
+/// So viele Sitzungen zeigt die Auswahl an.
+const SESSION_LIST_LIMIT: usize = 15;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -557,7 +567,10 @@ impl App {
             println!("  [2] Aktuellen Account speichern");
             println!("  [3] Neuen Account anmelden");
             println!("  [4] Status anzeigen");
-            println!("  [5] Beenden\n");
+            println!("  [5] Auslastung aller Accounts");
+            println!("  [6] Grenzen eines Accounts");
+            println!("  [7] Automatik und Aufgaben");
+            println!("  [8] Beenden\n");
 
             let Some(choice) = prompt_line("Auswahl: ")? else {
                 return Ok(());
@@ -567,9 +580,12 @@ impl App {
                 "2" => self.interactive_save(),
                 "3" => self.interactive_login(),
                 "4" => self.status(),
-                "5" | "q" | "quit" | "exit" => return Ok(()),
+                "5" => self.usage(),
+                "6" => self.interactive_limits(),
+                "7" => self.interactive_automation(),
+                "8" | "q" | "quit" | "exit" => return Ok(()),
                 _ => {
-                    eprintln!("Fehler: Bitte 1 bis 5 waehlen.");
+                    eprintln!("Fehler: Bitte 1 bis 8 waehlen.");
                     if !pause()? {
                         return Ok(());
                     }
@@ -671,6 +687,269 @@ impl App {
         }
         println!("\nDer offizielle Claude-Login wird jetzt geoeffnet ...\n");
         self.login(&name)
+    }
+
+    fn interactive_limits(&self) -> Result<()> {
+        let profiles = self.load_profiles()?;
+        if profiles.is_empty() {
+            bail!("Noch keine Accounts gespeichert. Nutze zuerst Menuepunkt 2.");
+        }
+        println!("\nGespeicherte Accounts:");
+        for (index, profile) in profiles.iter().enumerate() {
+            println!(
+                "  [{}] {} ({}){}",
+                index + 1,
+                profile.name,
+                profile.email,
+                describe_stops(&profile.limits)
+            );
+        }
+        println!("  [0] Zurueck");
+        let Some(choice) = prompt_line("Account: ")? else {
+            return Ok(());
+        };
+        if choice == "0" {
+            return Ok(());
+        }
+        let profile = profiles
+            .get(
+                choice
+                    .parse::<usize>()
+                    .context("bitte eine Account-Nummer eingeben")?
+                    .checked_sub(1)
+                    .context("ungueltige Account-Nummer")?,
+            )
+            .context("ungueltige Account-Nummer")?;
+
+        println!("\nEine eigene Grenze verlaesst den Account frueher als die globale Schwelle.");
+        println!("Leer laesst eine Grenze unveraendert, ein Minus (-) loescht alle Grenzen.");
+        let five_hour = prompt_line("Grenze 5h in Prozent: ")?.unwrap_or_default();
+        if five_hour.trim() == "-" {
+            return self.set_limits(&profile.name, None, None, None, true);
+        }
+        let seven_day = prompt_line("Grenze 7d in Prozent: ")?.unwrap_or_default();
+        let hard = match prompt_line("Grenze hart einhalten? [j/n, leer = unveraendert]: ")?
+            .unwrap_or_default()
+            .to_lowercase()
+        {
+            answer if answer.is_empty() => None,
+            answer => Some(matches!(answer.as_str(), "j" | "ja" | "y" | "yes")),
+        };
+        self.set_limits(
+            &profile.name,
+            parse_percent(&five_hour)?,
+            parse_percent(&seven_day)?,
+            hard,
+            false,
+        )
+    }
+
+    fn interactive_automation(&self) -> Result<()> {
+        loop {
+            let config = self.load_config();
+            let jobs = self.load_jobs().unwrap_or_default();
+            println!("\n--------------------------------");
+            println!("  Automatik und Aufgaben");
+            println!("--------------------------------");
+            println!(
+                "Auto-Wechsel bei vollem Limit: {}",
+                onoff(config.auto_switch)
+            );
+            println!(
+                "Fenster-Ping nach dem Reset:   {}",
+                onoff(config.ping.enabled)
+            );
+            println!(
+                "Aufgaben in der Warteschlange: {}\n",
+                jobs.iter().filter(|job| job.enabled).count()
+            );
+            println!("  [1] Auto-Wechsel umschalten");
+            println!("  [2] Fenster-Ping umschalten");
+            println!("  [3] Aufgabe anlegen");
+            println!("  [4] Sitzung fortsetzen lassen");
+            println!("  [5] Aufgaben anzeigen und loeschen");
+            println!("  [0] Zurueck\n");
+
+            let Some(choice) = prompt_line("Auswahl: ")? else {
+                return Ok(());
+            };
+            let action = match choice.as_str() {
+                "1" => self.toggle_auto_switch(),
+                "2" => self.toggle_ping(),
+                "3" => self.interactive_add_job(),
+                "4" => self.interactive_resume_session(),
+                "5" => self.interactive_job_list(),
+                "0" | "q" | "quit" | "exit" => return Ok(()),
+                _ => {
+                    eprintln!("Fehler: Bitte 0 bis 5 waehlen.");
+                    Ok(())
+                }
+            };
+            if let Err(error) = action {
+                eprintln!("Fehler: {error:#}");
+            }
+            if !pause()? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn toggle_auto_switch(&self) -> Result<()> {
+        let config = self.update_config(|config| config.auto_switch = !config.auto_switch)?;
+        println!(
+            "Auto-Wechsel bei vollem Limit ist jetzt {}.",
+            onoff(config.auto_switch)
+        );
+        if config.auto_switch {
+            println!(
+                "Der Dienst wechselt ab {:.0}% Auslastung auf den freiesten gespeicherten Account.",
+                config.threshold
+            );
+        }
+        Ok(())
+    }
+
+    fn toggle_ping(&self) -> Result<()> {
+        let config = self.update_config(|config| config.ping.enabled = !config.ping.enabled)?;
+        println!(
+            "Fenster-Ping nach dem Reset ist jetzt {}.",
+            onoff(config.ping.enabled)
+        );
+        if config.ping.enabled {
+            println!(
+                "Sobald das Fuenf-Stunden-Fenster zurueckgesetzt ist, schickt der Dienst von \
+                 selbst \"{}\" los. Damit laufen die fuenf Stunden ab dem fruehestmoeglichen \
+                 Zeitpunkt, ohne dass du etwas tippen musst.",
+                config.ping.prompt
+            );
+        }
+        Ok(())
+    }
+
+    fn interactive_add_job(&self) -> Result<()> {
+        let Some(text) = prompt_line("\nAuftrag (was soll Claude tun?): ")? else {
+            return Ok(());
+        };
+        if text.trim().is_empty() {
+            bail!("Der Auftrag darf nicht leer sein");
+        }
+        let home = env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+        let cwd = prompt_line(&format!("Arbeitsverzeichnis [{home}]: "))?.unwrap_or_default();
+        let cwd = if cwd.trim().is_empty() { home } else { cwd };
+        let repeat = matches!(
+            prompt_line("In jedem neuen Fenster wiederholen? [j/N]: ")?
+                .unwrap_or_default()
+                .to_lowercase()
+                .as_str(),
+            "j" | "ja" | "y" | "yes"
+        );
+        let job = self.add_job(
+            JobKind::Prompt { text },
+            PathBuf::from(cwd),
+            JobOptions {
+                repeat,
+                ..JobOptions::default()
+            },
+        )?;
+        self.announce_job(&job);
+        Ok(())
+    }
+
+    fn interactive_resume_session(&self) -> Result<()> {
+        let sessions = self.recent_sessions(SESSION_LIST_LIMIT);
+        if sessions.is_empty() {
+            bail!(
+                "Keine Sitzungen gefunden in {}",
+                self.sessions_dir().display()
+            );
+        }
+        println!("\nZuletzt benutzte Sitzungen:");
+        for (index, session) in sessions.iter().enumerate() {
+            println!(
+                "  [{}] {} - {}",
+                index + 1,
+                format_timestamp(session.modified as i64),
+                session.title
+            );
+            println!("      {}", session.cwd.display());
+        }
+        println!("  [0] Zurueck");
+        let Some(choice) = prompt_line("Sitzung: ")? else {
+            return Ok(());
+        };
+        if choice == "0" {
+            return Ok(());
+        }
+        let session = sessions
+            .get(
+                choice
+                    .parse::<usize>()
+                    .context("bitte eine Sitzungsnummer eingeben")?
+                    .checked_sub(1)
+                    .context("ungueltige Sitzungsnummer")?,
+            )
+            .context("ungueltige Sitzungsnummer")?;
+
+        let text = prompt_line(&format!(
+            "Weiter-Auftrag [{}]: ",
+            jobs::DEFAULT_RESUME_PROMPT
+        ))?
+        .unwrap_or_default();
+        let text = if text.trim().is_empty() {
+            jobs::DEFAULT_RESUME_PROMPT.to_owned()
+        } else {
+            text
+        };
+        let job = self.add_job(
+            JobKind::Resume {
+                session_id: session.id.clone(),
+                text,
+            },
+            session.cwd.clone(),
+            JobOptions::default(),
+        )?;
+        self.announce_job(&job);
+        Ok(())
+    }
+
+    /// Sagt, wann die eben angelegte Aufgabe laufen wird - sonst bliebe offen, ob ueberhaupt
+    /// etwas passiert.
+    fn announce_job(&self, job: &Job) {
+        println!("\nAngelegt: [{}] {}", job.id, job.title);
+        match job.last_window {
+            Some(resets_at) => println!(
+                "Startet, sobald das laufende Fenster zurueckgesetzt ist (ab {}).",
+                format_timestamp(resets_at.timestamp())
+            ),
+            None => {
+                println!("Startet beim naechsten Durchlauf des Dienstes (innerhalb einer Minute).")
+            }
+        }
+        if !self.load_config().ping.enabled {
+            println!(
+                "Hinweis: Der Dienst muss laufen (`systemctl --user status claude-account-sync`)."
+            );
+        }
+    }
+
+    fn interactive_job_list(&self) -> Result<()> {
+        let jobs = self.load_jobs()?;
+        if jobs.is_empty() {
+            println!("\nKeine Aufgaben angelegt.");
+            return Ok(());
+        }
+        println!("\nAufgaben:");
+        for job in &jobs {
+            println!("  {}", job.summary());
+        }
+        println!("  [0] Zurueck");
+        let Some(choice) = prompt_line("Nummer zum Loeschen: ")? else {
+            return Ok(());
+        };
+        if choice == "0" || choice.is_empty() {
+            return Ok(());
+        }
+        self.remove_job(&choice)
     }
 
     fn save_live_as(&self, name: &str) -> Result<Profile> {
@@ -815,15 +1094,18 @@ impl App {
         match auto_switch_threshold {
             Some(threshold) => log_event(&format!(
                 "Auslastung wird alle {USAGE_CHECK_INTERVAL_SECONDS}s geprueft; \
-                 ab {threshold:.0}% wird der Account gewechselt"
+                 ab {threshold:.0}% wird der Account gewechselt (per Aufrufoption erzwungen)"
             )),
-            None => log_event(
-                "Automatischer Wechsel bei vollem Limit ist aus; einschalten mit --auto-switch",
-            ),
+            None => log_event(&format!(
+                "Auslastung wird alle {USAGE_CHECK_INTERVAL_SECONDS}s geprueft; \
+                 Wechsel, Fenster-Ping und Aufgaben richten sich nach {}",
+                self.config_path().display()
+            )),
         }
 
         let mut synced_stamp: Option<CredentialStamp> = None;
         let mut last_problem: Option<String> = None;
+        let mut spoken: HashMap<String, String> = HashMap::new();
         let mut next_keepalive = SystemTime::now();
         let mut next_usage_check = SystemTime::now();
         loop {
@@ -838,12 +1120,22 @@ impl App {
                 }
             }
 
-            if let Some(threshold) = auto_switch_threshold
-                && SystemTime::now() >= next_usage_check
-            {
+            if SystemTime::now() >= next_usage_check {
                 next_usage_check =
                     SystemTime::now() + Duration::from_secs(USAGE_CHECK_INTERVAL_SECONDS);
-                if let Err(error) = self.auto_switch_tick(threshold) {
+                // Die Einstellungen werden bei jeder Pruefung neu gelesen: eine Aenderung im
+                // Menue soll sofort wirken, ohne dass jemand den Dienst neu startet.
+                let mut config = self.load_config();
+                if let Some(threshold) = auto_switch_threshold {
+                    config.auto_switch = true;
+                    config.threshold = threshold;
+                }
+                log_once(
+                    &mut spoken,
+                    "config",
+                    &format!("Einstellungen: {}", config.describe()),
+                );
+                if let Err(error) = self.automation_tick(&config, &mut spoken) {
                     log_problem(&format!("Limitpruefung fehlgeschlagen: {error:#}"));
                 }
             }
@@ -1275,6 +1567,698 @@ impl App {
             return Ok(());
         };
         self.auto_switch(threshold, false).map(|_| ())
+    }
+
+    // ---- Einstellungen ----
+
+    fn config_path(&self) -> PathBuf {
+        self.paths.store.join("config.json")
+    }
+
+    /// Die Einstellungen, so gut sie lesbar sind.
+    ///
+    /// Eine kaputte Datei darf den Dienst nicht anhalten: er faellt auf die Standardwerte
+    /// zurueck - und weil die Standardwerte alle Automatik *aus* schalten, tut er dann lieber
+    /// nichts, als das Falsche.
+    pub fn load_config(&self) -> Config {
+        match fs::read_to_string(self.config_path()) {
+            Ok(text) => match Config::parse(&text) {
+                Ok(config) => config,
+                Err(error) => {
+                    log_problem(&format!(
+                        "Einstellungen sind unlesbar ({error:#}); es gelten die Standardwerte"
+                    ));
+                    Config::default()
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Config::default(),
+            Err(error) => {
+                log_problem(&format!(
+                    "Einstellungen konnten nicht gelesen werden ({error}); \
+                     es gelten die Standardwerte"
+                ));
+                Config::default()
+            }
+        }
+    }
+
+    pub fn write_config(&self, config: &Config) -> Result<()> {
+        self.ensure_store()?;
+        let payload = serde_json::to_vec_pretty(config)?;
+        atomic_write(&self.config_path(), &payload, 0o600)
+    }
+
+    pub fn show_config(&self) -> Result<()> {
+        let config = self.load_config();
+        println!(
+            "Auto-Wechsel bei vollem Limit: {}",
+            onoff(config.auto_switch)
+        );
+        println!("Schwelle: {:.0}%", config.threshold);
+        println!(
+            "Fenster-Ping nach dem Reset: {}",
+            onoff(config.ping.enabled)
+        );
+        println!("  Text: {}", config.ping.prompt);
+        println!("  Modell: {}", config.ping.model);
+        println!("  Zeitlimit: {} min", config.ping.timeout_minutes);
+        let jobs = self.load_jobs()?;
+        println!(
+            "Aufgaben: {} in der Warteschlange, {} insgesamt",
+            jobs.iter().filter(|job| job.enabled).count(),
+            jobs.len()
+        );
+        Ok(())
+    }
+
+    /// Aendert einzelne Einstellungen und laesst den Rest, wie er war.
+    pub fn update_config(&self, change: impl FnOnce(&mut Config)) -> Result<Config> {
+        let mut config = self.load_config();
+        change(&mut config);
+        if !(0.0..=100.0).contains(&config.threshold) {
+            bail!("Schwelle muss zwischen 0 und 100 liegen");
+        }
+        if config.ping.prompt.trim().is_empty() {
+            bail!("Ping-Text darf nicht leer sein");
+        }
+        if config.ping.timeout_minutes == 0 {
+            bail!("Zeitlimit des Pings muss groesser als 0 sein");
+        }
+        self.write_config(&config)?;
+        Ok(config)
+    }
+
+    // ---- Aufgaben ----
+
+    fn jobs_dir(&self) -> PathBuf {
+        self.paths.store.join("jobs")
+    }
+
+    fn job_path(&self, id: &str) -> PathBuf {
+        self.jobs_dir().join(format!("{id}.json"))
+    }
+
+    fn job_log_path(&self, id: &str) -> PathBuf {
+        self.jobs_dir().join(format!("{id}.log"))
+    }
+
+    pub fn load_jobs(&self) -> Result<Vec<Job>> {
+        let entries = match fs::read_dir(self.jobs_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).context("Aufgabenverzeichnis konnte nicht gelesen werden");
+            }
+        };
+        let mut jobs = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            let Some(id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let data = fs::read(&path).with_context(|| {
+                format!("Aufgabe konnte nicht gelesen werden: {}", path.display())
+            })?;
+            jobs.push(jobs::parse_job(&data, id)?);
+        }
+        jobs.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(jobs)
+    }
+
+    pub fn load_job(&self, id: &str) -> Result<Job> {
+        let path = self.job_path(id);
+        let data = fs::read(&path).with_context(|| format!("Aufgabe `{id}` gibt es nicht"))?;
+        jobs::parse_job(&data, id)
+    }
+
+    fn write_job(&self, job: &Job) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(job)?;
+        atomic_write(&self.job_path(&job.id), &payload, 0o600)
+    }
+
+    pub fn remove_job(&self, id: &str) -> Result<()> {
+        let job = self.load_job(id)?;
+        fs::remove_file(self.job_path(id))
+            .with_context(|| format!("Aufgabe `{id}` konnte nicht geloescht werden"))?;
+        println!("Geloescht: [{}] {}", job.id, job.title);
+        Ok(())
+    }
+
+    pub fn set_job_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let mut job = self.load_job(id)?;
+        job.enabled = enabled;
+        self.write_job(&job)?;
+        println!(
+            "Aufgabe [{}] ist jetzt {}",
+            job.id,
+            if enabled { "aktiv" } else { "abgeschaltet" }
+        );
+        Ok(())
+    }
+
+    /// Legt eine Aufgabe an und merkt sich das *laufende* Fenster.
+    ///
+    /// Damit startet sie erst, wenn ein neues Fenster beginnt - wer gerade selbst arbeitet,
+    /// bekommt sein Kontingent nicht von der eigenen Warteschlange weggenommen. Laeuft gerade
+    /// kein Fenster, ist sie sofort faellig; genau dafuer ist sie ja da.
+    pub fn add_job(&self, kind: JobKind, cwd: PathBuf, options: JobOptions) -> Result<Job> {
+        if let JobKind::Resume { session_id, .. } = &kind {
+            jobs::validate_session_id(session_id)?;
+        }
+        if kind.text_is_empty() {
+            bail!("Der Auftrag darf nicht leer sein");
+        }
+        if !cwd.is_dir() {
+            bail!("Arbeitsverzeichnis gibt es nicht: {}", cwd.display());
+        }
+        if options.timeout_minutes == Some(0) {
+            bail!("Zeitlimit muss groesser als 0 sein");
+        }
+        create_private_dir(&self.jobs_dir())?;
+        let existing = self.load_jobs()?;
+        let mut job = Job::new(jobs::next_id(&existing), kind, cwd, unix_timestamp()?);
+        job.repeat = options.repeat;
+        job.skip_permissions = options.skip_permissions;
+        job.settings = options.settings;
+        job.model = options.model;
+        if let Some(title) = options.title.filter(|title| !title.trim().is_empty()) {
+            job.title = title;
+        }
+        if let Some(timeout_minutes) = options.timeout_minutes {
+            job.timeout_minutes = timeout_minutes;
+        }
+        job.last_window = match self.active_usage() {
+            Ok(usage) => usage.five_hour.resets_at,
+            Err(error) => {
+                log_problem(&format!(
+                    "Auslastung ist gerade nicht abrufbar ({error:#}); \
+                     die Aufgabe startet beim naechsten freien Fenster"
+                ));
+                None
+            }
+        };
+        self.write_job(&job)?;
+        Ok(job)
+    }
+
+    pub fn list_jobs(&self) -> Result<()> {
+        let jobs = self.load_jobs()?;
+        if jobs.is_empty() {
+            println!("Keine Aufgaben. Anlegen mit: claude-account job add \"<Auftrag>\"");
+            return Ok(());
+        }
+        for job in &jobs {
+            println!("{}", job.summary());
+        }
+        Ok(())
+    }
+
+    /// Fuehrt eine Aufgabe sofort aus, unabhaengig vom Fenster. Fuer Diagnose und fuer den Fall,
+    /// dass jemand nicht auf den naechsten Reset warten will.
+    pub fn run_job_now(&self, id: &str) -> Result<()> {
+        let job = self.load_job(id)?;
+        let Some(_lock) = self.try_lock_file("jobs")? else {
+            bail!("Es laeuft bereits eine Aufgabe");
+        };
+        log_event(&format!("Aufgabe [{}] wird von Hand gestartet", job.id));
+        // Wer die Aufgabe selbst startet, will am Exitcode sehen, ob sie durchlief - der
+        // Vermerk in der Aufgabendatei allein wird sonst leicht ueberlesen.
+        if !self.execute_job(&job)? {
+            let job = self.load_job(id)?;
+            bail!(
+                "Aufgabe [{}] ist nicht durchgelaufen: {}",
+                job.id,
+                job.last_status.as_deref().unwrap_or("Grund unbekannt")
+            );
+        }
+        Ok(())
+    }
+
+    // ---- Ausfuehrung ----
+
+    /// Startet Claude fuer eine Aufgabe und schreibt das Ergebnis in die Aufgabe zurueck.
+    /// Der Rueckgabewert sagt, ob der Lauf selbst geglueckt ist.
+    fn execute_job(&self, job: &Job) -> Result<bool> {
+        let mut job = job.clone();
+        if !job.cwd.is_dir() {
+            job.enabled = false;
+            job.last_status = Some(format!(
+                "nicht gestartet: Arbeitsverzeichnis fehlt ({})",
+                job.cwd.display()
+            ));
+            log_problem(&format!(
+                "Aufgabe [{}] abgeschaltet: Arbeitsverzeichnis fehlt ({})",
+                job.id,
+                job.cwd.display()
+            ));
+            return self.write_job(&job).map(|()| false);
+        }
+
+        // Der Start wird vermerkt, bevor der Prozess laeuft: bricht der Dienst mitten im Lauf
+        // ab, greift beim naechsten Start trotzdem die Sperre gegen einen Doppellauf.
+        job.last_run_at = Some(unix_timestamp()?);
+        job.last_status = Some("laeuft".to_owned());
+        self.write_job(&job)?;
+
+        let mut args = vec!["-p".to_owned(), job.text().to_owned()];
+        let mut label = String::from("-p <Auftrag>");
+        if let Some(session_id) = job.session_id() {
+            args.push("--resume".to_owned());
+            args.push(session_id.to_owned());
+            label.push_str(&format!(" --resume {session_id}"));
+        }
+        if let Some(model) = &job.model {
+            args.push("--model".to_owned());
+            args.push(model.clone());
+            label.push_str(&format!(" --model {model}"));
+        }
+        if let Some(settings) = &job.settings {
+            args.push("--settings".to_owned());
+            args.push(settings.display().to_string());
+            label.push_str(&format!(" --settings {}", settings.display()));
+        }
+        if job.skip_permissions {
+            args.push("--dangerously-skip-permissions".to_owned());
+            label.push_str(" --dangerously-skip-permissions");
+        }
+
+        let outcome = self.run_claude_task(
+            &self.job_log_path(&job.id),
+            &job.cwd,
+            args,
+            &label,
+            Duration::from_secs(job.timeout_minutes.saturating_mul(60)),
+        );
+        let success = match outcome {
+            Ok(run) => {
+                log_event(&format!("Aufgabe [{}] beendet: {}", job.id, run.status));
+                job.last_status = Some(run.status);
+                // Ein Fehlschlag darf die Aufgabe nicht stillschweigend verbrauchen: nur ein
+                // erfolgreicher Lauf hakt eine einmalige Aufgabe ab.
+                if run.success && !job.repeat {
+                    job.enabled = false;
+                }
+                run.success
+            }
+            Err(error) => {
+                log_problem(&format!(
+                    "Aufgabe [{}] konnte nicht gestartet werden: {error:#}",
+                    job.id
+                ));
+                job.last_status = Some(format!("nicht gestartet: {error:#}"));
+                false
+            }
+        };
+        job.last_window = self.confirm_window(&format!("Aufgabe [{}]", job.id));
+        self.write_job(&job)?;
+        Ok(success)
+    }
+
+    /// Holt nach einem Lauf den Fensterstand frisch und meldet ihn.
+    ///
+    /// Das ist zugleich der Beweis, dass der Lauf wirklich ein Fenster eroeffnet hat, und die
+    /// Kennung, an der die Faelligkeit erkennt, dass dieses Fenster bedient ist. Scheitert die
+    /// Abfrage, bleibt sie `None` - dann haelt allein die Sperre gegen Doppellauf.
+    fn confirm_window(&self, subject: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self.active_usage_fresh() {
+            Ok(usage) => {
+                match usage.five_hour.resets_at {
+                    Some(resets_at) => log_event(&format!(
+                        "{subject}: Fenster laeuft jetzt bis {} ({:.0}% verbraucht)",
+                        format_timestamp(resets_at.timestamp()),
+                        usage.five_hour.utilization
+                    )),
+                    None => log_problem(&format!(
+                        "{subject}: die API meldet weiterhin kein laufendes Fenster - \
+                         der Lauf hat keines eroeffnet"
+                    )),
+                }
+                usage.five_hour.resets_at
+            }
+            Err(error) => {
+                log_problem(&format!(
+                    "{subject}: Fensterstand nicht bestaetigt ({error:#}); \
+                     ein sofortiger zweiter Lauf wird durch die Sperre verhindert"
+                ));
+                None
+            }
+        }
+    }
+
+    /// Ruft die Claude-CLI auf und protokolliert Lauf und Ausgang in eine eigene Logdatei.
+    ///
+    /// Der Auftragstext steht nur im Prozessargument, nicht in der Kopfzeile: eine Logdatei
+    /// wird gelesen und weitergereicht, und was drinsteht, muss man verantworten koennen.
+    fn run_claude_task(
+        &self,
+        log_path: &Path,
+        cwd: &Path,
+        args: Vec<String>,
+        label: &str,
+        timeout: Duration,
+    ) -> Result<TaskRun> {
+        create_private_dir(
+            log_path
+                .parent()
+                .context("ungueltiger Pfad fuer die Logdatei")?,
+        )?;
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(log_path)
+            .with_context(|| format!("Logdatei nicht beschreibbar: {}", log_path.display()))?;
+        let started = SystemTime::now();
+        writeln!(
+            log,
+            "\n[{}] Start: {} {label} (Ordner {}, Zeitlimit {} min)",
+            chrono::Local::now().format("%F %T"),
+            self.paths.claude_bin.display(),
+            cwd.display(),
+            timeout.as_secs() / 60
+        )
+        .context("Logdatei konnte nicht geschrieben werden")?;
+
+        let stdout = log
+            .try_clone()
+            .context("Logdatei konnte nicht geteilt werden")?;
+        let stderr = log
+            .try_clone()
+            .context("Logdatei konnte nicht geteilt werden")?;
+        let mut child = Command::new(&self.paths.claude_bin)
+            .args(&args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr))
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Claude konnte nicht gestartet werden: {}",
+                    self.paths.claude_bin.display()
+                )
+            })?;
+
+        // Testbar und im Notfall operativ anpassbar, ohne jede Aufgabe einzeln zu aendern.
+        let timeout = env::var("CLAUDE_ACCOUNT_SWITCHER_JOB_TIMEOUT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(timeout);
+        let (success, mut status) = match child.wait_timeout(timeout) {
+            Ok(Some(exit)) if exit.success() => (true, "erfolgreich".to_owned()),
+            Ok(Some(exit)) => (false, format!("Claude endete mit {exit}")),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                (
+                    false,
+                    format!(
+                        "Abbruch nach Zeitlimit von {}",
+                        describe_duration(timeout.as_secs())
+                    ),
+                )
+            }
+            Err(error) => (
+                false,
+                format!("Claude konnte nicht abgewartet werden: {error}"),
+            ),
+        };
+        // Ohne Claudes eigene Worte sind Limit, Berechtigungsfrage und Netzfehler dieselbe Zeile.
+        if !success && let Some(reason) = claude_reason(log_path) {
+            status.push_str(&format!(": {reason}"));
+        }
+        let seconds = started
+            .elapsed()
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let status = format!("{status} ({})", describe_duration(seconds));
+        let _ = writeln!(
+            log,
+            "[{}] Ende: {status}",
+            chrono::Local::now().format("%F %T")
+        );
+        Ok(TaskRun { success, status })
+    }
+
+    // ---- Fenster-Ping ----
+
+    fn ping_state_path(&self) -> PathBuf {
+        self.paths.store.join("ping.json")
+    }
+
+    fn load_ping_state(&self) -> PingState {
+        fs::read(self.ping_state_path())
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_default()
+    }
+
+    fn write_ping_state(&self, state: &PingState) -> Result<()> {
+        self.ensure_store()?;
+        let payload = serde_json::to_vec_pretty(state)?;
+        atomic_write(&self.ping_state_path(), &payload, 0o600)
+    }
+
+    /// Eroeffnet das Fuenf-Stunden-Fenster mit einem winzigen Auftrag.
+    ///
+    /// Das Fenster startet nicht mit dem Reset, sondern mit der ersten Anfrage danach. Wer erst
+    /// Stunden spaeter wieder etwas tippt, verschiebt seine ganzen fuenf Stunden nach hinten.
+    pub fn ping_now(&self) -> Result<()> {
+        let config = self.load_config();
+        self.send_ping(&config)
+    }
+
+    fn send_ping(&self, config: &Config) -> Result<()> {
+        let home = env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .context("HOME ist nicht gesetzt")?;
+        let mut state = self.load_ping_state();
+        state.last_run_at = Some(unix_timestamp()?);
+        self.write_ping_state(&state)?;
+
+        let outcome = self.run_claude_task(
+            &self.paths.store.join("ping.log"),
+            &home,
+            vec![
+                "-p".to_owned(),
+                config.ping.prompt.clone(),
+                "--model".to_owned(),
+                config.ping.model.clone(),
+                "--strict-mcp-config".to_owned(),
+            ],
+            &format!("-p <Ping> --model {}", config.ping.model),
+            Duration::from_secs(config.ping.timeout_minutes.saturating_mul(60)),
+        );
+        match outcome {
+            Ok(run) if run.success => log_event(&format!("Fenster-Ping gesendet: {}", run.status)),
+            Ok(run) => log_problem(&format!("Fenster-Ping fehlgeschlagen: {}", run.status)),
+            Err(error) => log_problem(&format!("Fenster-Ping nicht gestartet: {error:#}")),
+        }
+        state.last_window = self.confirm_window("Fenster-Ping");
+        self.write_ping_state(&state)
+    }
+
+    // ---- Durchlauf im Hintergrunddienst ----
+
+    /// Ein Durchlauf der Automatik: Wechsel, Ping, faellige Aufgaben - in dieser Reihenfolge.
+    ///
+    /// `spoken` haelt die zuletzt gemeldete Begruendung je Gegenstand fest. Gemeldet wird jede
+    /// Entscheidung, auch jedes "noch nicht" - aber erst wieder, wenn sie sich aendert. Sonst
+    /// stuende dieselbe Zeile jede Minute im Journal, und niemand laese sie mehr.
+    fn automation_tick(&self, config: &Config, spoken: &mut HashMap<String, String>) -> Result<()> {
+        if config.auto_switch {
+            self.auto_switch_tick(config.threshold)?;
+        }
+        let jobs = match self.load_jobs() {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                log_problem(&format!("Aufgaben nicht lesbar: {error:#}"));
+                Vec::new()
+            }
+        };
+        let waiting = jobs.iter().filter(|job| job.enabled).count();
+        if !config.ping.enabled && waiting == 0 {
+            return Ok(());
+        }
+
+        // Die Auslastung wird genau einmal geholt und von Ping und Aufgaben gemeinsam benutzt:
+        // der Endpunkt ist ratenbegrenzt, und beide bewerten dasselbe Fenster.
+        let usage = self.active_usage()?;
+        let now = unix_timestamp()?;
+
+        if config.ping.enabled {
+            let state = self.load_ping_state();
+            let verdict = jobs::window_readiness(
+                &usage,
+                config.threshold,
+                state.last_window,
+                state.last_run_at,
+                now,
+            );
+            match &verdict {
+                Readiness::Due(reason) => {
+                    log_event(&format!("Fenster-Ping faellig: {reason}"));
+                    spoken.remove("ping");
+                    if let Err(error) = self.send_ping(config) {
+                        log_problem(&format!("Fenster-Ping fehlgeschlagen: {error:#}"));
+                    }
+                }
+                Readiness::Waiting(reason) => {
+                    log_once(spoken, "ping", &format!("Fenster-Ping wartet: {reason}"))
+                }
+            }
+        }
+
+        if waiting == 0 {
+            return Ok(());
+        }
+        // Nur eine Aufgabe gleichzeitig: zwei parallele Laeufe teilen sich dasselbe Kontingent
+        // und stolpern im selben Arbeitsverzeichnis uebereinander.
+        let Some(lock) = self.try_lock_file("jobs")? else {
+            log_once(spoken, "jobs", "Aufgaben warten: es laeuft bereits eine");
+            return Ok(());
+        };
+        let mut start: Option<Job> = None;
+        for (job, verdict) in jobs::evaluate(&jobs, &usage, config.threshold, now) {
+            let key = format!("job-{}", job.id);
+            match (&verdict, start.is_none()) {
+                (Readiness::Due(reason), true) => {
+                    log_event(&format!("Aufgabe [{}] faellig: {reason}", job.id));
+                    spoken.remove(&key);
+                    start = Some(job.clone());
+                }
+                (Readiness::Due(_), false) => log_once(
+                    spoken,
+                    &key,
+                    &format!("Aufgabe [{}] faellig, wartet auf den freien Platz", job.id),
+                ),
+                (Readiness::Waiting(reason), _) => {
+                    log_once(spoken, &key, &format!("Aufgabe [{}]: {reason}", job.id))
+                }
+            }
+        }
+        match start {
+            // Der Lauf gehoert in einen eigenen Faden: eine Aufgabe darf Stunden dauern, und
+            // solange muessen rotierte Tokens weiter gesichert werden.
+            Some(job) => self.spawn_job(job, lock),
+            None => drop(lock),
+        }
+        Ok(())
+    }
+
+    fn spawn_job(&self, job: Job, lock: File) {
+        let paths = self.paths.clone();
+        thread::spawn(move || {
+            let app = App { paths };
+            if let Err(error) = app.execute_job(&job).map(|_| ()) {
+                log_problem(&format!(
+                    "Ergebnis der Aufgabe [{}] konnte nicht gespeichert werden: {error:#}",
+                    job.id
+                ));
+            }
+            drop(lock);
+        });
+    }
+
+    /// Die Auslastung des aktiven Accounts; ein junger gemerkter Stand genuegt hier.
+    fn active_usage(&self) -> Result<Usage> {
+        let active = self.active_profile_name()?;
+        let profile = self.load_profile(&active)?;
+        self.profile_usage_cached(&profile, Some(active.as_str()))
+            .map(|(usage, _age)| usage)
+    }
+
+    /// Die Auslastung ohne gemerkten Stand. Nach einem Lauf ist genau das noetig: der Cache
+    /// waere wenige Sekunden alt und wuerde den Stand von *vor* dem Lauf zurueckgeben.
+    fn active_usage_fresh(&self) -> Result<Usage> {
+        let active = self.active_profile_name()?;
+        let profile = self.load_profile(&active)?;
+        let usage = self.profile_usage(&profile, Some(active.as_str()), true)?;
+        self.write_cached_usage(&active, usage, unix_timestamp()?);
+        Ok(usage)
+    }
+
+    // ---- Sitzungen ----
+
+    fn sessions_dir(&self) -> PathBuf {
+        self.paths
+            .credentials
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("projects")
+    }
+
+    /// Die zuletzt benutzten Claude-Sitzungen, neueste zuerst.
+    ///
+    /// Arbeitsverzeichnis und Titel kommen aus der Sitzungsdatei selbst und nicht aus ihrem
+    /// Ordnernamen: der ist verlustbehaftet kodiert, und ein falsches Arbeitsverzeichnis waere
+    /// beim Fortsetzen genau der Fehler, den niemand bemerkt.
+    pub fn recent_sessions(&self, limit: usize) -> Vec<SessionEntry> {
+        let mut files: Vec<(u64, PathBuf)> = Vec::new();
+        let Ok(projects) = fs::read_dir(self.sessions_dir()) else {
+            return Vec::new();
+        };
+        for project in projects.flatten() {
+            let Ok(entries) = fs::read_dir(project.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let modified = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|value| value.as_secs())
+                    .unwrap_or(0);
+                files.push((modified, path));
+            }
+        }
+        // Neueste zuerst: was zuletzt lief, will man am ehesten fortsetzen.
+        files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+        files
+            .into_iter()
+            .take(limit)
+            .filter_map(|(modified, path)| read_session(&path, modified))
+            .collect()
+    }
+
+    /// Sucht eine Sitzung anhand ihrer ID, damit ein Auftrag ohne Angabe eines Ordners im
+    /// richtigen Verzeichnis fortsetzt statt irgendwo.
+    pub fn find_session(&self, id: &str) -> Option<SessionEntry> {
+        self.recent_sessions(usize::MAX)
+            .into_iter()
+            .find(|session| session.id == id)
+    }
+
+    pub fn list_sessions(&self) -> Result<()> {
+        let sessions = self.recent_sessions(SESSION_LIST_LIMIT);
+        if sessions.is_empty() {
+            bail!(
+                "Keine Sitzungen gefunden in {}",
+                self.sessions_dir().display()
+            );
+        }
+        for session in sessions {
+            println!(
+                "{}  {}  {}",
+                session.id,
+                format_timestamp(session.modified as i64),
+                session.title
+            );
+            println!("    {}", session.cwd.display());
+        }
+        Ok(())
     }
 
     fn renew_profile(&self, profile: &Profile) -> Result<RenewOutcome> {
@@ -1762,6 +2746,166 @@ impl App {
         let payload = serde_json::to_vec_pretty(state)?;
         atomic_write(&self.state_path(), &payload, 0o600)
     }
+}
+
+/// Alles, was eine Aufgabe ausser Auftrag und Ordner haben kann. Die Standardwerte sind die
+/// eines unbeaufsichtigten Laufs: keine Rueckfragen, eine Stunde Zeit, einmalig.
+#[derive(Debug, Clone)]
+pub struct JobOptions {
+    pub title: Option<String>,
+    pub settings: Option<PathBuf>,
+    pub model: Option<String>,
+    pub timeout_minutes: Option<u64>,
+    pub skip_permissions: bool,
+    pub repeat: bool,
+}
+
+impl Default for JobOptions {
+    fn default() -> Self {
+        Self {
+            title: None,
+            settings: None,
+            model: None,
+            timeout_minutes: None,
+            skip_permissions: true,
+            repeat: false,
+        }
+    }
+}
+
+/// Ausgang eines Claude-Aufrufs, wie er in der Aufgabe vermerkt wird.
+struct TaskRun {
+    success: bool,
+    status: String,
+}
+
+/// Zustand des Fenster-Pings. Er ist keine Aufgabe und taucht deshalb auch nicht in der
+/// Aufgabenliste auf - er braucht aber dieselben zwei Merkposten.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PingState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_run_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_window: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Eine Claude-Sitzung, wie sie in der Auswahl erscheint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEntry {
+    pub id: String,
+    pub cwd: PathBuf,
+    pub title: String,
+    pub modified: u64,
+}
+
+/// Liest Arbeitsverzeichnis und erste Frage aus einer Sitzungsdatei.
+///
+/// Gelesen werden nur die ersten Zeilen: die Dateien werden megabytegross, und beides steht
+/// am Anfang. Eine unlesbare Datei wird uebersprungen und nicht zum Abbruch.
+fn read_session(path: &Path, modified: u64) -> Option<SessionEntry> {
+    let id = path.file_stem()?.to_str()?.to_owned();
+    if jobs::validate_session_id(&id).is_err() {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    let mut cwd: Option<PathBuf> = None;
+    let mut title: Option<String> = None;
+    for line in BufReader::new(file).lines().take(SESSION_SCAN_LINES) {
+        let Ok(line) = line else { break };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if cwd.is_none()
+            && let Some(found) = value.get("cwd").and_then(Value::as_str)
+        {
+            cwd = Some(PathBuf::from(found));
+        }
+        if title.is_none()
+            && value.get("type").and_then(Value::as_str) == Some("user")
+            && let Some(text) = session_text(&value)
+        {
+            title = Some(text);
+        }
+        if cwd.is_some() && title.is_some() {
+            break;
+        }
+    }
+    Some(SessionEntry {
+        id,
+        cwd: cwd?,
+        title: title.unwrap_or_else(|| "(ohne Text)".to_owned()),
+        modified,
+    })
+}
+
+/// Der erste echte Nutzertext einer Sitzung.
+///
+/// Der Inhalt ist mal ein String, mal eine Liste von Bloecken. Eingeklammerte Blocke wie
+/// `<command-name>` sind Werkzeugrauschen und taugen nicht als Titel.
+fn session_text(value: &Value) -> Option<String> {
+    let content = value.get("message")?.get("content")?;
+    let text = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() || single_line.starts_with('<') {
+        return None;
+    }
+    Some(shorten(&single_line, 60))
+}
+
+fn shorten(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut short: String = text.chars().take(max_chars).collect();
+    short.push_str(" ...");
+    short
+}
+
+/// Eine Prozentangabe aus dem Menue. Leer heisst "nicht angegeben", nicht "null".
+fn parse_percent(input: &str) -> Result<Option<f64>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value: f64 = trimmed
+        .replace(',', ".")
+        .trim_end_matches('%')
+        .trim()
+        .parse()
+        .with_context(|| format!("`{trimmed}` ist keine Prozentzahl"))?;
+    Ok(Some(value))
+}
+
+fn onoff(value: bool) -> &'static str {
+    if value { "an" } else { "aus" }
+}
+
+fn describe_duration(seconds: u64) -> String {
+    match seconds {
+        0..=90 => format!("{seconds} s"),
+        _ => format!("{} min", seconds / 60),
+    }
+}
+
+/// Schreibt eine Zeile nur, wenn sie sich seit der letzten zu diesem Gegenstand geaendert hat.
+///
+/// Gemeldet wird jede Entscheidung der Automatik, auch jedes Warten - aber eine unveraenderte
+/// Begruendung jede Minute erneut zu schreiben, macht das Journal unlesbar und damit nutzlos.
+fn log_once(spoken: &mut HashMap<String, String>, key: &str, message: &str) {
+    if spoken.get(key).map(String::as_str) == Some(message) {
+        return;
+    }
+    log_event(message);
+    spoken.insert(key.to_owned(), message.to_owned());
 }
 
 fn validate_name(name: &str) -> Result<()> {
