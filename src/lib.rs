@@ -57,6 +57,9 @@ const SECRET_WORD_MIN_CHARS: usize = 40;
 const SESSION_SCAN_LINES: usize = 60;
 /// So viele Sitzungen zeigt die Auswahl an.
 const SESSION_LIST_LIMIT: usize = 15;
+/// Ab dieser Groesse wird eine Aufgaben-Logdatei beiseitegelegt, bevor der naechste Lauf
+/// anhaengt. Das entspricht etwa hundert langen Laeufen - genug Vorgeschichte, wenig Ballast.
+const LOG_ROTATE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -1756,7 +1759,7 @@ impl App {
             Err(error) => {
                 log_problem(&format!(
                     "Auslastung ist gerade nicht abrufbar ({error:#}); \
-                     die Aufgabe startet beim naechsten freien Fenster"
+                     die Aufgabe startet damit beim naechsten Durchlauf des Dienstes"
                 ));
                 None
             }
@@ -1823,6 +1826,7 @@ impl App {
         job.last_run_at = Some(unix_timestamp()?);
         job.last_status = Some("laeuft".to_owned());
         self.write_job(&job)?;
+        let started_at = job.last_run_at;
 
         let mut args = vec!["-p".to_owned(), job.text().to_owned()];
         let mut label = String::from("-p <Auftrag>");
@@ -1873,9 +1877,49 @@ impl App {
                 false
             }
         };
+        // Die Sperre zaehlt ab dem *Ende* des Laufs. Mit dem Startzeitpunkt waere sie bei jedem
+        // Lauf, der laenger als sie selbst dauert, schon abgelaufen, bevor er fertig ist - und
+        // genau dann muesste sie greifen, naemlich wenn die Auslastungsabfrage danach scheitert
+        // und das gemerkte Fenster deshalb alt bleibt.
+        job.last_run_at = Some(unix_timestamp()?);
         job.last_window = self.confirm_window(&format!("Aufgabe [{}]", job.id));
-        self.write_job(&job)?;
+        self.save_job_result(&job, started_at)?;
         Ok(success)
+    }
+
+    /// Schreibt das Ergebnis zurueck, ohne eine zwischenzeitliche Entscheidung zu ueberfahren.
+    ///
+    /// Ein Lauf kann Stunden dauern. Wer die Aufgabe in dieser Zeit geloescht oder abgeschaltet
+    /// hat, meinte das so - ohne diese Pruefung wuerde das Ergebnis sie wieder anlegen bzw.
+    /// reaktivieren.
+    fn save_job_result(&self, job: &Job, started_at: Option<u64>) -> Result<()> {
+        match self.load_job(&job.id) {
+            Ok(current) => {
+                let mut job = job.clone();
+                if !current.enabled {
+                    job.enabled = false;
+                }
+                // Ein Start, der nach unserem eigenen liegt, gehoert zu einem anderen Lauf;
+                // dessen Vermerk zu ueberschreiben wuerde seine Sperre aufheben.
+                if current.last_run_at > started_at && current.last_run_at > job.last_run_at {
+                    log_problem(&format!(
+                        "Aufgabe [{}] wurde waehrend ihres Laufs erneut gestartet; \
+                         das aeltere Ergebnis wird verworfen",
+                        job.id
+                    ));
+                    return Ok(());
+                }
+                self.write_job(&job)
+            }
+            Err(_) => {
+                log_event(&format!(
+                    "Aufgabe [{}] wurde waehrend ihres Laufs geloescht; \
+                     das Ergebnis steht nur noch im Log",
+                    job.id
+                ));
+                Ok(())
+            }
+        }
     }
 
     /// Holt nach einem Lauf den Fensterstand frisch und meldet ihn.
@@ -1926,6 +1970,7 @@ impl App {
                 .parent()
                 .context("ungueltiger Pfad fuer die Logdatei")?,
         )?;
+        rotate_log(log_path);
         let mut log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -2061,7 +2106,10 @@ impl App {
             Ok(run) => log_problem(&format!("Fenster-Ping fehlgeschlagen: {}", run.status)),
             Err(error) => log_problem(&format!("Fenster-Ping nicht gestartet: {error:#}")),
         }
-        state.last_window = self.confirm_window("Fenster-Ping");
+        // Der Beweis, dass der Ping wirklich ein Fenster eroeffnet hat, gehoert ins Log; die
+        // Sperre zaehlt danach ab dem Ende des Laufs, nicht ab seinem Beginn.
+        self.confirm_window("Fenster-Ping");
+        state.last_run_at = Some(unix_timestamp()?);
         self.write_ping_state(&state)
     }
 
@@ -2095,13 +2143,7 @@ impl App {
 
         if config.ping.enabled {
             let state = self.load_ping_state();
-            let verdict = jobs::window_readiness(
-                &usage,
-                config.threshold,
-                state.last_window,
-                state.last_run_at,
-                now,
-            );
+            let verdict = jobs::ping_readiness(&usage, config.threshold, state.last_run_at, now);
             match &verdict {
                 Readiness::Due(reason) => {
                     log_event(&format!("Fenster-Ping faellig: {reason}"));
@@ -2780,13 +2822,11 @@ struct TaskRun {
 }
 
 /// Zustand des Fenster-Pings. Er ist keine Aufgabe und taucht deshalb auch nicht in der
-/// Aufgabenliste auf - er braucht aber dieselben zwei Merkposten.
+/// Aufgabenliste auf - er braucht nur einen Merkposten: wann er zuletzt lief.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PingState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_run_at: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_window: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Eine Claude-Sitzung, wie sie in der Auswahl erscheint.
@@ -2883,6 +2923,18 @@ fn parse_percent(input: &str) -> Result<Option<f64>> {
         .parse()
         .with_context(|| format!("`{trimmed}` ist keine Prozentzahl"))?;
     Ok(Some(value))
+}
+
+/// Legt eine zu gross gewordene Logdatei beiseite, bevor der naechste Lauf anhaengt.
+///
+/// Eine wiederkehrende Aufgabe schreibt sonst jahrelang in dieselbe Datei - und die Suche nach
+/// dem Abbruchgrund liest sie jedes Mal ganz. Ein Vorgaenger genuegt: aeltere Laeufe stehen
+/// ohnehin schon im Journal.
+fn rotate_log(path: &Path) {
+    let too_big = fs::metadata(path).is_ok_and(|meta| meta.len() > LOG_ROTATE_BYTES);
+    if too_big {
+        let _ = fs::rename(path, path.with_extension("log.alt"));
+    }
 }
 
 fn onoff(value: bool) -> &'static str {

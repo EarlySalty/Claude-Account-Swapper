@@ -172,10 +172,45 @@ impl Readiness {
     }
 }
 
-/// Die eine Regel, nach der Aufgaben *und* Fenster-Ping starten.
+/// Beide Fenster muessen unter der Schwelle liegen, sonst laeuft der Auftrag in ein Limit.
+/// `None` heisst: dagegen spricht nichts.
+fn blocking_limit(usage: &Usage, threshold: f64) -> Option<Readiness> {
+    if usage.five_hour.utilization >= threshold {
+        return Some(Readiness::Waiting(format!(
+            "Fuenf-Stunden-Fenster ist voll ({:.0}%, {})",
+            usage.five_hour.utilization,
+            crate::describe_reset(usage.five_hour.resets_at)
+        )));
+    }
+    if usage.seven_day.utilization >= threshold {
+        return Some(Readiness::Waiting(format!(
+            "Wochenfenster ist voll ({:.0}%, {})",
+            usage.seven_day.utilization,
+            crate::describe_reset(usage.seven_day.resets_at)
+        )));
+    }
+    None
+}
+
+/// Die Sperre gegen einen Doppellauf. `last_run_at` ist der Zeitpunkt, an dem der letzte Lauf
+/// *geendet* hat - waere es der Start, waere die Sperre bei einem langen Lauf schon abgelaufen,
+/// bevor er ueberhaupt fertig ist, und genau dann greift sie nicht mehr.
+fn rerun_block(last_run_at: Option<u64>, now: u64) -> Option<Readiness> {
+    let last_run_at = last_run_at?;
+    let waited = now.saturating_sub(last_run_at);
+    (waited < MIN_RERUN_GAP_SECONDS).then(|| {
+        Readiness::Waiting(format!(
+            "letzter Lauf ist erst {} min her; Sperre gegen Doppellauf laeuft {} min",
+            waited / 60,
+            MIN_RERUN_GAP_SECONDS / 60
+        ))
+    })
+}
+
+/// Wann eine Aufgabe laufen darf.
 ///
 /// Drei Bedingungen, jede aus einem konkreten Grund:
-/// 1. Beide Fenster muessen unter der Schwelle liegen - sonst laeuft die Aufgabe in ein Limit.
+/// 1. Beide Fenster muessen unter der Schwelle liegen.
 /// 2. Das Fuenf-Stunden-Fenster muss ein anderes sein als beim letzten Lauf. Nach dem Reset
 ///    meldet die API gar kein `resets_at` mehr: das Fenster ist ungenutzt, und genau dann ist
 ///    der beste Startzeitpunkt. Laeuft dagegen noch das Fenster, in dem zuletzt gearbeitet
@@ -188,19 +223,8 @@ pub fn window_readiness(
     last_run_at: Option<u64>,
     now: u64,
 ) -> Readiness {
-    if usage.five_hour.utilization >= threshold {
-        return Readiness::Waiting(format!(
-            "Fuenf-Stunden-Fenster ist voll ({:.0}%, {})",
-            usage.five_hour.utilization,
-            crate::describe_reset(usage.five_hour.resets_at)
-        ));
-    }
-    if usage.seven_day.utilization >= threshold {
-        return Readiness::Waiting(format!(
-            "Wochenfenster ist voll ({:.0}%, {})",
-            usage.seven_day.utilization,
-            crate::describe_reset(usage.seven_day.resets_at)
-        ));
+    if let Some(blocked) = blocking_limit(usage, threshold) {
+        return blocked;
     }
     if usage.five_hour.resets_at.is_some() && usage.five_hour.resets_at == last_window {
         return Readiness::Waiting(format!(
@@ -208,15 +232,8 @@ pub fn window_readiness(
             crate::describe_reset(usage.five_hour.resets_at)
         ));
     }
-    if let Some(last_run_at) = last_run_at {
-        let waited = now.saturating_sub(last_run_at);
-        if waited < MIN_RERUN_GAP_SECONDS {
-            return Readiness::Waiting(format!(
-                "letzter Lauf ist erst {} min her; Sperre gegen Doppellauf laeuft {} min",
-                waited / 60,
-                MIN_RERUN_GAP_SECONDS / 60
-            ));
-        }
+    if let Some(blocked) = rerun_block(last_run_at, now) {
+        return blocked;
     }
     match usage.five_hour.resets_at {
         None => Readiness::Due(format!(
@@ -229,6 +246,36 @@ pub fn window_readiness(
             crate::describe_reset(usage.five_hour.resets_at)
         )),
     }
+}
+
+/// Wann der Fenster-Ping laufen darf.
+///
+/// Enger als bei einer Aufgabe: der Ping hat nur einen Zweck, naemlich ein *ungenutztes* Fenster
+/// zu eroeffnen. In ein laufendes hineinzufunken wuerde nichts bewirken und trotzdem Kontingent
+/// kosten - deshalb entscheidet hier allein, ob die API ein laufendes Fenster meldet.
+pub fn ping_readiness(
+    usage: &Usage,
+    threshold: f64,
+    last_run_at: Option<u64>,
+    now: u64,
+) -> Readiness {
+    if let Some(blocked) = blocking_limit(usage, threshold) {
+        return blocked;
+    }
+    if let Some(resets_at) = usage.five_hour.resets_at {
+        return Readiness::Waiting(format!(
+            "Fenster laeuft noch ({:.0}%, {})",
+            usage.five_hour.utilization,
+            crate::describe_reset(Some(resets_at))
+        ));
+    }
+    if let Some(blocked) = rerun_block(last_run_at, now) {
+        return blocked;
+    }
+    Readiness::Due(format!(
+        "Fenster ist ungenutzt ({:.0}%)",
+        usage.five_hour.utilization
+    ))
 }
 
 pub fn readiness(job: &Job, usage: &Usage, threshold: f64, now: u64) -> Readiness {
@@ -503,6 +550,70 @@ mod tests {
 
     /// Aeltere Dateien kennen die spaeter ergaenzten Felder nicht; sie duerfen dadurch nicht
     /// unlesbar werden - und eine Aufgabe ohne Kennzeichen ist aktiv, nicht heimlich aus.
+    /// Der Fall, den das Merge-Gate gefunden hat: eine Aufgabe laeuft laenger als die Sperre.
+    /// Zaehlte sie ab dem *Start*, waere sie beim Laufende schon abgelaufen - und ein
+    /// gescheiterter Fensterabgleich haette die Aufgabe sofort erneut gestartet.
+    #[test]
+    fn die_sperre_zaehlt_ab_dem_ende_eines_langen_laufs() {
+        let mut job = job_im_laufenden_fenster();
+        let start = 2_000;
+        let dauer = 40 * 60;
+        job.last_run_at = Some(start + dauer);
+
+        let direkt_danach = readiness(&job, &ungenutztes_fenster(), 98.0, start + dauer + 60);
+        assert!(!direkt_danach.is_due(), "{direkt_danach:?}");
+        assert!(
+            direkt_danach.reason().contains("Doppellauf"),
+            "{direkt_danach:?}"
+        );
+
+        let spaeter = readiness(&job, &ungenutztes_fenster(), 98.0, start + dauer + 16 * 60);
+        assert!(spaeter.is_due(), "{spaeter:?}");
+    }
+
+    /// Der Ping hat nur einen Zweck: ein ungenutztes Fenster eroeffnen. In ein laufendes
+    /// hineinzufunken kostet Kontingent und bewirkt nichts.
+    #[test]
+    fn der_ping_feuert_nur_in_ein_ungenutztes_fenster() {
+        let laeuft = ping_readiness(&laufendes_fenster(), 98.0, None, 9_000);
+        assert!(!laeuft.is_due(), "{laeuft:?}");
+        assert!(
+            laeuft.reason().contains("Fenster laeuft noch"),
+            "{laeuft:?}"
+        );
+
+        let frei = ping_readiness(&ungenutztes_fenster(), 98.0, None, 9_000);
+        assert!(frei.is_due(), "{frei:?}");
+    }
+
+    /// Bleibt das Fenster nach einem Ping ungenutzt - er hat es also nicht eroeffnet -, wird
+    /// nicht sofort nachgefeuert, sondern erst nach der Sperre.
+    #[test]
+    fn ein_wirkungsloser_ping_wird_nicht_sofort_wiederholt() {
+        let gerade_gepingt = ping_readiness(&ungenutztes_fenster(), 98.0, Some(9_000), 9_060);
+        assert!(!gerade_gepingt.is_due(), "{gerade_gepingt:?}");
+        assert!(
+            ping_readiness(&ungenutztes_fenster(), 98.0, Some(9_000), 9_000 + 16 * 60).is_due()
+        );
+    }
+
+    #[test]
+    fn ein_volles_limit_haelt_auch_den_ping_zurueck() {
+        let usage = Usage {
+            five_hour: Bucket {
+                utilization: 0.0,
+                resets_at: None,
+            },
+            seven_day: Bucket {
+                utilization: 99.0,
+                resets_at: Some(at("2026-08-09T02:00:00Z")),
+            },
+        };
+        let verdict = ping_readiness(&usage, 98.0, None, 9_000);
+        assert!(!verdict.is_due(), "{verdict:?}");
+        assert!(verdict.reason().contains("Wochenfenster"), "{verdict:?}");
+    }
+
     #[test]
     fn eine_datei_ohne_die_neueren_felder_bleibt_lesbar() {
         let data = br#"{"id":"0001","title":"alt","art":"prompt","text":"tu was",
