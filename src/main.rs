@@ -76,12 +76,12 @@ enum AccountCommand {
         /// Untaetige Profile gar nicht auffrischen
         #[arg(long)]
         no_keepalive: bool,
-        /// Ab dieser Auslastung in Prozent wird automatisch gewechselt
-        #[arg(long, default_value_t = DEFAULT_SWITCH_THRESHOLD)]
-        auto_switch_threshold: f64,
-        /// Bei vollem Limit nicht automatisch wechseln
+        /// Bei vollem Limit selbst den Account wechseln (standardmaessig aus)
         #[arg(long)]
-        no_auto_switch: bool,
+        auto_switch: bool,
+        /// Ab dieser Auslastung in Prozent wird gewechselt; wirkt nur mit --auto-switch
+        #[arg(long, default_value_t = DEFAULT_SWITCH_THRESHOLD, requires = "auto_switch")]
+        auto_switch_threshold: f64,
     },
     /// Untaetige Profile auffrischen, damit ihr Login nicht ablaeuft
     Keepalive {
@@ -125,12 +125,12 @@ fn run() -> Result<()> {
             interval,
             keepalive_max_age_days,
             no_keepalive,
+            auto_switch,
             auto_switch_threshold,
-            no_auto_switch,
         }) => app.watch(
             interval,
             (!no_keepalive).then_some(keepalive_max_age_days),
-            (!no_auto_switch).then_some(auto_switch_threshold),
+            auto_switch.then_some(auto_switch_threshold),
         ),
         Some(AccountCommand::Keepalive { max_age_days }) => app.keepalive(max_age_days),
         None => app.interactive(),

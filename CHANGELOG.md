@@ -1,5 +1,11 @@
 # Changelog
 
+## #10 — Der automatische Wechsel wird jetzt eingeschaltet, statt vorausgesetzt
+
+Ein Wechsel zieht jede laufende Sitzung mit. So etwas gehört nicht standardmäßig an — auch wenn es meistens das Richtige tut.
+
+Der Hintergrunddienst wechselt ab jetzt nur noch, wenn es ausdrücklich eingeschaltet ist. Ohne diesen Schalter fragt er die Auslastung gar nicht erst ab; von Hand bleiben Übersicht und Wechsel unverändert nutzbar. Beim Start steht im Protokoll, welcher der beiden Zustände gerade gilt.
+
 ## #9 — Jeder Account kann seine eigene Grenze bekommen
 
 Bisher galt für alle Accounts dieselbe Schwelle. Wer einem Account einen Teil seines Kontingents freihalten wollte — etwa das Wochenlimit für etwas Bestimmtes — konnte das nicht ausdrücken.
