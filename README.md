@@ -50,7 +50,25 @@ Das Menü sieht so aus:
 [2] Aktuellen Account speichern
 [3] Neuen Account anmelden
 [4] Status anzeigen
-[5] Beenden
+[5] Auslastung aller Accounts
+[6] Grenzen eines Accounts
+[7] Automatik und Aufgaben
+[8] Beenden
+```
+
+Hinter **Automatik und Aufgaben** liegen der automatische Wechsel bei vollem Limit, der Fenster-Ping und die Aufgaben, die auf ein freies Fünf-Stunden-Fenster warten:
+
+```text
+Auto-Wechsel bei vollem Limit: aus
+Fenster-Ping nach dem Reset:   an
+Aufgaben in der Warteschlange: 2
+
+[1] Auto-Wechsel umschalten
+[2] Fenster-Ping umschalten
+[3] Aufgabe anlegen
+[4] Sitzung fortsetzen lassen
+[5] Aufgaben anzeigen und loeschen
+[0] Zurueck
 ```
 
 Die bisherigen Terminalbefehle bleiben verfügbar:
@@ -197,7 +215,7 @@ Das Fuenf-Stunden-Fenster beginnt nicht mit dem Reset, sondern mit der ersten An
 claude-account config --ping on
 ```
 
-Meldet die Auslastungs-Abfrage kein laufendes Fenster mehr — die Schnittstelle liefert dann `resets_at: null` bei 0 Prozent —, schickt der Dienst `Bist du da?` mit dem kleinsten Modell los und eroeffnet es damit. Danach fragt er den Stand **ungecacht** erneut ab und protokolliert, bis wann das neue Fenster laeuft. Bleibt der Stand unveraendert, gilt der Ping als fehlgeschlagen und wird als Problem gemeldet: ein Ping, der nichts bewirkt, darf nicht wie Erfolg aussehen.
+Meldet die Auslastungs-Abfrage kein laufendes Fenster mehr — die Schnittstelle liefert dann `resets_at: null` bei 0 Prozent —, schickt der Dienst `Bist du da?` mit dem kleinsten Modell los und eroeffnet es damit. Solange ein Fenster laeuft, tut er nichts: hineinzufunken wuerde nur Kontingent kosten und nichts bewirken. Danach fragt er den Stand **ungecacht** erneut ab und protokolliert, bis wann das neue Fenster laeuft. Bleibt der Stand unveraendert, gilt der Ping als fehlgeschlagen und wird als Problem gemeldet: ein Ping, der nichts bewirkt, darf nicht wie Erfolg aussehen. Der naechste Versuch folgt fruehestens 15 Minuten spaeter.
 
 Text und Modell sind aenderbar: `--ping-prompt`, `--ping-model`.
 

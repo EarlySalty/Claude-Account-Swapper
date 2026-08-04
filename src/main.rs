@@ -166,7 +166,7 @@ enum JobCommand {
     },
     /// Eine bestehende Sitzung fortsetzen lassen, sobald wieder Kontingent da ist
     Resume {
-        /// Sitzungs-ID; `claude-account jobs --sessions` zeigt die letzten an
+        /// Sitzungs-ID; `claude-account job sessions` zeigt die letzten an
         session_id: String,
         /// Womit fortgesetzt wird
         #[arg(long)]

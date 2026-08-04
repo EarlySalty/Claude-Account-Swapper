@@ -2906,3 +2906,136 @@ fn the_menu_creates_a_job() {
     assert_eq!(job["cwd"], json!(home), "{job}");
     assert_eq!(job["repeat"], json!(false), "{job}");
 }
+
+/// Der Fund des Merge-Gates: die Sperre gegen Doppellaeufe zaehlte ab dem *Start* eines Laufs.
+/// Bei einem Lauf, der laenger dauert als die Sperre, waere sie beim Ende schon abgelaufen -
+/// und ein danach gescheiterter Fensterabgleich haette dieselbe Aufgabe sofort erneut gestartet.
+#[test]
+fn the_rerun_block_counts_from_the_end_of_a_run() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&[
+        "job",
+        "add",
+        "dauert",
+        "--cwd",
+        harness.home.to_str().expect("Pfad"),
+    ]));
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("Systemzeit")
+        .as_secs();
+
+    assert_success(
+        &harness
+            .command_recording()
+            .env("FAKE_PROMPT_NOOP", "0")
+            .env("FAKE_PROMPT_HANG", "2")
+            .args(["job", "run", "0001"])
+            .output()
+            .expect("job run"),
+    );
+
+    let job = harness.read_job("0001");
+    let last_run_at = job["last_run_at"].as_u64().expect("Zeitpunkt");
+    assert!(
+        last_run_at >= before + 2,
+        "der Vermerk muss vom Ende des Laufs stammen, nicht von seinem Start: \
+         {last_run_at} vs. Start {before}"
+    );
+}
+
+/// Ein Lauf kann Stunden dauern. Wer die Aufgabe waehrenddessen loescht, will sie los - das
+/// Ergebnis darf sie nicht wieder anlegen.
+#[test]
+fn a_job_deleted_during_its_run_does_not_come_back() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&[
+        "job",
+        "add",
+        "wird geloescht",
+        "--cwd",
+        harness.home.to_str().expect("Pfad"),
+    ]));
+
+    let child = harness
+        .command_recording()
+        .env("FAKE_PROMPT_NOOP", "0")
+        .env("FAKE_PROMPT_HANG", "3")
+        .args(["job", "run", "0001"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("job run");
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    fs::remove_file(harness.job_file("0001")).expect("Aufgabe loeschen");
+    let output = child.wait_with_output().expect("job run output");
+
+    assert!(
+        !harness.job_file("0001").exists(),
+        "die geloeschte Aufgabe darf nicht wieder auftauchen: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// Dasselbe fuer das Abschalten: eine waehrend des Laufs abgeschaltete Aufgabe bleibt aus.
+#[test]
+fn a_job_switched_off_during_its_run_stays_off() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&[
+        "job",
+        "add",
+        "wird abgeschaltet",
+        "--cwd",
+        harness.home.to_str().expect("Pfad"),
+        "--repeat",
+    ]));
+
+    let child = harness
+        .command_recording()
+        .env("FAKE_PROMPT_NOOP", "0")
+        .env("FAKE_PROMPT_HANG", "3")
+        .args(["job", "run", "0001"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("job run");
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    assert_success(&harness.run(&["job", "disable", "0001"]));
+    let _ = child.wait_with_output().expect("job run output");
+
+    let job = harness.read_job("0001");
+    assert_eq!(job["enabled"], json!(false), "{job}");
+}
+
+/// Der Ping ist nur fuer ein ungenutztes Fenster da. Laeuft schon eines, waere er verbrauchtes
+/// Kontingent ohne jede Wirkung.
+#[test]
+fn the_ping_stays_quiet_while_a_window_is_running() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["config", "--ping", "on"]));
+    let server = UsageServer::start_sequence("access-work", vec![usage_body(20.0, 30.0)]);
+
+    let mut child = harness
+        .command_recording()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(log.contains("Fenster-Ping wartet"), "{log}");
+    assert!(log.contains("Fenster laeuft noch"), "{log}");
+    assert!(
+        harness.recorded_calls().is_empty(),
+        "in ein laufendes Fenster darf nicht gepingt werden: {log}"
+    );
+}
