@@ -52,6 +52,12 @@ case "$1:$2" in
     fi
     ;;
   -p:*)
+    # Haelt fest, womit und wo aufgerufen wurde. Nur so laesst sich pruefen, dass eine Aufgabe
+    # wirklich mit ihrem Auftrag und in ihrem Ordner startet - und nicht irgendwo anders.
+    if [ -n "${FAKE_ARGS_FILE:-}" ]; then
+      printf 'PWD=%s\n' "$PWD" >>"$FAKE_ARGS_FILE"
+      printf 'ARG=%s\n' "$@" >>"$FAKE_ARGS_FILE"
+    fi
     # Bildet einen echten Request nach: Claude Code erneuert dabei den Login in dem
     # Konfigurationsverzeichnis, das gerade gilt. Ein verbrauchter Token wird geleert.
     target="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
@@ -1772,6 +1778,44 @@ impl UsageServer {
     }
 }
 
+impl UsageServer {
+    /// Antwortet der Reihe nach; die letzte Antwort gilt danach weiter.
+    ///
+    /// Genau das braucht der Fenster-Ping: vor ihm meldet die API ein ungenutztes Fenster, nach
+    /// ihm ein laufendes. Ein Server mit nur einer Antwort koennte den Unterschied nie zeigen.
+    fn start_sequence(token: &str, bodies: Vec<String>) -> Self {
+        let server = std::sync::Arc::new(
+            tiny_http::Server::http("127.0.0.1:0").expect("usage server startet"),
+        );
+        let url = format!("http://{}/usage", server.server_addr());
+        let token = token.to_owned();
+        let listener = std::sync::Arc::clone(&server);
+        let worker = std::thread::spawn(move || {
+            let mut served = 0usize;
+            for request in listener.incoming_requests() {
+                let matches = request.headers().iter().any(|header| {
+                    header.field.equiv("Authorization")
+                        && header.value.as_str().trim_start_matches("Bearer ") == token
+                });
+                let response = if matches {
+                    let body = bodies[served.min(bodies.len() - 1)].clone();
+                    served += 1;
+                    tiny_http::Response::from_string(body).with_status_code(200)
+                } else {
+                    tiny_http::Response::from_string(r#"{"error":"unbekannter Token"}"#)
+                        .with_status_code(401)
+                };
+                let _ = request.respond(response);
+            }
+        });
+        Self {
+            url,
+            server,
+            worker: Some(worker),
+        }
+    }
+}
+
 impl Drop for UsageServer {
     fn drop(&mut self) {
         self.server.unblock();
@@ -2370,7 +2414,10 @@ fn watch_switches_nothing_without_the_opt_in() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert!(log.contains("--auto-switch"), "der Hinweis fehlt: {log}");
+    assert!(
+        log.contains("Auto-Wechsel aus"),
+        "der Dienst muss seinen Zustand nennen: {log}"
+    );
     assert!(
         !log.contains("Auslastung work"),
         "ohne Opt-in darf nichts abgefragt werden: {log}"
@@ -2428,4 +2475,434 @@ fn watch_rejects_a_threshold_without_the_opt_in() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// ---- Aufgaben, Fenster-Ping und Menue ----
+
+impl Harness {
+    fn job_file(&self, id: &str) -> PathBuf {
+        self.store.join("jobs").join(format!("{id}.json"))
+    }
+
+    fn read_job(&self, id: &str) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(self.job_file(id)).expect("Aufgabe lesen"))
+            .expect("Aufgabe ist JSON")
+    }
+
+    fn args_file(&self) -> PathBuf {
+        self.home.join("fake-args.txt")
+    }
+
+    /// Womit und wo die Claude-CLI wirklich aufgerufen wurde.
+    fn recorded_calls(&self) -> String {
+        fs::read_to_string(self.args_file()).unwrap_or_default()
+    }
+
+    /// Ein Aufruf, bei dem die gefakte CLI ihre Argumente mitschreibt und den Login in Ruhe
+    /// laesst - hier interessiert der Aufruf selbst, nicht die Token-Rotation.
+    fn command_recording(&self) -> Command {
+        let mut command = self.command();
+        command
+            .env("FAKE_ARGS_FILE", self.args_file())
+            .env("FAKE_PROMPT_NOOP", "1");
+        command
+    }
+}
+
+/// Ein Fenster, in dem noch nichts verbraucht wurde: die API nennt dann keinen Reset-Zeitpunkt.
+fn unused_window_body() -> String {
+    json!({
+        "five_hour": {"utilization": 0.0, "resets_at": null},
+        "seven_day": {"utilization": 30.0, "resets_at": "2026-08-09T02:00:00Z"}
+    })
+    .to_string()
+}
+
+#[test]
+fn a_job_runs_with_its_own_prompt_in_its_own_directory() {
+    let harness = harness_with_two_accounts();
+    let workdir = harness.home.join("projekt");
+    fs::create_dir_all(&workdir).expect("Arbeitsverzeichnis");
+
+    assert_success(&harness.run(&[
+        "job",
+        "add",
+        "Baue das Ding",
+        "--cwd",
+        workdir.to_str().expect("Pfad"),
+    ]));
+    assert_success(
+        &harness
+            .command_recording()
+            .args(["job", "run", "0001"])
+            .output()
+            .expect("job run"),
+    );
+
+    let calls = harness.recorded_calls();
+    assert!(
+        calls.contains(&format!("PWD={}", workdir.display())),
+        "die Aufgabe muss in ihrem Ordner laufen: {calls}"
+    );
+    assert!(calls.contains("ARG=-p"), "{calls}");
+    assert!(calls.contains("ARG=Baue das Ding"), "{calls}");
+    assert!(
+        calls.contains("ARG=--dangerously-skip-permissions"),
+        "eine unbeaufsichtigte Aufgabe darf nicht auf eine Rueckfrage warten: {calls}"
+    );
+
+    let log = fs::read_to_string(harness.store.join("jobs").join("0001.log")).expect("Logdatei");
+    let head = log
+        .lines()
+        .find(|line| line.contains("Start:"))
+        .expect("Kopfzeile");
+    assert!(
+        !head.contains("Baue das Ding"),
+        "der Auftrag gehoert nicht in die Kopfzeile: {head}"
+    );
+    assert!(
+        !log.contains("access-work") && !log.contains("refresh-w"),
+        "im Log darf kein Token stehen: {log}"
+    );
+}
+
+#[test]
+fn a_resume_job_hands_the_session_id_to_claude() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&[
+        "job",
+        "resume",
+        "abc-123",
+        "--prompt",
+        "Mach weiter",
+        "--cwd",
+        harness.home.to_str().expect("Pfad"),
+    ]));
+    assert_success(
+        &harness
+            .command_recording()
+            .args(["job", "run", "0001"])
+            .output()
+            .expect("job run"),
+    );
+
+    let calls = harness.recorded_calls();
+    assert!(calls.contains("ARG=--resume"), "{calls}");
+    assert!(calls.contains("ARG=abc-123"), "{calls}");
+    assert!(calls.contains("ARG=Mach weiter"), "{calls}");
+}
+
+#[test]
+fn a_one_off_job_is_done_after_its_run_a_repeating_one_stays() {
+    let harness = harness_with_two_accounts();
+    let home = harness.home.to_str().expect("Pfad").to_owned();
+    assert_success(&harness.run(&["job", "add", "einmal", "--cwd", &home]));
+    assert_success(&harness.run(&["job", "add", "immer", "--cwd", &home, "--repeat"]));
+
+    for id in ["0001", "0002"] {
+        assert_success(
+            &harness
+                .command_recording()
+                .args(["job", "run", id])
+                .output()
+                .expect("job run"),
+        );
+    }
+
+    let einmal = harness.read_job("0001");
+    assert_eq!(einmal["enabled"], json!(false), "{einmal}");
+    assert!(
+        einmal["last_status"]
+            .as_str()
+            .expect("Status")
+            .contains("erfolgreich"),
+        "{einmal}"
+    );
+    let immer = harness.read_job("0002");
+    assert_eq!(immer["enabled"], json!(true), "{immer}");
+}
+
+/// Ein gescheiterter Lauf darf die Aufgabe nicht verbrauchen - sonst waere sie nach einem
+/// Rate-Limit still weg, und niemand haette den Auftrag je erledigt.
+#[test]
+fn a_failed_run_keeps_the_job_and_records_the_reason() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&[
+        "job",
+        "add",
+        "wird scheitern",
+        "--cwd",
+        harness.home.to_str().expect("Pfad"),
+    ]));
+
+    let output = harness
+        .command_recording()
+        .env("FAKE_PROMPT_EXIT", "3")
+        .env("FAKE_PROMPT_STDERR", "Claude AI usage limit reached")
+        .args(["job", "run", "0001"])
+        .output()
+        .expect("job run");
+    assert!(
+        !output.status.success(),
+        "ein gescheiterter Lauf muss auch als Fehler zurueckkommen"
+    );
+
+    let job = harness.read_job("0001");
+    assert_eq!(job["enabled"], json!(true), "{job}");
+    let status = job["last_status"].as_str().expect("Status");
+    assert!(status.contains("endete mit"), "{status}");
+    assert!(status.contains("usage limit reached"), "{status}");
+}
+
+#[test]
+fn a_job_without_its_directory_is_switched_off_with_a_reason() {
+    let harness = harness_with_two_accounts();
+    let workdir = harness.home.join("weg");
+    fs::create_dir_all(&workdir).expect("Arbeitsverzeichnis");
+    assert_success(&harness.run(&[
+        "job",
+        "add",
+        "egal",
+        "--cwd",
+        workdir.to_str().expect("Pfad"),
+    ]));
+    fs::remove_dir_all(&workdir).expect("Arbeitsverzeichnis entfernen");
+
+    let output = harness
+        .command_recording()
+        .args(["job", "run", "0001"])
+        .output()
+        .expect("job run");
+    assert!(!output.status.success());
+    assert!(
+        harness.recorded_calls().is_empty(),
+        "ohne Arbeitsverzeichnis darf Claude gar nicht erst starten"
+    );
+
+    let job = harness.read_job("0001");
+    assert_eq!(job["enabled"], json!(false), "{job}");
+    assert!(
+        job["last_status"]
+            .as_str()
+            .expect("Status")
+            .contains("Arbeitsverzeichnis fehlt"),
+        "{job}"
+    );
+}
+
+/// Eine haengende Aufgabe darf den Platz nicht auf Dauer belegen; das Zeitlimit ist die einzige
+/// Bremse, die auch dann noch greift, wenn Claude selbst nicht mehr antwortet.
+#[test]
+fn a_hanging_job_is_stopped_by_its_time_limit() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&[
+        "job",
+        "add",
+        "haengt",
+        "--cwd",
+        harness.home.to_str().expect("Pfad"),
+    ]));
+
+    let output = harness
+        .command_recording()
+        // Der kurze Weg der gefakten CLI endet sofort; hier ist gerade das Haengen der Punkt.
+        .env("FAKE_PROMPT_NOOP", "0")
+        .env("FAKE_PROMPT_HANG", "30")
+        .env("CLAUDE_ACCOUNT_SWITCHER_JOB_TIMEOUT", "1")
+        .args(["job", "run", "0001"])
+        .output()
+        .expect("job run");
+    assert!(!output.status.success());
+
+    let job = harness.read_job("0001");
+    assert!(
+        job["last_status"]
+            .as_str()
+            .expect("Status")
+            .contains("Abbruch nach Zeitlimit"),
+        "{job}"
+    );
+    assert_eq!(job["enabled"], json!(true), "{job}");
+}
+
+#[test]
+fn settings_survive_a_restart_and_a_broken_file_falls_back_to_defaults() {
+    let harness = Harness::new();
+    assert_success(&harness.run(&["config", "--ping", "on", "--auto-switch", "on"]));
+
+    let shown = harness.run(&["config"]);
+    assert_success(&shown);
+    let text = String::from_utf8_lossy(&shown.stdout);
+    assert!(text.contains("Fenster-Ping nach dem Reset: an"), "{text}");
+    assert!(text.contains("Auto-Wechsel bei vollem Limit: an"), "{text}");
+
+    fs::write(harness.store.join("config.json"), "kein json").expect("Einstellungen kaputtmachen");
+    let shown = harness.run(&["config"]);
+    assert_success(&shown);
+    assert!(
+        String::from_utf8_lossy(&shown.stdout).contains("Fenster-Ping nach dem Reset: aus"),
+        "eine kaputte Datei muss auf die Standardwerte fallen"
+    );
+    assert!(
+        String::from_utf8_lossy(&shown.stderr).contains("unlesbar"),
+        "und das muss gemeldet werden"
+    );
+}
+
+/// Der eigentliche Zweck des Pings: das Fenster startet mit der ersten Anfrage. Der Dienst
+/// schickt sie, sobald die API kein laufendes Fenster mehr meldet - und beweist danach am
+/// frischen Reset-Zeitpunkt, dass wirklich eines geoeffnet wurde.
+#[test]
+fn the_service_opens_a_fresh_window_with_a_ping() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["config", "--ping", "on"]));
+    let server = UsageServer::start_sequence(
+        "access-work",
+        vec![
+            unused_window_body(),
+            usage_body_with_resets(4.0, 30.0, "2026-08-04T23:00:00Z", "2026-08-09T02:00:00Z"),
+        ],
+    );
+
+    let mut child = harness
+        .command_recording()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(log.contains("Fenster-Ping faellig"), "{log}");
+    assert!(
+        log.contains("Fenster laeuft jetzt bis"),
+        "der Beweis fehlt: {log}"
+    );
+    let calls = harness.recorded_calls();
+    assert!(calls.contains("ARG=Bist du da?"), "{calls}");
+    assert!(calls.contains("ARG=haiku"), "{calls}");
+}
+
+#[test]
+fn the_service_starts_a_due_job_and_marks_it_done() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&[
+        "job",
+        "add",
+        "starte von selbst",
+        "--cwd",
+        harness.home.to_str().expect("Pfad"),
+    ]));
+    let server = UsageServer::start_sequence("access-work", vec![usage_body(10.0, 30.0)]);
+
+    let mut child = harness
+        .command_recording()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(log.contains("Aufgabe [0001] faellig"), "{log}");
+    assert!(
+        harness.recorded_calls().contains("ARG=starte von selbst"),
+        "die Aufgabe muss wirklich gestartet worden sein: {log}"
+    );
+    let job = harness.read_job("0001");
+    assert_eq!(job["enabled"], json!(false), "{job}");
+}
+
+/// Ohne Aufgaben und ohne Ping darf der Dienst die ratenbegrenzte Auslastungs-API gar nicht
+/// erst anfassen.
+#[test]
+fn the_service_asks_for_usage_only_when_it_has_something_to_do() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start_sequence("access-work", vec![usage_body(10.0, 30.0)]);
+
+    let mut child = harness
+        .command_recording()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(log.contains("Auto-Wechsel aus"), "{log}");
+    assert!(!log.contains("Auslastung work"), "{log}");
+    assert!(harness.recorded_calls().is_empty(), "{log}");
+}
+
+#[test]
+fn the_menu_offers_usage_limits_and_automation() {
+    let harness = harness_with_two_accounts();
+    let output = harness.run_with_input(&[], "8\n");
+    assert_success(&output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    for entry in [
+        "[5] Auslastung aller Accounts",
+        "[6] Grenzen eines Accounts",
+        "[7] Automatik und Aufgaben",
+        "[8] Beenden",
+    ] {
+        assert!(text.contains(entry), "{entry} fehlt im Menue: {text}");
+    }
+}
+
+#[test]
+fn the_menu_switches_the_window_ping_on() {
+    let harness = harness_with_two_accounts();
+    let output = harness.run_with_input(&[], "7\n2\n\n0\n\n8\n");
+    assert_success(&output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("Fenster-Ping nach dem Reset ist jetzt an."),
+        "{text}"
+    );
+
+    let config = fs::read_to_string(harness.store.join("config.json")).expect("Einstellungen");
+    assert!(config.contains("\"enabled\": true"), "{config}");
+}
+
+#[test]
+fn the_menu_creates_a_job() {
+    let harness = harness_with_two_accounts();
+    let home = harness.home.display().to_string();
+    let output = harness.run_with_input(
+        &[],
+        &format!("7\n3\nSchreib den Bericht\n{home}\nn\n\n0\n\n8\n"),
+    );
+    assert_success(&output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Angelegt: [0001]"), "{text}");
+
+    let job = harness.read_job("0001");
+    assert_eq!(job["text"], json!("Schreib den Bericht"), "{job}");
+    assert_eq!(job["cwd"], json!(home), "{job}");
+    assert_eq!(job["repeat"], json!(false), "{job}");
 }

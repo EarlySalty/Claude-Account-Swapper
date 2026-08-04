@@ -1,8 +1,13 @@
-use anyhow::Result;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use claude_account_swapper::jobs::{DEFAULT_RESUME_PROMPT, Job, JobKind};
 use claude_account_swapper::usage::DEFAULT_SWITCH_THRESHOLD;
-use claude_account_swapper::{App, DEFAULT_KEEPALIVE_MAX_AGE_DAYS, DEFAULT_WATCH_INTERVAL_SECONDS};
+use claude_account_swapper::{
+    App, DEFAULT_KEEPALIVE_MAX_AGE_DAYS, DEFAULT_WATCH_INTERVAL_SECONDS, JobOptions,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -89,6 +94,105 @@ enum AccountCommand {
         #[arg(long, default_value_t = DEFAULT_KEEPALIVE_MAX_AGE_DAYS)]
         max_age_days: u64,
     },
+    /// Einstellungen der Automatik anzeigen oder aendern
+    Config {
+        /// Bei vollem Limit selbst den Account wechseln
+        #[arg(long)]
+        auto_switch: Option<Switch>,
+        /// Das Fuenf-Stunden-Fenster nach dem Reset von selbst eroeffnen
+        #[arg(long)]
+        ping: Option<Switch>,
+        /// Text, mit dem das Fenster eroeffnet wird
+        #[arg(long)]
+        ping_prompt: Option<String>,
+        /// Modell fuer den Fenster-Ping
+        #[arg(long)]
+        ping_model: Option<String>,
+        /// Ab dieser Auslastung in Prozent gilt ein Limit als verbraucht
+        #[arg(long)]
+        threshold: Option<f64>,
+    },
+    /// Aufgaben anzeigen, die auf ein freies Fenster warten
+    Jobs,
+    /// Eine Aufgabe anlegen, aendern oder ausfuehren
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
+    },
+    /// Das Fuenf-Stunden-Fenster sofort eroeffnen
+    Ping,
+}
+
+/// Ein Schalter, den man auf der Kommandozeile ohne Nachdenken trifft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+impl Switch {
+    fn is_on(self) -> bool {
+        self == Self::On
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum JobCommand {
+    /// Auftrag anlegen, der beim naechsten freien Fuenf-Stunden-Fenster startet
+    Add {
+        /// Was Claude tun soll
+        prompt: String,
+        /// Arbeitsverzeichnis; ohne Angabe das aktuelle
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Eigene Bezeichnung fuer Listen
+        #[arg(long)]
+        title: Option<String>,
+        /// In jedem neuen Fenster erneut ausfuehren
+        #[arg(long)]
+        repeat: bool,
+        /// Eigene Einstellungsdatei fuer diesen Lauf
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        /// Modell fuer diesen Lauf
+        #[arg(long)]
+        model: Option<String>,
+        /// Zeitlimit des Laufs in Minuten
+        #[arg(long)]
+        timeout_minutes: Option<u64>,
+        /// Berechtigungsfragen zulassen; ohne das laeuft die Aufgabe ohne Rueckfragen
+        #[arg(long)]
+        allow_permissions: bool,
+    },
+    /// Eine bestehende Sitzung fortsetzen lassen, sobald wieder Kontingent da ist
+    Resume {
+        /// Sitzungs-ID; `claude-account jobs --sessions` zeigt die letzten an
+        session_id: String,
+        /// Womit fortgesetzt wird
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Arbeitsverzeichnis der Sitzung; ohne Angabe aus der Sitzung selbst
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        timeout_minutes: Option<u64>,
+        #[arg(long)]
+        allow_permissions: bool,
+    },
+    /// Die zuletzt benutzten Claude-Sitzungen anzeigen
+    Sessions,
+    /// Aufgabe loeschen
+    Remove { id: String },
+    /// Aufgabe wieder aktivieren
+    Enable { id: String },
+    /// Aufgabe abschalten, ohne sie zu loeschen
+    Disable { id: String },
+    /// Aufgabe sofort ausfuehren, unabhaengig vom Fenster
+    Run { id: String },
 }
 
 fn run() -> Result<()> {
@@ -133,7 +237,136 @@ fn run() -> Result<()> {
             auto_switch.then_some(auto_switch_threshold),
         ),
         Some(AccountCommand::Keepalive { max_age_days }) => app.keepalive(max_age_days),
+        Some(AccountCommand::Config {
+            auto_switch,
+            ping,
+            ping_prompt,
+            ping_model,
+            threshold,
+        }) => {
+            let unchanged = auto_switch.is_none()
+                && ping.is_none()
+                && ping_prompt.is_none()
+                && ping_model.is_none()
+                && threshold.is_none();
+            if !unchanged {
+                app.update_config(|config| {
+                    if let Some(value) = auto_switch {
+                        config.auto_switch = value.is_on();
+                    }
+                    if let Some(value) = ping {
+                        config.ping.enabled = value.is_on();
+                    }
+                    if let Some(value) = ping_prompt {
+                        config.ping.prompt = value;
+                    }
+                    if let Some(value) = ping_model {
+                        config.ping.model = value;
+                    }
+                    if let Some(value) = threshold {
+                        config.threshold = value;
+                    }
+                })?;
+            }
+            app.show_config()
+        }
+        Some(AccountCommand::Jobs) => app.list_jobs(),
+        Some(AccountCommand::Job { command }) => run_job_command(&app, command),
+        Some(AccountCommand::Ping) => app.ping_now(),
         None => app.interactive(),
+    }
+}
+
+fn run_job_command(app: &App, command: JobCommand) -> Result<()> {
+    match command {
+        JobCommand::Add {
+            prompt,
+            cwd,
+            title,
+            repeat,
+            settings,
+            model,
+            timeout_minutes,
+            allow_permissions,
+        } => {
+            let cwd = match cwd {
+                Some(cwd) => cwd,
+                None => std::env::current_dir().context("aktuelles Verzeichnis unbekannt")?,
+            };
+            let job = app.add_job(
+                JobKind::Prompt { text: prompt },
+                cwd,
+                JobOptions {
+                    title,
+                    settings,
+                    model,
+                    timeout_minutes,
+                    skip_permissions: !allow_permissions,
+                    repeat,
+                },
+            )?;
+            announce(&job);
+            Ok(())
+        }
+        JobCommand::Resume {
+            session_id,
+            prompt,
+            cwd,
+            settings,
+            model,
+            timeout_minutes,
+            allow_permissions,
+        } => {
+            // Ohne Ordnerangabe zaehlt der Ordner der Sitzung selbst: eine Sitzung woanders
+            // fortzusetzen waere ein Fehler, den man erst am Ergebnis merkt.
+            let cwd = match cwd {
+                Some(cwd) => cwd,
+                None => app
+                    .find_session(&session_id)
+                    .map(|session| session.cwd)
+                    .with_context(|| {
+                        format!(
+                            "Sitzung `{session_id}` wurde nicht gefunden; \
+                             gib das Arbeitsverzeichnis mit --cwd an"
+                        )
+                    })?,
+            };
+            let job = app.add_job(
+                JobKind::Resume {
+                    session_id,
+                    text: prompt.unwrap_or_else(|| DEFAULT_RESUME_PROMPT.to_owned()),
+                },
+                cwd,
+                JobOptions {
+                    settings,
+                    model,
+                    timeout_minutes,
+                    skip_permissions: !allow_permissions,
+                    ..JobOptions::default()
+                },
+            )?;
+            announce(&job);
+            Ok(())
+        }
+        JobCommand::Sessions => app.list_sessions(),
+        JobCommand::Remove { id } => app.remove_job(&id),
+        JobCommand::Enable { id } => app.set_job_enabled(&id, true),
+        JobCommand::Disable { id } => app.set_job_enabled(&id, false),
+        JobCommand::Run { id } => app.run_job_now(&id),
+    }
+}
+
+fn announce(job: &Job) {
+    println!("Angelegt: [{}] {}", job.id, job.title);
+    println!("Ordner: {}", job.cwd.display());
+    match job.last_window {
+        Some(resets_at) => println!(
+            "Startet, sobald das laufende Fenster zurueckgesetzt ist (ab {}).",
+            resets_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+        ),
+        None => println!("Startet beim naechsten Durchlauf des Dienstes."),
     }
 }
 

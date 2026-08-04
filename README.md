@@ -79,6 +79,13 @@ Ohne Argument öffnet `claude-account` dasselbe Hauptmenü wie der Desktop-Start
 | `claude-account sync` | Sichert von Claude rotierte Tokens einmalig ins aktive Profil. |
 | `claude-account watch` | Macht dasselbe dauerhaft und frischt untaetige Profile auf; laeuft als Hintergrunddienst. `--interval <sekunden>`, Standard 5. `--auto-switch` schaltet den Wechsel bei vollem Limit ein (standardmaessig aus), `--auto-switch-threshold <prozent>` aendert die Schwelle. |
 | `claude-account keepalive` | Benutzt untaetige Profile, damit ihr Login nicht abläuft. `--max-age-days <tage>`, Standard 7. |
+| `claude-account config` | Zeigt die Einstellungen der Automatik. Aendern: `--auto-switch on\|off`, `--ping on\|off`, `--ping-prompt <text>`, `--ping-model <name>`, `--threshold <prozent>`. |
+| `claude-account ping` | Eroeffnet das Fuenf-Stunden-Fenster sofort mit einer kurzen Nachricht. |
+| `claude-account jobs` | Zeigt die Aufgaben, die auf ein freies Fenster warten. |
+| `claude-account job add "<auftrag>"` | Legt einen Auftrag an. `--cwd <pfad>` (Standard: aktuelles Verzeichnis), `--repeat` fuer jedes neue Fenster, `--model`, `--settings`, `--timeout-minutes`, `--allow-permissions`. |
+| `claude-account job resume <sitzungs-id>` | Setzt eine fruehere Sitzung fort, sobald wieder Kontingent da ist. `--prompt <text>`, `--cwd <pfad>`. |
+| `claude-account job sessions` | Zeigt die zuletzt benutzten Claude-Sitzungen samt ID und Arbeitsverzeichnis. |
+| `claude-account job run\|remove\|enable\|disable <id>` | Fuehrt eine Aufgabe sofort aus, loescht sie oder schaltet sie um. |
 | `claude-account` | Öffnet das vollständige Hauptmenü. |
 
 Profilnamen duerfen Buchstaben, Zahlen, `.`, `-` und `_` enthalten.
@@ -181,6 +188,40 @@ Der Endpunkt ist ratenbegrenzt und antwortet unter Last mit `429`. Ohne Gegenmas
 - Jede gelesene Auslastung wird gemerkt. Ein Stand aus den letzten 45 Sekunden wird ohne neue Anfrage benutzt; scheitert eine Anfrage, traegt ein Stand bis zu 30 Minuten weiter. Sein Alter steht dann in jeder Zeile, die darauf beruht. Aeltere Zahlen werden verworfen — sie wuerden einen Wechsel auf einen laengst vollen Account begruenden.
 
 Gemerkt werden nur Prozentwerte und Zeitpunkte, keine Zugangsdaten.
+
+### Das Fenster von selbst eroeffnen
+
+Das Fuenf-Stunden-Fenster beginnt nicht mit dem Reset, sondern mit der ersten Anfrage danach. Wer erst Stunden spaeter wieder etwas tippt, verschiebt seine ganzen fuenf Stunden nach hinten. Der Fenster-Ping nimmt das ab:
+
+```bash
+claude-account config --ping on
+```
+
+Meldet die Auslastungs-Abfrage kein laufendes Fenster mehr — die Schnittstelle liefert dann `resets_at: null` bei 0 Prozent —, schickt der Dienst `Bist du da?` mit dem kleinsten Modell los und eroeffnet es damit. Danach fragt er den Stand **ungecacht** erneut ab und protokolliert, bis wann das neue Fenster laeuft. Bleibt der Stand unveraendert, gilt der Ping als fehlgeschlagen und wird als Problem gemeldet: ein Ping, der nichts bewirkt, darf nicht wie Erfolg aussehen.
+
+Text und Modell sind aenderbar: `--ping-prompt`, `--ping-model`.
+
+### Aufgaben, die auf ein freies Fenster warten
+
+Statt nur ein Fenster zu eroeffnen, kann der Dienst damit auch gleich arbeiten:
+
+```bash
+claude-account job add "Räum die offenen TODOs im Repo auf" --cwd ~/Documents/projekt
+claude-account job add "Kurzer Statusbericht" --repeat
+claude-account job resume 3f2a1b90-... --prompt "Mach da weiter, wo du aufgehoert hast."
+```
+
+Eine Aufgabe laeuft als `claude -p` im angegebenen Verzeichnis, ohne Rueckfragen (`--allow-permissions` schaltet das ab), mit einem Zeitlimit von standardmaessig einer Stunde. Ihre komplette Ausgabe steht in `~/.claude-account-switcher/jobs/<id>.log`, das Ergebnis in der Aufgabe selbst.
+
+Wann eine Aufgabe laeuft, entscheidet dieselbe Regel wie beim Ping:
+
+- Beide Fenster muessen unter der Schwelle liegen.
+- Das Fuenf-Stunden-Fenster muss ein anderes sein als beim letzten Lauf. Beim Anlegen merkt sich die Aufgabe das *gerade laufende* Fenster — sie nimmt damit niemandem das Kontingent weg, an dem er gerade arbeitet, sondern startet im naechsten. Laeuft gerade keines, startet sie sofort.
+- Zwischen zwei Laeufen liegen mindestens 15 Minuten. Diese Bremse faengt den Fall ab, dass die Auslastungs-Abfrage nach einem Lauf scheitert: dann bleibt der gemerkte Fensterstand alt, und ohne sie liefe die Aufgabe sofort erneut.
+
+Es laeuft immer nur eine Aufgabe gleichzeitig, und zwar in einem eigenen Faden — der Dienst sichert waehrenddessen weiter rotierte Tokens. Eine einmalige Aufgabe ist nach einem **erfolgreichen** Lauf erledigt; scheitert sie, bleibt sie mit der Begruendung stehen. Fehlt ihr Arbeitsverzeichnis, wird sie abgeschaltet statt blind gestartet.
+
+Jede Entscheidung steht im Protokoll — auch jedes Warten, mit Grund. Wiederholt wird eine Wartebegruendung erst, wenn sie sich aendert.
 
 ### Was der Dienst nicht tut
 
