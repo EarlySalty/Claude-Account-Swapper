@@ -817,7 +817,9 @@ impl App {
                 "Auslastung wird alle {USAGE_CHECK_INTERVAL_SECONDS}s geprueft; \
                  ab {threshold:.0}% wird der Account gewechselt"
             )),
-            None => log_event("Automatischer Wechsel bei vollem Limit ist abgeschaltet"),
+            None => log_event(
+                "Automatischer Wechsel bei vollem Limit ist aus; einschalten mit --auto-switch",
+            ),
         }
 
         let mut synced_stamp: Option<CredentialStamp> = None;

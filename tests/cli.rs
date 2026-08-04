@@ -2342,3 +2342,90 @@ fn auto_asks_no_other_account_while_the_active_one_is_fine() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+/// Der automatische Wechsel greift in laufende Sitzungen ein und ist deshalb opt-in. Ohne das
+/// Flag darf der Dienst die Auslastung nicht einmal abfragen.
+#[test]
+fn watch_switches_nothing_without_the_opt_in() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(100.0, 100.0)),
+        ("access-personal", 200, usage_body(0.0, 0.0)),
+    ]);
+
+    let mut child = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(log.contains("--auto-switch"), "der Hinweis fehlt: {log}");
+    assert!(
+        !log.contains("Auslastung work"),
+        "ohne Opt-in darf nichts abgefragt werden: {log}"
+    );
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("live"),
+        fs::read(harness.saved_credentials("work")).expect("snapshot"),
+        "ohne Opt-in darf nichts gewechselt werden"
+    );
+}
+
+/// Mit dem Flag wechselt derselbe Aufbau sehr wohl - sonst wuerde der Test oben auch dann
+/// bestehen, wenn der automatische Wechsel gar nicht mehr funktioniert.
+#[test]
+fn watch_switches_with_the_opt_in() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(100.0, 100.0)),
+        ("access-personal", 200, usage_body(0.0, 0.0)),
+    ]);
+
+    let mut child = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["watch", "--interval", "1", "--auto-switch"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(log.contains("Wechsel zu personal"), "{log}");
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("live"),
+        fs::read(harness.saved_credentials("personal")).expect("snapshot"),
+        "mit Opt-in muss gewechselt werden"
+    );
+}
+
+/// Die Schwelle allein schaltet nichts ein - das waere eine stille Falle.
+#[test]
+fn watch_rejects_a_threshold_without_the_opt_in() {
+    let harness = harness_with_two_accounts();
+    let output = harness.run(&["watch", "--auto-switch-threshold", "90"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("auto-switch"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
