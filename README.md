@@ -50,7 +50,25 @@ Das Menü sieht so aus:
 [2] Aktuellen Account speichern
 [3] Neuen Account anmelden
 [4] Status anzeigen
-[5] Beenden
+[5] Auslastung aller Accounts
+[6] Grenzen eines Accounts
+[7] Automatik und Aufgaben
+[8] Beenden
+```
+
+Hinter **Automatik und Aufgaben** liegen der automatische Wechsel bei vollem Limit, der Fenster-Ping und die Aufgaben, die auf ein freies Fünf-Stunden-Fenster warten:
+
+```text
+Auto-Wechsel bei vollem Limit: aus
+Fenster-Ping nach dem Reset:   an
+Aufgaben in der Warteschlange: 2
+
+[1] Auto-Wechsel umschalten
+[2] Fenster-Ping umschalten
+[3] Aufgabe anlegen
+[4] Sitzung fortsetzen lassen
+[5] Aufgaben anzeigen und loeschen
+[0] Zurueck
 ```
 
 Die bisherigen Terminalbefehle bleiben verfügbar:
