@@ -22,6 +22,7 @@ pub struct Config {
     /// Ab dieser Auslastung in Prozent gilt ein Fenster als verbraucht.
     pub threshold: f64,
     pub ping: Ping,
+    pub routing: crate::routing::Routing,
 }
 
 /// Startet das Fuenf-Stunden-Fenster von selbst neu, sobald es zurueckgesetzt wurde.
@@ -40,6 +41,7 @@ impl Default for Config {
             auto_switch: false,
             threshold: DEFAULT_SWITCH_THRESHOLD,
             ping: Ping::default(),
+            routing: crate::routing::Routing::default(),
         }
     }
 }
@@ -64,6 +66,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        self.routing.validate()?;
         anyhow::ensure!(
             (0.0..=100.0).contains(&self.threshold),
             "Schwelle muss zwischen 0 und 100 liegen"

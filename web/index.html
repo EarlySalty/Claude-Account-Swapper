@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="account-csrf" content="{{CSRF}}">
+<title>Claude Accounts</title><link rel="stylesheet" href="./style.css"><script src="./app.js" defer></script>
+</head>
+<body><main>
+<header><div><p class="eyebrow">CLAUDE CODE · LINUX</p><h1>Accounts & Sessions</h1></div><span id="connection" role="status">Verbindung wird hergestellt …</span><button id="refresh" type="button">Aktualisieren</button></header>
+<p class="intro">Accounts getrennt nutzen. Projekte zuordnen. T3-Sessions nach verfügbarem Kontingent verteilen.</p>
+<div id="error" role="alert"></div>
+<section aria-labelledby="accounts-title"><div class="section-head"><h2 id="accounts-title">Accounts</h2><span id="threshold" class="tag">Wechsel bei 98 % · 5h</span></div><div id="accounts" class="account-grid"><p>Accounts werden geladen …</p></div></section>
+<section class="panel"><div class="section-head"><h2>Verteilung</h2><span class="muted">Änderungen greifen zwischen zwei Antworten</span></div>
+<form id="settings"><div class="form-grid">
+<label>Strategie<select name="strategy"><option value="balanced">Sessions verteilen</option><option value="best">Meistes Restkontingent</option><option value="consume-first">Baldigen Wochenreset zuerst nutzen</option><option value="next-available">Nächster freier Account</option></select></label>
+<label>5h-Grenze (%)<input name="threshold" type="number" min="1" max="100" step="0.1" value="98" required></label>
+<label>Wochengrenze (%)<input name="weekly_threshold" type="number" min="1" max="100" step="0.1" value="100" required></label>
+<label>Wechselpause (Sekunden)<input name="cooldown_seconds" type="number" min="0" max="3600" value="300" required></label>
+<label>Sicherheitspuffer (%)<input name="hysteresis" type="number" min="0" max="25" step="0.1" value="3" required></label>
+<label class="check"><input name="auto_switch" type="checkbox" checked> Automatischer Session-Wechsel</label>
+</div><div class="form-footer"><p>Ein erreichtes Limit hat Vorrang vor der Wechselpause. Fehlende oder veraltete Nutzungsdaten gelten nicht als freies Kontingent.</p><button type="submit">Verteilung speichern</button></div></form></section>
+<section class="panel"><div class="section-head"><h2>Projekte</h2><span class="muted">Unterordner übernehmen die nächste übergeordnete Regel</span></div>
+<form id="project"><div class="form-grid project-grid"><label>Projektverzeichnis<input name="path" placeholder="/home/du/projekte/app" required></label><label>Account<select name="account" id="project-account"><option value="">Automatisch</option></select></label><label>Account-Pool (optional)<input name="pool" placeholder="privat, arbeit"></label><label>Modell-Wochenlimit (optional)<input name="model" placeholder="Name aus der Usage-Anzeige"></label></div><div class="form-footer"><p>Ein fester Account wird nicht durch einen anderen ersetzt. Ohne feste Zuordnung kann der angegebene Pool genutzt werden.</p><button type="submit">Projekt zuordnen</button></div></form><div id="projects"></div></section>
+<section class="panel"><div class="section-head"><h2>Verwaltete Sessions</h2><span id="session-count" class="muted"></span></div><p class="muted">Hier erscheinen Starts über <code>claude-account run</code> und den T3-Launcher. Bereits laufende, anders gestartete T3-Threads werden nicht nachträglich übernommen.</p><div id="sessions"></div></section>
+<details class="panel"><summary>Terminal & T3 einrichten</summary><p>Für jeden Account einmal einen eigenen offiziellen Claude-Login anlegen. Bereits vorhandene native Konfigurationen können stattdessen mit <code>bind</code> angebunden werden.</p><pre>claude-account session-login privat
+claude-account session-login arbeit
+claude-account share-setup privat
+claude-account share-setup arbeit
+
+claude-account run privat
+claude-account run arbeit
+claude-account map privat /home/du/projekte/app</pre><p>In T3 unter Providers als Claude-Binary <code>~/.cargo/bin/claude-account-t3</code> auswählen und das Feld <code>CLAUDE_CONFIG_DIR</code> leer lassen. Der Launcher wählt den Account je Session. Für einen Wechsel mit bestehendem Verlauf müssen die beteiligten Accounts den Projektverlauf teilen.</p><p>Die Zugangsdaten bleiben in Claudes nativen Konfigurationsverzeichnissen. Diese Seite liefert weder Tokens noch Passwörter aus.</p></details>
+<footer>Nur lokale Verwaltung. Kein Konto wird erstellt, kein Limit verändert, keine laufende Antwort für einen Account-Wechsel abgebrochen.</footer>
+</main></body></html>

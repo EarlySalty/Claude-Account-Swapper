@@ -22,6 +22,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum AccountCommand {
+    #[command(flatten)]
+    Managed(claude_account_swapper::commands::ManagedCommand),
     /// Aktuell autorisierten Claude-Login unter einem Namen speichern
     Save { name: String },
     /// Einmalig im Browser einloggen und den neuen Account speichern
@@ -196,9 +198,20 @@ enum JobCommand {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
     let app = App::discover()?;
+    if std::env::args_os().next().is_some_and(|path| {
+        std::path::Path::new(&path)
+            .file_name()
+            .is_some_and(|name| name == "claude-account-t3")
+    }) {
+        std::process::exit(claude_account_swapper::bridge::run(
+            &app,
+            std::env::args().skip(1).collect(),
+        )?);
+    }
+    let cli = Cli::parse();
     match cli.command {
+        Some(AccountCommand::Managed(command)) => command.execute(&app),
         Some(AccountCommand::Save { name }) => app.save(&name),
         Some(AccountCommand::Login { name }) => app.login(&name),
         Some(AccountCommand::Switch { name, no_check }) => app.switch_checked(&name, !no_check),

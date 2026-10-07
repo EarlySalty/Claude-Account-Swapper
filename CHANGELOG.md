@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0: parallele Linux-Accounts und Session-Verteilung
+
+Der globale Swapper bekommt einen getrennten nativen Session-Modus. Accounts können in verschiedenen Terminals parallel laufen, Projekte erhalten feste Zuordnungen oder Account-Pools. Zur Auswahl stehen `balanced`, `best`, `consume-first` und `next-available`; die 5h-Umschaltschwelle bleibt bei 98 %. Pausen, Sicherheitspuffer und optionale Modell-Wochenlimits ergänzen die Auswahl.
+
+Ein neuer `claude-account-t3`-Launcher verwaltet Claude-Stream-Sessions, erhält deren Session-ID beim Account-Wechsel und wartet auf abgeschlossene Antworten. Die nativen Logins bleiben in eigenen offiziellen Claude-Konfigurationen. Ein Account wird nicht gleichzeitig von zwei verwalteten Prozessen verwendet; die Login-Pflege wartet auf eine freie Sperre.
+
+`claude-account dashboard` bietet eine kleine lokale HTML-Oberfläche für Quoten, Projektregeln und Session-Zuordnungen. Der Installer liefert beide Binaries, einen Dashboard-Dienst und einen Browser-Starter aus. Schreibzugriffe sind gegen fremde Origins und DNS-Rebinding abgesichert; Tokens werden nicht an die Oberfläche ausgeliefert.
+
+Die T3-Bridge ist mit einem lokalen Protokollsimulator getestet. Der Abnahmelauf mit einer echten T3-Installation und zwei offiziellen nativen Logins bleibt vor produktiver Nutzung erforderlich. Bestehende T3-Laufzeitdateien werden nicht verändert. Windows und macOS bleiben außen vor. Einrichtung und Grenzen stehen in [docs/orchestrierung.md](docs/orchestrierung.md).
+
 ## #11 — Das Fünf-Stunden-Fenster startet von selbst, und Aufträge warten darauf
 
 Das Fenster beginnt nicht mit dem Reset, sondern mit der ersten Anfrage danach. Wer nachts um vier nicht am Rechner sitzt, verschiebt damit seine ganzen fünf Stunden — und musste sich bisher selbst einen Wecker stellen, um irgendetwas zu tippen.

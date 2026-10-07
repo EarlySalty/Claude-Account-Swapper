@@ -15,8 +15,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use wait_timeout::ChildExt;
 
+pub mod bridge;
+pub mod commands;
 pub mod config;
+pub mod dashboard;
 pub mod jobs;
+pub mod routing;
+pub mod runtime;
 pub mod usage;
 
 use config::Config;
@@ -1082,6 +1087,7 @@ impl App {
         keepalive_max_age_days: Option<u64>,
         auto_switch_threshold: Option<f64>,
     ) -> Result<()> {
+        self.start_native_monitor();
         let interval = Duration::from_secs(interval_seconds.clamp(1, 3600));
         log_event(&format!(
             "Beobachte {} alle {}s",

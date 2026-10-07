@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -329,7 +329,22 @@ fn compare_utilization(left: &Usage, right: &Usage) -> Ordering {
 /// Der Token wandert ausschliesslich in den Authorization-Header: als Kommandozeilenargument
 /// stuende er in der Prozessliste, und in einer Fehlermeldung stuende er dauerhaft im Journal.
 /// Deshalb enthaelt auch kein Fehlertext dieser Funktion den Token.
+#[derive(Debug)]
+pub struct HttpFailure(pub u16);
+
+impl std::fmt::Display for HttpFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Auslastungs-API antwortete mit HTTP {}", self.0)
+    }
+}
+
+impl std::error::Error for HttpFailure {}
+
 pub fn fetch(access_token: &str) -> Result<Usage> {
+    parse(&fetch_document(access_token)?)
+}
+
+pub fn fetch_document(access_token: &str) -> Result<String> {
     let url = std::env::var("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL")
         .ok()
         .filter(|value| !value.is_empty())
@@ -356,9 +371,9 @@ pub fn fetch(access_token: &str) -> Result<Usage> {
         .read_to_string()
         .context("Antwort der Auslastungs-API konnte nicht gelesen werden")?;
     if status != 200 {
-        bail!("Auslastungs-API antwortete mit HTTP {status}");
+        return Err(HttpFailure(status).into());
     }
-    parse(&body)
+    Ok(body)
 }
 
 /// Liest die beiden interessanten Fenster aus der Antwort.
@@ -374,6 +389,38 @@ pub fn parse(body: &str) -> Result<Usage> {
     })
 }
 
+pub fn parse_model_windows(body: &str) -> Result<std::collections::BTreeMap<String, Bucket>> {
+    let value: Value = serde_json::from_str(body)?;
+    let mut result = std::collections::BTreeMap::new();
+    if let Some(object) = value.as_object() {
+        for (key, item) in object {
+            if !key.starts_with("seven_day_") || item.is_null() {
+                continue;
+            }
+            if let Ok(window) = bucket(&value, key) {
+                let name = item
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| key.trim_start_matches("seven_day_"));
+                result.insert(name.to_owned(), window);
+            }
+        }
+    }
+    if let Some(models) = value.get("per_model").and_then(Value::as_array) {
+        for item in models {
+            if let (Some(name), Ok(window)) = (
+                item.get("display_name").and_then(Value::as_str),
+                serde_json::from_value::<Bucket>(item.clone()),
+            ) && window.utilization.is_finite()
+                && window.utilization >= 0.0
+            {
+                result.insert(name.into(), window);
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn bucket(value: &Value, field: &str) -> Result<Bucket> {
     let bucket = value
         .get(field)
@@ -382,6 +429,10 @@ fn bucket(value: &Value, field: &str) -> Result<Bucket> {
         .get("utilization")
         .and_then(Value::as_f64)
         .with_context(|| format!("`{field}` enthaelt keine Auslastung"))?;
+    anyhow::ensure!(
+        utilization.is_finite() && utilization >= 0.0,
+        "`{field}` enthält eine ungültige Auslastung"
+    );
     // `resets_at` fehlt bei einem ungenutzten Fenster; nur ein *unlesbarer* Wert ist ein Fehler.
     let resets_at = match bucket.get("resets_at").and_then(Value::as_str) {
         Some(text) => Some(

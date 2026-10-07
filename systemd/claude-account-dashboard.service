@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Account Dashboard und native Login-Pflege
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=__BINARY__ dashboard
+__CLAUDE_BIN_ENV__
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -2,9 +2,23 @@
 
 Speichert mehrere Claude-Code-Logins und wechselt die aktive Authentifizierung ohne erneuten Browser-Login.
 
-## Prinzip
+## Neu: parallele Accounts, Projektregeln und T3-Launcher
 
-Claude Code nutzt unter Linux genau einen aktiven OAuth-Datensatz in `~/.claude/.credentials.json`. `claude-account` sichert diesen Datensatz unter einem Profilnamen und ersetzt ihn beim Wechsel atomar. Vor jedem Wechsel wird der aktuelle Stand zurueckgesichert, damit von Claude rotierte Tokens nicht verloren gehen.
+Version 0.3 ergänzt den bisherigen globalen Swapper um getrennte native Claude-Konfigurationen:
+
+- `claude-account run <name>` für parallele Accounts in verschiedenen Terminals.
+- `claude-account map <name|auto> <ordner>` für Projektregeln und Account-Pools.
+- `best`, `balanced`, `consume-first` und `next-available`, mit 98-%-Schwelle im 5h-Fenster, Wechselpause, Sicherheitspuffer und optionalem Modell-Wochenlimit.
+- `claude-account-t3` als Stream-JSON-Launcher mit Session-Zuordnung und Wechsel zwischen abgeschlossenen Antworten.
+- `claude-account dashboard` als kleine lokale HTML-Oberfläche auf Port 3775.
+
+Für native Sessions werden die Accounts einmal separat über den offiziellen Claude-Login angemeldet. Aktive Tokens werden nicht zwischen gleichzeitig laufenden Konfigurationen kopiert. Pro Account läuft ein verwalteter Prozess; verschiedene Accounts können parallel arbeiten. Der T3-Launcher ist protokollgetestet, benötigt aber vor produktivem Einsatz noch einen Abnahmelauf mit der konkret installierten T3-Version und echten Logins.
+
+**Einrichtung, Befehle und Grenzen:** [Parallele Accounts und T3 Code](docs/orchestrierung.md).
+
+## Prinzip des bisherigen globalen Swappers
+
+Claude Code nutzt in seiner Standardkonfiguration unter Linux einen aktiven OAuth-Datensatz in `~/.claude/.credentials.json`. `claude-account` sichert diesen Datensatz unter einem Profilnamen und ersetzt ihn beim Wechsel atomar. Vor jedem Wechsel wird der aktuelle Stand zurueckgesichert, damit von Claude rotierte Tokens nicht verloren gehen.
 
 Zum Login gehoeren zwei Dateien: die Tokens in `~/.claude/.credentials.json` und die Kontodaten, die Claude Code getrennt davon in `~/.claude.json` (`oauthAccount`, `userID`) zwischenspeichert. Der Switcher leert diesen Cache bei jedem Wechsel, damit Claude ihn passend zum neuen Token neu laedt. Bleibt er stehen, meldet Claude Code `Login expired · Please run /login`.
 

@@ -6,12 +6,16 @@ cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 binary="$cargo_home/bin/claude-account"
 applications_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 
-if ! command -v cargo >/dev/null 2>&1; then
+cargo_bin="$cargo_home/bin/cargo"
+if [[ ! -x "$cargo_bin" ]]; then
+  cargo_bin="$(command -v cargo || true)"
+fi
+if [[ -z "$cargo_bin" ]]; then
   printf 'Fehler: Rust/Cargo fehlt. Installation: https://rustup.rs\n' >&2
   exit 1
 fi
 
-cargo install --path "$repo_dir" --locked --force
+"$cargo_bin" install --path "$repo_dir" --locked --force
 
 if [[ ! -x "$binary" ]]; then
   printf 'Fehler: Binary wurde nicht gefunden: %s\n' "$binary" >&2
@@ -100,4 +104,41 @@ printf '\nInstalliert:\n  %s\n  %s\n' "$desktop_launcher" "$application_launcher
 if [[ "$service_installed" -eq 1 ]]; then
   printf '  %s (laeuft)\n' "$service_unit"
 fi
-printf '\nJetzt "Claude Account Swapper" doppelklicken.\n'
+dashboard_unit="$systemd_user_dir/claude-account-dashboard.service"
+if [[ -f "$repo_dir/systemd/claude-account-dashboard.service" ]]; then
+  dashboard_temporary="$(mktemp "${dashboard_unit}.XXXXXX")"
+  sed -e "s|__BINARY__|$binary|g" -e "s|__CLAUDE_BIN_ENV__|${claude_bin_env:-# Claude-CLI wird im PATH gesucht.}|g" \
+    "$repo_dir/systemd/claude-account-dashboard.service" >"$dashboard_temporary"
+  chmod 644 "$dashboard_temporary"
+  mv -f -- "$dashboard_temporary" "$dashboard_unit"
+  if systemctl --user daemon-reload >/dev/null 2>&1 &&
+    systemctl --user enable --now claude-account-dashboard.service >/dev/null 2>&1; then
+    printf '  %s (läuft)\n' "$dashboard_unit"
+  else
+    printf 'Warnung: Dashboard-Dienst konnte nicht gestartet werden.\n' >&2
+    printf '         Manuell: %s dashboard\n' "$binary" >&2
+  fi
+fi
+
+cat >"$applications_dir/claude-account-dashboard.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Claude Accounts
+Comment=Accounts, Projekte und T3-Sessions verwalten
+Exec=xdg-open http://127.0.0.1:3775/
+Terminal=false
+Icon=system-users
+Categories=Utility;
+EOF
+chmod 644 "$applications_dir/claude-account-dashboard.desktop"
+cp -- "$applications_dir/claude-account-dashboard.desktop" "$desktop_dir/Claude Accounts.desktop"
+chmod 755 "$desktop_dir/Claude Accounts.desktop"
+if command -v gio >/dev/null 2>&1; then
+  gio set "$desktop_dir/Claude Accounts.desktop" metadata::trusted true >/dev/null 2>&1 || true
+fi
+
+printf '\nTerminal: "Claude Account Swapper". Oberfläche: "Claude Accounts".\n'
+printf 'Dashboard auf diesem Rechner: http://127.0.0.1:3775/\n'
+printf 'T3-Launcher: %s/bin/claude-account-t3\n' "$cargo_home"
+printf 'Bereits laufende Dienste werden nicht mitten in einer Aufgabe neu gestartet.\n'
