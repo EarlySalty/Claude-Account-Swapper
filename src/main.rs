@@ -123,9 +123,12 @@ enum AccountCommand {
     Ping,
     /// Lokales Webmenü für den privaten Tailscale-Proxy starten
     Web {
-        /// Lokaler Port des Webmenüs
-        #[arg(long, default_value_t = 8785)]
-        port: u16,
+        /// Unix-Socket, über den Caddy das Webmenü erreicht
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Erlaubter Host-Header, mehrfach angebbar
+        #[arg(long = "allowed-host", default_values_t = [claude_account_swapper::web::DEFAULT_ALLOWED_HOST.to_owned()])]
+        allowed_hosts: Vec<String>,
     },
 }
 
@@ -279,7 +282,10 @@ fn run() -> Result<()> {
         Some(AccountCommand::Jobs) => app.list_jobs(),
         Some(AccountCommand::Job { command }) => run_job_command(&app, command),
         Some(AccountCommand::Ping) => app.ping_now(),
-        Some(AccountCommand::Web { port }) => claude_account_swapper::web::serve(&app, port),
+        Some(AccountCommand::Web {
+            socket,
+            allowed_hosts,
+        }) => claude_account_swapper::web::serve(&app, socket, allowed_hosts),
         None => app.interactive(),
     }
 }

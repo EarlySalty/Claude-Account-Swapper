@@ -4,8 +4,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin
-ExecStart=%h/.cargo/bin/claude-account web --port 8785
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin
+__CLAUDE_BIN_ENV__
+ExecStart=__BINARY__ web --socket %h/.claude-account-web/web.sock --allowed-host v50671-kde --allowed-host v50671-kde.taile28573.ts.net --allowed-host 100.117.29.112
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true

@@ -1,13 +1,16 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs::{self, DirBuilder};
 use std::io::Read;
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -16,8 +19,12 @@ use crate::jobs::JobKind;
 use crate::usage::Stops;
 use crate::{App, JobOptions};
 
-const PRIVATE_PROXY_HEADER: &str = "X-Account-Swapper-Private-Proxy";
-const PRIVATE_PROXY_MARKER: &str = "tailscale-caddy-v50671";
+pub const DEFAULT_ALLOWED_HOST: &str = "v50671-kde";
+const SOCKET_DIR_NAME: &str = ".claude-account-web";
+const SOCKET_FILE_NAME: &str = "web.sock";
+const SOCKET_MODE: u32 = 0o660;
+const SOCKET_DIR_MODE: u32 = 0o750;
+const LOCAL_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const TASK_HISTORY: usize = 24;
 const RUNNING: &str = "läuft";
@@ -126,24 +133,85 @@ struct ServiceRequest {
     action: String,
 }
 
-pub fn serve(app: &App, port: u16) -> Result<()> {
-    let server = Server::http(("127.0.0.1", port))
-        .map_err(|error| anyhow::anyhow!("Webmenü konnte nicht gestartet werden: {error}"))?;
-    println!("Claude Account Swapper Webmenü auf 127.0.0.1:{port}");
-    println!("Zugriff nur über den privaten Tailscale-Proxy.");
+pub fn serve(app: &App, socket: Option<PathBuf>, allowed_hosts: Vec<String>) -> Result<()> {
+    let allowed_hosts: Vec<String> = allowed_hosts
+        .into_iter()
+        .map(|host| host.trim().to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+        .collect();
+    if allowed_hosts.is_empty() {
+        bail!("Mindestens ein erlaubter Host ist nötig.");
+    }
+    let socket = match socket {
+        Some(path) => path,
+        None => default_socket_path()?,
+    };
+    let server = bind_socket(&socket)?;
+    println!("Claude Account Swapper Webmenü auf {}", socket.display());
+    println!("Erlaubte Hosts: {}", allowed_hosts.join(", "));
 
     let app = Arc::new(app.clone());
     let tasks = Arc::new(TaskStore::default());
+    let allowed_hosts = Arc::new(allowed_hosts);
     for request in server.incoming_requests() {
         let app = Arc::clone(&app);
         let tasks = Arc::clone(&tasks);
-        thread::spawn(move || handle_request(request, app, tasks));
+        let allowed_hosts = Arc::clone(&allowed_hosts);
+        thread::spawn(move || handle_request(request, app, tasks, allowed_hosts));
     }
     Ok(())
 }
 
-fn handle_request(mut request: Request, app: Arc<App>, tasks: Arc<TaskStore>) {
-    let response = match route(&mut request, &app, &tasks) {
+fn default_socket_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .context("HOME ist nicht gesetzt")?;
+    Ok(PathBuf::from(home)
+        .join(SOCKET_DIR_NAME)
+        .join(SOCKET_FILE_NAME))
+}
+
+fn bind_socket(path: &Path) -> Result<Server> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .context("Der Socket braucht ein eigenes Verzeichnis.")?;
+    DirBuilder::new()
+        .recursive(true)
+        .mode(SOCKET_DIR_MODE)
+        .create(dir)
+        .with_context(|| format!("Verzeichnis {} fehlt", dir.display()))?;
+    let mode = fs::metadata(dir)?.permissions().mode();
+    if mode & 0o007 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode & 0o7770))?;
+    }
+    remove_stale_socket(path)?;
+    let server = Server::http_unix(path)
+        .map_err(|error| anyhow::anyhow!("Webmenü konnte nicht gestartet werden: {error}"))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))?;
+    Ok(server)
+}
+
+fn remove_stale_socket(path: &Path) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_socket() {
+        bail!("{} existiert und ist kein Socket.", path.display());
+    }
+    if UnixStream::connect(path).is_ok() {
+        bail!("Das Webmenü läuft bereits auf {}.", path.display());
+    }
+    fs::remove_file(path).with_context(|| format!("{} ist nicht entfernbar", path.display()))
+}
+
+fn handle_request(
+    mut request: Request,
+    app: Arc<App>,
+    tasks: Arc<TaskStore>,
+    allowed_hosts: Arc<Vec<String>>,
+) {
+    let response = match route(&mut request, &app, &tasks, &allowed_hosts) {
         Ok(response) => response,
         Err((status, message)) => json_response(status, &serde_json::json!({"error": message})),
     };
@@ -154,8 +222,10 @@ fn route(
     request: &mut Request,
     app: &App,
     tasks: &Arc<TaskStore>,
+    allowed_hosts: &[String],
 ) -> std::result::Result<Response<std::io::Cursor<Vec<u8>>>, (StatusCode, String)> {
-    if !authorized(request) {
+    let host = header_value(request, "Host");
+    if !host_allowed(host, allowed_hosts) {
         return Err((
             StatusCode(403),
             "Zugriff nur über das private Tailscale-Menü.".into(),
@@ -226,7 +296,7 @@ fn route(
             ))
         }
         (&Method::Post, path) if path.starts_with("/api/") => {
-            if !same_origin(request) {
+            if !origin_matches(host, header_value(request, "Origin")) {
                 return Err((
                     StatusCode(403),
                     "Die Anfrage stammt nicht von dieser Seite.".into(),
@@ -256,7 +326,7 @@ fn dispatch_post(
                 "local" => {
                     let name = input.name;
                     let task = start_task(tasks, "Login (lokal)", move |app| {
-                        app.login(&name)?;
+                        app.login_within(&name, Some(LOCAL_LOGIN_TIMEOUT))?;
                         Ok(format!("Login für {name} abgeschlossen."))
                     });
                     Ok(task_response(task))
@@ -632,27 +702,29 @@ fn systemctl_state(action: &str) -> String {
         .unwrap_or_default()
 }
 
-fn authorized(request: &Request) -> bool {
-    request.headers().iter().any(|header| {
-        header.field.equiv(PRIVATE_PROXY_HEADER) && header.value.as_str() == PRIVATE_PROXY_MARKER
+fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv(name))
+        .map(|header| header.value.as_str())
+}
+
+fn host_allowed(host: Option<&str>, allowed_hosts: &[String]) -> bool {
+    host.is_some_and(|host| {
+        allowed_hosts
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(host))
     })
 }
 
-fn same_origin(request: &Request) -> bool {
-    let host = request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("Host"));
-    let origin = request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("Origin"));
+fn origin_matches(host: Option<&str>, origin: Option<&str>) -> bool {
     match (host, origin) {
-        (Some(host), Some(origin)) => {
-            let host = host.value.as_str();
-            let origin = origin.value.as_str();
-            origin == format!("http://{host}") || origin == format!("https://{host}")
-        }
+        (Some(host), Some(origin)) => ["http://", "https://"].iter().any(|scheme| {
+            origin
+                .strip_prefix(scheme)
+                .is_some_and(|rest| rest.eq_ignore_ascii_case(host))
+        }),
         _ => false,
     }
 }
@@ -737,6 +809,24 @@ mod tests {
             message: String::new(),
             auth_url: None,
         }
+    }
+
+    #[test]
+    fn only_allowlisted_hosts_and_their_own_origin_pass() {
+        let allowed = vec!["v50671-kde".to_owned()];
+        assert!(host_allowed(Some("V50671-KDE"), &allowed));
+        assert!(!host_allowed(Some("rebind.example"), &allowed));
+        assert!(!host_allowed(Some("v50671-kde:8785"), &allowed));
+        assert!(!host_allowed(None, &allowed));
+        assert!(origin_matches(
+            Some("v50671-kde"),
+            Some("http://v50671-kde")
+        ));
+        assert!(!origin_matches(
+            Some("v50671-kde"),
+            Some("http://v50671-kde.evil.example")
+        ));
+        assert!(!origin_matches(Some("v50671-kde"), None));
     }
 
     #[test]
