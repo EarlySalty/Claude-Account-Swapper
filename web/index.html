@@ -97,7 +97,7 @@
               <label class="toggle-row"><span><strong>Bei vollem Limit zum freien Account wechseln</strong><small>Der Hintergrunddienst prüft die Account-Auslastung regelmäßig.</small></span><input id="auto-switch" type="checkbox"></label>
               <label class="toggle-row"><span><strong>Wochenkontingent gleichmäßig verbrauchen</strong><small>Bevorzugt den Account, dessen Wochenrest bis zum Reset schneller verbraucht werden muss. Höchstens alle 3 Stunden ein vorausschauender Wechsel.</small></span><input id="weekly-pacing" type="checkbox"></label>
               <label class="field-label" for="threshold">Globale Wechselgrenze <span class="range-value" id="threshold-value">98%</span></label>
-              <input id="threshold" type="range" min="50" max="100" step="1">
+              <input id="threshold" type="range" min="0" max="100" step="1">
               <label class="toggle-row"><span><strong>Fünf-Stunden-Fenster nach Reset starten</strong><small>Sendet einen kurzen Ping, wenn das Fenster ungenutzt ist.</small></span><input id="ping-enabled" type="checkbox"></label>
               <label for="ping-prompt">Ping-Text</label><input id="ping-prompt" maxlength="2000">
               <div class="two-fields"><div><label for="ping-model">Modell</label><input id="ping-model" maxlength="80" placeholder="haiku"></div><div><label for="ping-timeout">Zeitlimit in Minuten</label><input id="ping-timeout" type="number" min="1" max="1440"></div></div>

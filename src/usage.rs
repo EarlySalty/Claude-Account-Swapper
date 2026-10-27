@@ -256,13 +256,7 @@ pub fn pick_target_with(
         };
     }
 
-    if let Some(target) = rank(
-        pacing,
-        threshold,
-        accounts
-            .iter()
-            .filter(|candidate| candidate.name != active && candidate.within_stops(threshold)),
-    ) {
+    if let Some(target) = reactive_target(active, accounts, threshold, pacing) {
         return Decision::SwitchTo {
             name: target.name.clone(),
             reason: format!(
@@ -378,6 +372,27 @@ fn pacing_switch(
             current.describe(threshold)
         ),
     })
+}
+
+fn reactive_target<'a>(
+    active: &str,
+    accounts: &'a [Candidate],
+    threshold: f64,
+    pacing: Option<DateTime<Utc>>,
+) -> Option<&'a Candidate> {
+    let free = || {
+        accounts
+            .iter()
+            .filter(move |candidate| candidate.name != active && candidate.within_stops(threshold))
+    };
+    rank(
+        pacing,
+        threshold,
+        free().filter(|candidate| {
+            candidate.five_hour_headroom(threshold) >= PACE_MIN_FIVE_HOUR_HEADROOM
+        }),
+    )
+    .or_else(|| rank(pacing, threshold, free()))
 }
 
 fn rank<'a>(
@@ -611,6 +626,22 @@ mod tests {
         );
         assert!(
             matches!(&decision, Decision::SwitchTo { name, .. } if name == "c"),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn beim_vollen_limit_schlaegt_fuenf_stunden_luft_das_wochentempo() {
+        let decision = decide(
+            "a",
+            &accounts(&[
+                ("a", weekly(98.5, 50.0, "2026-08-08T00:00:00Z")),
+                ("b", weekly(20.0, 10.0, "2026-08-10T00:00:00Z")),
+                ("c", weekly(96.5, 70.0, "2026-08-04T12:00:00Z")),
+            ]),
+        );
+        assert!(
+            matches!(&decision, Decision::SwitchTo { name, .. } if name == "b"),
             "{decision:?}"
         );
     }

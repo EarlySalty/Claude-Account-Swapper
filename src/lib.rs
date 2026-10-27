@@ -6,6 +6,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +48,7 @@ const USAGE_CACHE_FRESH_SECONDS: u64 = 45;
 const USAGE_CACHE_MAX_AGE_SECONDS: u64 = 30 * 60;
 const PACING_CACHE_MAX_AGE_SECONDS: u64 = 5 * 60;
 const PACING_MIN_DWELL_SECONDS: u64 = 3 * 60 * 60;
+const FAILED_LOGIN_RETRY_SECONDS: u64 = 6 * 60 * 60;
 /// Ein haengender Request wuerde den Dienst sonst dauerhaft anhalten.
 const KEEPALIVE_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 /// Restlaufzeit, ab der ein Access-Token vor einem Wechsel als sicher gilt. Darunter muesste
@@ -257,13 +259,24 @@ impl AuthStatus {
 #[derive(Clone)]
 pub struct App {
     paths: Paths,
+    active_memo: Arc<Mutex<Option<ActiveMemo>>>,
+}
+
+struct ActiveMemo {
+    fingerprint: String,
+    name: Option<String>,
 }
 
 impl App {
     pub fn discover() -> Result<Self> {
-        Ok(Self {
-            paths: Paths::discover()?,
-        })
+        Ok(Self::with_paths(Paths::discover()?))
+    }
+
+    fn with_paths(paths: Paths) -> Self {
+        Self {
+            paths,
+            active_memo: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn save(&self, name: &str) -> Result<()> {
@@ -276,6 +289,10 @@ impl App {
     }
 
     pub fn login(&self, name: &str) -> Result<()> {
+        self.login_within(name, None)
+    }
+
+    pub fn login_within(&self, name: &str, timeout: Option<Duration>) -> Result<()> {
         validate_name(name)?;
         self.ensure_no_auth_override()?;
         let _lock = self.lock()?;
@@ -293,15 +310,10 @@ impl App {
         };
         let previous_state = self.load_state()?;
 
-        let login_status = Command::new(&self.paths.claude_bin)
-            .args(["auth", "login", "--claudeai"])
-            .status()
-            .with_context(|| {
-                format!(
-                    "Claude Login konnte nicht gestartet werden: {}",
-                    self.paths.claude_bin.display()
-                )
-            })?;
+        let Some(login_status) = self.run_login(timeout)? else {
+            self.restore_live(previous_credentials.as_deref(), &previous_state)?;
+            bail!("Claude Login hat das Zeitlimit ueberschritten und wurde abgebrochen");
+        };
         if !login_status.success() {
             self.restore_live(previous_credentials.as_deref(), &previous_state)?;
             bail!("Claude Login wurde abgebrochen oder ist fehlgeschlagen");
@@ -320,6 +332,29 @@ impl App {
                 Err(error).context(
                     "neuer Login wurde nicht gespeichert; vorheriger Login ist wieder aktiv",
                 )
+            }
+        }
+    }
+
+    fn run_login(&self, timeout: Option<Duration>) -> Result<Option<std::process::ExitStatus>> {
+        let mut child = Command::new(&self.paths.claude_bin)
+            .args(["auth", "login", "--claudeai"])
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Claude Login konnte nicht gestartet werden: {}",
+                    self.paths.claude_bin.display()
+                )
+            })?;
+        let Some(timeout) = timeout else {
+            return Ok(Some(child.wait()?));
+        };
+        match child.wait_timeout(timeout)? {
+            Some(status) => Ok(Some(status)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Ok(None)
             }
         }
     }
@@ -1421,19 +1456,30 @@ impl App {
     }
 
     fn seed_auto_switch(&self, threshold: f64) -> Result<()> {
-        if self.config_path().exists() {
+        let stored = match fs::read(self.config_path()) {
+            Ok(data) => Some(serde_json::from_slice::<Value>(&data).ok()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("Einstellungen sind nicht lesbar"),
+        };
+        let has_key = |key: &str| {
+            stored
+                .as_ref()
+                .is_some_and(|value| value.as_ref().is_none_or(|value| value.get(key).is_some()))
+        };
+        if has_key("auto_switch") {
             log_event(&format!(
                 "--auto-switch wird ignoriert: {} legt den Auto-Wechsel fest",
                 self.config_path().display()
             ));
             return Ok(());
         }
-        let config = Config {
-            auto_switch: true,
-            threshold,
-            ..Config::default()
-        };
-        self.write_config(&config)?;
+        let keep_threshold = has_key("threshold");
+        self.update_config(|config| {
+            config.auto_switch = true;
+            if !keep_threshold {
+                config.threshold = threshold;
+            }
+        })?;
         log_event("Auto-Wechsel aus der Aufrufoption in die Einstellungen uebernommen");
         Ok(())
     }
@@ -1842,6 +1888,59 @@ impl App {
         Ok(self.resolve_active_profile(&status)?.name)
     }
 
+    fn active_profile_name_memoized(&self, live: Option<&[u8]>) -> Option<String> {
+        let Some(fingerprint) = self.active_identity_fingerprint(live) else {
+            return self.active_profile_name().ok();
+        };
+        if let Ok(memo) = self.active_memo.lock()
+            && let Some(memo) = memo.as_ref()
+            && memo.fingerprint == fingerprint
+        {
+            return memo.name.clone();
+        }
+        let name = self.active_profile_name().ok();
+        if let Ok(mut memo) = self.active_memo.lock() {
+            *memo = Some(ActiveMemo {
+                fingerprint,
+                name: name.clone(),
+            });
+        }
+        name
+    }
+
+    fn active_identity_fingerprint(&self, live: Option<&[u8]>) -> Option<String> {
+        let claude_json: Value =
+            serde_json::from_slice(&fs::read(&self.paths.claude_json).ok()?).ok()?;
+        let identity = |field: &str| {
+            claude_json
+                .get(field)
+                .map(Value::to_string)
+                .unwrap_or_default()
+        };
+        let profiles: Vec<(String, String, Option<String>)> = self
+            .load_profiles()
+            .ok()?
+            .into_iter()
+            .map(|profile| (profile.name, profile.email, profile.org_id))
+            .collect();
+        let state = fs::read(self.state_path()).unwrap_or_default();
+        let profiles = serde_json::to_vec(&profiles).ok()?;
+        let account = identity("oauthAccount");
+        let user = identity("userID");
+        let mut hasher = Sha256::new();
+        for part in [
+            live.unwrap_or_default(),
+            state.as_slice(),
+            profiles.as_slice(),
+            account.as_bytes(),
+            user.as_bytes(),
+        ] {
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+        Some(format!("{:x}", hasher.finalize()))
+    }
+
     /// Holt die Auslastung eines Profils.
     ///
     /// Der Token stammt aus der Live-Datei, sobald das Profil der aktuell benutzte Login ist -
@@ -1858,6 +1957,12 @@ impl App {
             }
             if !allow_renew {
                 bail!("Access-Token ist abgelaufen");
+            }
+            if recently_failed(profile.login_failed_at, unix_timestamp()?) {
+                bail!(
+                    "gespeicherter Login ist verbraucht - `claude-account login {}`",
+                    profile.name
+                );
             }
             match self.renew_snapshot(profile, Locking::Acquire)? {
                 RenewResult::Renewed(credentials) | RenewResult::StillValid(credentials) => {
@@ -1886,7 +1991,10 @@ impl App {
         let snapshot = fs::read(self.profile_credentials(&profile.name)).ok();
         let name = profile.name.as_str();
         let is_live = (live.is_some() && snapshot == live)
-            || self.active_profile_name().ok().as_deref() == Some(name);
+            || self
+                .active_profile_name_memoized(live.as_deref())
+                .as_deref()
+                == Some(name);
         let credentials = if is_live {
             live.or(snapshot)
                 .context("weder aktiver Login noch Snapshot lesbar")?
@@ -2536,7 +2644,7 @@ impl App {
     fn spawn_job(&self, job: Job, lock: File) {
         let paths = self.paths.clone();
         thread::spawn(move || {
-            let app = App { paths };
+            let app = App::with_paths(paths);
             if let Err(error) = app.execute_job(&job).map(|_| ()) {
                 log_problem(&format!(
                     "Ergebnis der Aufgabe [{}] konnte nicht gespeichert werden: {error:#}",
@@ -3522,6 +3630,11 @@ fn atomic_write_into_existing_dir(path: &Path, data: &[u8], mode: u32) -> Result
             path.display()
         )
     })
+}
+
+fn recently_failed(login_failed_at: Option<u64>, now: u64) -> bool {
+    login_failed_at
+        .is_some_and(|failed_at| now.saturating_sub(failed_at) < FAILED_LOGIN_RETRY_SECONDS)
 }
 
 /// sha256 des Refresh-Tokens. Erkennt eine Rotation, ohne den Token selbst irgendwo abzulegen.
