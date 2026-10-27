@@ -5,16 +5,16 @@ Goal: when every saved account is at the 5h limit, running Claude sessions wrap 
 ## How it works
 
 - `watch` evaluates the pause every 60s after the usage refresh (`limit::App::limit_tick`).
-  - Enter: `limit_compact.enabled` and (`force` or every profile's cached 5h utilization >= `threshold`).
-  - Leave: `force` off and usable quota: the active account (the one that runs every resumed turn; the auto switch moves there first) has fresh cached 5h usage below `resume_below` and weekly usage below the switch threshold. Disabling the feature also leaves; parked sessions are then dropped with one log line each.
+  - Enter: `limit_compact.enabled` and (`force` or every profile is blocked: cached 5h utilization >= `threshold`, outside its own limits, or either window at the switch threshold). Entering again forgets the previous pause's compactions and keeps only sessions that are still stopped.
+  - Leave: `force` off and usable quota: the active account (the one that runs every resumed turn; the auto switch moves there first) is within its own limits, below the switch threshold in both windows and below `resume_below` in the 5h window, so a queued resume job runs in the same tick. With `auto_switch` on, a pause or pending resume switches to the emptiest usable account when the active one is not usable. Disabling the feature also leaves; parked sessions are then dropped with one log line each.
   - On leave the hooks stop telling sessions (`active=false`), but Stops of already parked sessions are still recorded. Only one watcher runs a tick at a time (`.limit-tick.lock`).
 - Hook `claude-account hook` (wired in `~/.claude/settings.json` for `PostToolUse` matcher `*` and `Stop`):
   - Inactive pause: reads one small JSON file and exits silently.
-  - `PostToolUse`: first call per session injects `additionalContext` with the wrap-up instruction (write TODO.md, end the turn, last line `TODO: <path>`). No tool is interrupted; the agent ends at its own pace.
+  - `PostToolUse`: first call per session (or the first after a recorded stop, if the session runs again) injects `additionalContext` with the wrap-up instruction (write TODO.md, end the turn, last line `TODO: <path>`). No tool is interrupted; the agent ends at its own pace.
   - `Stop` of a session that was never told: blocks once with the same instruction. `stop_hook_active` is honoured.
   - Subagents (`agent_id` set) and sessions inside our own `/compact` turns are left alone.
 - Compaction pass (pause active): T3 shell over HTTP, then projection and `message.dispatch` with exactly `/compact` over the T3 WebSocket RPC. Only threads that are idle, finished between `idle_minutes` and `cache_ttl_minutes` ago, have at least `min_context_tokens` in the last provider turn and whose last item is not already a compaction. At most `max_compactions` per pause. Busy threads (active run, busy status, pending runtime request) are never touched.
-- Resume pass (pause released): each parked session gets a self-contained message pointing at its TODO.md (path from the latest reply written after the wrap-up instruction). Threads the user already continued (also before a compaction) are skipped and logged; busy threads wait. T3 sessions (`CLAUDE_CODE_ENTRYPOINT=sdk-ts`) only resume through their thread; T3 being down keeps them pending. Terminal sessions become a `JobKind::Resume` job that may run in the current window and keeps permission checks, unless their transcript moved on after the stop. Each session's outcome is stored on its own, errors stay pending and are retried. Sessions without a thread or without a seen turn end are given up 30 min after the release with a log line. Every outcome is logged, so nothing stays stopped silently.
+- Resume pass (pause released): each parked session gets a self-contained message pointing at its TODO.md (path from the latest reply written after the wrap-up instruction). Threads that got a non-system message after the wrap-up instruction are skipped and logged; busy threads wait. T3 sessions (`CLAUDE_CODE_ENTRYPOINT=sdk-ts`) only resume through their thread; T3 being down keeps them pending. Terminal sessions become a `JobKind::Resume` job that may run in the current window and keeps permission checks, unless the transcript holds a real user prompt after the stop. An existing resume job for the session is reused instead of adding a second one. Each session's outcome is stored on its own, errors stay pending and are retried. Sessions without a thread or without a seen turn end are given up 30 min after the release with a log line. Every outcome is logged, so nothing stays stopped silently.
 - The web panel's config save keeps `limit_compact` as stored; only the CLI changes it.
 
 ## State
@@ -52,7 +52,7 @@ T3 access: own token `~/.claude-account-switcher/t3-bearer` (0600, scopes orches
 3. 22:37:28 `Thread fc22e24b... kompaktiert (130289 Tokens im Kontext)`; timeline: `user_message` 21:37:28Z, `compaction completed "Context compacted"` 21:37:49Z; next provider turn 13593 tokens. No follow-up turn from the Stop hook.
 4. Force off, 22:38:30 resume message sent: "[claude-account] The 5-hour usage limit has reset ... Read /tmp/cas-test/.tasks/2026-10-27-dummy/TODO.md first ..."; the thread finished the task (2715 lines) and marked the TODO done. `Limit-Pause beendet`.
 
-Gate round 1 found 16 state-machine defects in resume and release handling (see commit); all fixed with regression tests.
+Gate rounds 1 to 4 found state-machine defects in resume, release and re-entry handling (see commits). The pure decision helpers (hook reply, verdict, switch target, re-entry, continuation checks, TODO lookup) have unit tests; the T3 and job paths around them are covered only by the live test above.
 
 Bugs found in the test and fixed: hook logged to stdout (corrupts the hook JSON); TODO path is not yet in the transcript when Stop fires, so it is re-read at resume time.
 
@@ -62,4 +62,5 @@ Bugs found in the test and fixed: hook logged to stdout (corrupts the hook JSON)
 - `~/.config/claude-t3/bearer` is expired.
 - Compaction runs on the active account at >= 95%; if it hits 100% mid-compaction the turn fails (logged, not retried).
 - Non-T3 resume via `claude --resume` jobs is not exercised in the live test.
+- A broken `config.json` or `limit-compact.json` pauses the feature with a log line instead of falling back to defaults.
 - T3 protocol is internal; a T3 update can break shell/projection/dispatch shapes. Failures are logged once per state and leave threads untouched.

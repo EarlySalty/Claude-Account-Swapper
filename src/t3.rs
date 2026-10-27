@@ -36,6 +36,7 @@ pub struct ThreadDetail {
     pub used_tokens: Option<u64>,
     pub last_item_is_compaction: bool,
     pub last_compaction_at: Option<DateTime<Utc>>,
+    pub last_foreign_message_at: Option<DateTime<Utc>>,
 }
 
 pub struct Rpc {
@@ -78,7 +79,7 @@ impl Client {
             Ok((status, body))
         })?;
         let value: Value = serde_json::from_str(&body).context("T3 lieferte kein JSON")?;
-        Ok(parse_shell(&value))
+        parse_shell(&value)
     }
 
     pub fn connect(&self) -> Result<Rpc> {
@@ -223,7 +224,7 @@ impl Rpc {
             "orchestration.getThreadProjection",
             json!({ "threadId": thread_id }),
         )?;
-        Ok(parse_projection(&value))
+        parse_projection(&value)
     }
 
     pub fn send_message(&mut self, thread_id: &str, text: &str) -> Result<()> {
@@ -283,30 +284,32 @@ fn is_busy(thread: &Value) -> bool {
     active_run || pending || status
 }
 
-pub fn parse_shell(value: &Value) -> Vec<ThreadSummary> {
-    value
+pub fn parse_shell(value: &Value) -> Result<Vec<ThreadSummary>> {
+    let threads = value
         .get("threads")
         .and_then(Value::as_array)
-        .map(|threads| {
-            threads
-                .iter()
-                .filter(|thread| {
-                    thread.get("providerInstanceId").and_then(Value::as_str) == Some("claudeAgent")
-                        && thread.get("archivedAt").is_none_or(Value::is_null)
-                        && thread.get("deletedAt").is_none_or(Value::is_null)
-                })
-                .filter_map(|thread| {
-                    Some(ThreadSummary {
-                        id: thread.get("id")?.as_str()?.to_owned(),
-                        busy: is_busy(thread),
-                        last_run_completed_at: timestamp(thread, "latestRunCompletedAt"),
-                        last_user_message_at: timestamp(thread, "latestUserMessageAt"),
-                        updated_at: timestamp(thread, "updatedAt"),
-                    })
-                })
-                .collect()
+        .context("T3-Uebersicht ohne Thread-Liste")?;
+    threads
+        .iter()
+        .filter(|thread| {
+            thread.get("providerInstanceId").and_then(Value::as_str) == Some("claudeAgent")
+                && thread.get("archivedAt").is_none_or(Value::is_null)
+                && thread.get("deletedAt").is_none_or(Value::is_null)
         })
-        .unwrap_or_default()
+        .map(|thread| {
+            let id = thread
+                .get("id")
+                .and_then(Value::as_str)
+                .context("T3-Thread ohne id")?;
+            Ok(ThreadSummary {
+                id: id.to_owned(),
+                busy: is_busy(thread),
+                last_run_completed_at: timestamp(thread, "latestRunCompletedAt"),
+                last_user_message_at: timestamp(thread, "latestUserMessageAt"),
+                updated_at: timestamp(thread, "updatedAt"),
+            })
+        })
+        .collect()
 }
 
 fn by_ordinal(items: &[Value]) -> Vec<&Value> {
@@ -315,36 +318,47 @@ fn by_ordinal(items: &[Value]) -> Vec<&Value> {
     sorted
 }
 
-pub fn parse_projection(value: &Value) -> ThreadDetail {
-    let empty = Vec::new();
-    let array = |field: &str| value.get(field).and_then(Value::as_array).unwrap_or(&empty);
-    let native_session_ids = array("providerThreads")
+fn required_array<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("T3-Thread-Projektion ohne {field}"))
+}
+
+pub fn parse_projection(value: &Value) -> Result<ThreadDetail> {
+    let native_session_ids = required_array(value, "providerThreads")?
         .iter()
         .filter_map(|thread| thread.pointer("/nativeThreadRef/nativeId")?.as_str())
         .map(str::to_owned)
         .collect();
-    let used_tokens = by_ordinal(array("providerTurns"))
+    let used_tokens = by_ordinal(required_array(value, "providerTurns")?)
         .into_iter()
         .rev()
         .find_map(|turn| turn.pointer("/tokenUsage/usedTokens")?.as_u64());
-    let items: Vec<&Value> = by_ordinal(array("turnItems"))
+    let items: Vec<&Value> = by_ordinal(required_array(value, "turnItems")?)
         .into_iter()
         .filter(|item| item.get("type").and_then(Value::as_str) != Some("checkpoint"))
         .collect();
-    let is_compaction =
-        |item: &Value| item.get("type").and_then(Value::as_str) == Some("compaction");
-    let last_item_is_compaction = items.last().is_some_and(|item| is_compaction(item));
+    let of_type = |item: &Value, kind: &str| item.get("type").and_then(Value::as_str) == Some(kind);
+    let last_item_is_compaction = items.last().is_some_and(|item| of_type(item, "compaction"));
     let last_compaction_at = items
         .iter()
         .rev()
-        .find(|item| is_compaction(item))
+        .find(|item| of_type(item, "compaction"))
         .and_then(|item| timestamp(item, "startedAt"));
-    ThreadDetail {
+    let last_foreign_message_at = items
+        .iter()
+        .filter(|item| of_type(item, "user_message"))
+        .filter(|item| item.get("createdBy").and_then(Value::as_str) != Some("system"))
+        .filter_map(|item| timestamp(item, "startedAt"))
+        .max();
+    Ok(ThreadDetail {
         native_session_ids,
         used_tokens,
         last_item_is_compaction,
         last_compaction_at,
-    }
+        last_foreign_message_at,
+    })
 }
 
 #[cfg(test)]
@@ -361,15 +375,26 @@ mod tests {
             ],
             "turnItems": [
                 { "ordinal": 2000003, "type": "checkpoint" },
-                { "ordinal": 1000001, "type": "user_message" },
+                { "ordinal": 1000001, "type": "user_message", "createdBy": "user",
+                  "startedAt": "2026-10-27T21:10:00Z" },
+                { "ordinal": 2000001, "type": "user_message", "createdBy": "system",
+                  "startedAt": "2026-10-27T21:18:00Z" },
                 { "ordinal": 2000002, "type": "compaction", "startedAt": "2026-10-27T21:18:10Z" }
             ]
         });
-        let detail = parse_projection(&value);
+        let Ok(detail) = parse_projection(&value) else {
+            panic!("projection must parse");
+        };
         assert_eq!(detail.native_session_ids, vec!["s-1".to_owned()]);
         assert_eq!(detail.used_tokens, Some(12351));
         assert!(detail.last_item_is_compaction);
         assert!(detail.last_compaction_at.is_some());
+        assert_eq!(
+            detail.last_foreign_message_at.map(|time| time.to_rfc3339()),
+            Some("2026-10-27T21:10:00+00:00".to_owned())
+        );
+        assert!(parse_projection(&json!(null)).is_err());
+        assert!(parse_projection(&json!({ "providerThreads": [] })).is_err());
     }
 
     #[test]
@@ -381,8 +406,14 @@ mod tests {
             { "id": "c", "providerInstanceId": "codex", "status": "completed" },
             { "id": "d", "providerInstanceId": "claudeAgent", "archivedAt": "2026-10-01T00:00:00Z" }
         ]});
-        let threads = parse_shell(&value);
+        let Ok(threads) = parse_shell(&value) else {
+            panic!("shell must parse");
+        };
         assert_eq!(threads.len(), 2);
+        assert!(parse_shell(&json!({})).is_err());
+        assert!(
+            parse_shell(&json!({ "threads": [{ "providerInstanceId": "claudeAgent" }] })).is_err()
+        );
         assert!(threads[0].busy);
         assert!(!threads[1].busy);
         assert!(threads[1].last_run_completed_at.is_some());
