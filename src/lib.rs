@@ -50,6 +50,8 @@ const PACING_CACHE_MAX_AGE_SECONDS: u64 = 5 * 60;
 const USAGE_BACKOFF_DEFAULT_SECONDS: u64 = 5 * 60;
 const USAGE_BACKOFF_MIN_SECONDS: u64 = 60;
 const USAGE_BACKOFF_MAX_SECONDS: u64 = 15 * 60;
+/// Nur eine Bremse gegen haengende Laeufe, so lang wie ein Fuenf-Stunden-Fenster.
+const JOB_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60 * 60);
 
 #[derive(Debug)]
 struct UsageThrottled {
@@ -2236,9 +2238,6 @@ impl App {
         if !cwd.is_dir() {
             bail!("Arbeitsverzeichnis gibt es nicht: {}", cwd.display());
         }
-        if options.timeout_minutes == Some(0) {
-            bail!("Zeitlimit muss groesser als 0 sein");
-        }
         let last_window = self.current_window();
         create_private_dir(&self.jobs_dir())?;
         let _lock = self.lock_named("jobs-add")?;
@@ -2250,9 +2249,6 @@ impl App {
         job.model = options.model;
         if let Some(title) = options.title.filter(|title| !title.trim().is_empty()) {
             job.title = title;
-        }
-        if let Some(timeout_minutes) = options.timeout_minutes {
-            job.timeout_minutes = timeout_minutes;
         }
         job.last_window = last_window;
         self.write_job(&job)?;
@@ -2359,7 +2355,7 @@ impl App {
             &job.cwd,
             args,
             &label,
-            Duration::from_secs(job.timeout_minutes.saturating_mul(60)),
+            JOB_RUN_TIMEOUT,
         );
         let success = match outcome {
             Ok(run) => {
@@ -2484,11 +2480,10 @@ impl App {
         let started = SystemTime::now();
         writeln!(
             log,
-            "\n[{}] Start: {} {label} (Ordner {}, Zeitlimit {} min)",
+            "\n[{}] Start: {} {label} (Ordner {})",
             chrono::Local::now().format("%F %T"),
             self.paths.claude_bin.display(),
-            cwd.display(),
-            timeout.as_secs() / 60
+            cwd.display()
         )
         .context("Logdatei konnte nicht geschrieben werden")?;
 
@@ -3332,13 +3327,12 @@ impl App {
 }
 
 /// Alles, was eine Aufgabe ausser Auftrag und Ordner haben kann. Die Standardwerte sind die
-/// eines unbeaufsichtigten Laufs: keine Rueckfragen, eine Stunde Zeit, einmalig.
+/// eines unbeaufsichtigten Laufs: keine Rueckfragen, einmalig.
 #[derive(Debug, Clone)]
 pub struct JobOptions {
     pub title: Option<String>,
     pub settings: Option<PathBuf>,
     pub model: Option<String>,
-    pub timeout_minutes: Option<u64>,
     pub skip_permissions: bool,
     pub repeat: bool,
 }
@@ -3349,7 +3343,6 @@ impl Default for JobOptions {
             title: None,
             settings: None,
             model: None,
-            timeout_minutes: None,
             skip_permissions: true,
             repeat: false,
         }

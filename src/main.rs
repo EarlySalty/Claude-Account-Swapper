@@ -166,9 +166,6 @@ enum JobCommand {
         /// Modell fuer diesen Lauf
         #[arg(long)]
         model: Option<String>,
-        /// Zeitlimit des Laufs in Minuten
-        #[arg(long)]
-        timeout_minutes: Option<u64>,
         /// Berechtigungsfragen zulassen; ohne das laeuft die Aufgabe ohne Rueckfragen
         #[arg(long)]
         allow_permissions: bool,
@@ -187,8 +184,6 @@ enum JobCommand {
         settings: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long)]
-        timeout_minutes: Option<u64>,
         #[arg(long)]
         allow_permissions: bool,
     },
@@ -299,7 +294,6 @@ fn run_job_command(app: &App, command: JobCommand) -> Result<()> {
             repeat,
             settings,
             model,
-            timeout_minutes,
             allow_permissions,
         } => {
             let cwd = match cwd {
@@ -313,7 +307,6 @@ fn run_job_command(app: &App, command: JobCommand) -> Result<()> {
                     title,
                     settings,
                     model,
-                    timeout_minutes,
                     skip_permissions: !allow_permissions,
                     repeat,
                 },
@@ -327,7 +320,6 @@ fn run_job_command(app: &App, command: JobCommand) -> Result<()> {
             cwd,
             settings,
             model,
-            timeout_minutes,
             allow_permissions,
         } => {
             // Ohne Ordnerangabe zaehlt der Ordner der Sitzung selbst: eine Sitzung woanders
@@ -353,7 +345,6 @@ fn run_job_command(app: &App, command: JobCommand) -> Result<()> {
                 JobOptions {
                     settings,
                     model,
-                    timeout_minutes,
                     skip_permissions: !allow_permissions,
                     ..JobOptions::default()
                 },

@@ -100,7 +100,7 @@ Ohne Argument öffnet `claude-account` dasselbe Hauptmenü wie der Desktop-Start
 | `claude-account config` | Zeigt die Einstellungen der Automatik. Aendern: `--auto-switch on\|off`, `--ping on\|off`, `--ping-prompt <text>`, `--ping-model <name>`, `--threshold <prozent>`. |
 | `claude-account ping` | Eroeffnet das Fuenf-Stunden-Fenster sofort mit einer kurzen Nachricht. |
 | `claude-account jobs` | Zeigt die Aufgaben, die auf ein freies Fenster warten. |
-| `claude-account job add "<auftrag>"` | Legt einen Auftrag an. `--cwd <pfad>` (Standard: aktuelles Verzeichnis), `--repeat` fuer jedes neue Fenster, `--model`, `--settings`, `--timeout-minutes`, `--allow-permissions`. |
+| `claude-account job add "<auftrag>"` | Legt einen Auftrag an. `--cwd <pfad>` (Standard: aktuelles Verzeichnis), `--repeat` fuer jedes neue Fenster, `--model`, `--settings`, `--allow-permissions`. |
 | `claude-account job resume <sitzungs-id>` | Setzt eine fruehere Sitzung fort, sobald wieder Kontingent da ist. `--prompt <text>`, `--cwd <pfad>`. |
 | `claude-account job sessions` | Zeigt die zuletzt benutzten Claude-Sitzungen samt ID und Arbeitsverzeichnis. |
 | `claude-account job run\|remove\|enable\|disable <id>` | Fuehrt eine Aufgabe sofort aus, loescht sie oder schaltet sie um. |
@@ -233,7 +233,7 @@ claude-account job add "Kurzer Statusbericht" --repeat
 claude-account job resume 3f2a1b90-... --prompt "Mach da weiter, wo du aufgehoert hast."
 ```
 
-Eine Aufgabe laeuft als `claude -p` im angegebenen Verzeichnis, ohne Rueckfragen (`--allow-permissions` schaltet das ab), mit einem Zeitlimit von standardmaessig einer Stunde. Ihre komplette Ausgabe steht in `~/.claude-account-switcher/jobs/<id>.log`, das Ergebnis in der Aufgabe selbst.
+Eine Aufgabe laeuft als `claude -p` im angegebenen Verzeichnis, ohne Rueckfragen (`--allow-permissions` schaltet das ab), und wartet auf ein freies Fuenf-Stunden-Fenster. Eine haengende Aufgabe wird spaetestens nach fuenf Stunden beendet. Ihre komplette Ausgabe steht in `~/.claude-account-switcher/jobs/<id>.log`, das Ergebnis in der Aufgabe selbst.
 
 Wann eine Aufgabe laeuft, entscheidet dieselbe Regel wie beim Ping:
 

@@ -120,6 +120,8 @@ struct JobRequest {
     title: Option<String>,
     settings: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
     timeout_minutes: Option<u64>,
     #[serde(default)]
     allow_permissions: bool,
@@ -490,7 +492,6 @@ fn dispatch_post(
                         title: input.title,
                         settings,
                         model: input.model,
-                        timeout_minutes: input.timeout_minutes,
                         skip_permissions: !input.allow_permissions,
                         repeat: input.repeat,
                     },

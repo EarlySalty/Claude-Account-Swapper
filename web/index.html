@@ -142,7 +142,7 @@
               <div id="session-picker" hidden><label for="session-id">Sitzung auswählen</label><select id="session-id"><option value="">Sitzung wählen …</option></select></div>
               <label for="job-text">Anweisung</label><textarea id="job-text" rows="5" maxlength="30000" placeholder="Was soll Claude erledigen?"></textarea>
               <div class="two-fields"><div><label for="job-cwd">Arbeitsverzeichnis</label><input id="job-cwd" required placeholder="/home/nathanael/Projekt"></div><div><label for="job-title">Name in der Liste</label><input id="job-title" maxlength="70" placeholder="Optional"></div></div>
-              <div class="two-fields"><div><label for="job-model">Modell</label><input id="job-model" placeholder="Standard"></div><div><label for="job-timeout">Zeitlimit in Minuten</label><input id="job-timeout" type="number" min="1" max="10080" placeholder="60"></div></div>
+              <label for="job-model">Modell</label><input id="job-model" placeholder="Standard">
               <label for="job-settings">Eigene Settings-Datei <span class="muted">(optional)</span></label><input id="job-settings" placeholder="/pfad/zu/settings.json">
               <label class="toggle-row"><span><strong>Bei jedem neuen Fenster erneut ausführen</strong><small>Ausgeschaltet bedeutet einmalige Ausführung.</small></span><input id="job-repeat" type="checkbox"></label>
               <label class="toggle-row caution-row"><span><strong>Berechtigungsfragen zulassen</strong><small>Unbeaufsichtigte Aufgaben bleiben sonst bei Rückfragen hängen. Standardmäßig läuft Claude ohne Rückfragen.</small></span><input id="job-permissions" type="checkbox"></label>

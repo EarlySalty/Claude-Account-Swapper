@@ -387,7 +387,7 @@ function renderJobs() {
     head.append(identity, el("span", `status-pill ${job.enabled ? "good" : ""}`, job.last_status || (job.enabled ? "In Warteschlange" : "Pausiert")));
     card.append(head);
     card.append(el("p", "job-prompt", job.text || ""));
-    card.append(el("small", "muted", `${job.cwd}${job.model ? ` · ${job.model}` : ""} · ${job.timeout_minutes} Min.${job.skip_permissions ? " · ohne Berechtigungsfragen" : " · Berechtigungsfragen zulassen"}`));
+    card.append(el("small", "muted", `${job.cwd}${job.model ? ` · ${job.model}` : ""}${job.skip_permissions ? " · ohne Berechtigungsfragen" : " · Berechtigungsfragen zulassen"}`));
     const actions = el("div", "job-actions");
     actions.append(actionButton("Jetzt ausführen", "run-job", "button button-secondary", { id: job.id }));
     actions.append(actionButton(job.enabled ? "Pausieren" : "Aktivieren", job.enabled ? "disable-job" : "enable-job", "button button-quiet", { id: job.id }));
@@ -710,7 +710,6 @@ $("#job-form").addEventListener("submit", async (event) => {
     text: $("#job-text").value.trim() || (kind === "resume" ? "Mach da weiter, wo du aufgehört hast." : ""),
     cwd: $("#job-cwd").value.trim(), title: $("#job-title").value.trim() || null,
     settings: $("#job-settings").value.trim() || null, model: $("#job-model").value.trim() || null,
-    timeoutMinutes: $("#job-timeout").value ? Number($("#job-timeout").value) : null,
     allowPermissions: $("#job-permissions").checked, repeat: $("#job-repeat").checked,
   };
   const form = event.currentTarget;
