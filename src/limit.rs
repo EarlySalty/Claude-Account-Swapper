@@ -128,6 +128,20 @@ fn last_assistant_text(transcript: &Path) -> Option<String> {
     })
 }
 
+fn todo_from_transcript(transcript: Option<&Path>) -> Option<PathBuf> {
+    transcript
+        .and_then(last_assistant_text)
+        .and_then(|text| find_todo_path(&text))
+}
+
+fn with_todo(parked: &Parked) -> Parked {
+    let mut parked = parked.clone();
+    if parked.todo.is_none() {
+        parked.todo = todo_from_transcript(parked.transcript.as_deref());
+    }
+    parked
+}
+
 fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Value> {
     if !state.active || input.session_id.is_empty() || input.agent_id.is_some() {
         return None;
@@ -158,12 +172,7 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
             match state.sessions.get_mut(&input.session_id) {
                 Some(parked) => {
                     parked.stopped_at = Some(now);
-                    if let Some(todo) = input
-                        .transcript_path
-                        .as_deref()
-                        .and_then(last_assistant_text)
-                        .and_then(|text| find_todo_path(&text))
-                    {
+                    if let Some(todo) = todo_from_transcript(input.transcript_path.as_deref()) {
                         parked.todo = Some(todo);
                     }
                     None
@@ -267,12 +276,6 @@ impl App {
         let input: HookInput = serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
         let now = unix_timestamp()?;
         let reply = self.update_limit_state(|state| hook_reply(&input, state, now))?;
-        if reply.is_some() {
-            log_event(&format!(
-                "Limit-Pause: Sitzung {} angewiesen ({})",
-                input.session_id, input.hook_event_name
-            ));
-        }
         Ok(reply.map(|value| value.to_string()))
     }
 
@@ -554,7 +557,7 @@ impl App {
         if thread.busy {
             return Ok(Outcome::Pending);
         }
-        rpc.send_message(thread_id, &resume_message(parked))?;
+        rpc.send_message(thread_id, &resume_message(&with_todo(parked)))?;
         Ok(Outcome::Done(format!("in Thread {thread_id} fortgesetzt")))
     }
 
@@ -579,7 +582,7 @@ impl App {
         let job = self.add_job(
             JobKind::Resume {
                 session_id: session.to_owned(),
-                text: resume_message(parked),
+                text: resume_message(&with_todo(parked)),
             },
             cwd,
             JobOptions::default(),
