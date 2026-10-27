@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Account Swapper private web panel
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin
+ExecStart=%h/.cargo/bin/claude-account web --port 8785
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target

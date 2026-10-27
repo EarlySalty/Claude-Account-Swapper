@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -18,6 +19,7 @@ use wait_timeout::ChildExt;
 pub mod config;
 pub mod jobs;
 pub mod usage;
+pub mod web;
 
 use config::Config;
 use jobs::{Job, JobKind, Readiness};
@@ -250,6 +252,7 @@ impl AuthStatus {
     }
 }
 
+#[derive(Clone)]
 pub struct App {
     paths: Paths,
 }
@@ -300,6 +303,140 @@ impl App {
         if !login_status.success() {
             self.restore_live(previous_credentials.as_deref(), &previous_state)?;
             bail!("Claude Login wurde abgebrochen oder ist fehlgeschlagen");
+        }
+
+        match self.save_live_as(name) {
+            Ok(profile) => {
+                println!(
+                    "Gespeichert und aktiv: {} ({})",
+                    profile.name, profile.email
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.restore_live(previous_credentials.as_deref(), &previous_state)?;
+                Err(error).context(
+                    "neuer Login wurde nicht gespeichert; vorheriger Login ist wieder aktiv",
+                )
+            }
+        }
+    }
+
+    /// Starts Claude Code's browser login without opening a browser on the server. The web UI
+    /// receives the authorization URL and sends the pasted callback code back to the CLI prompt.
+    pub fn login_device(
+        &self,
+        name: &str,
+        input: Receiver<Option<String>>,
+        on_auth_url: impl Fn(String),
+    ) -> Result<()> {
+        validate_name(name)?;
+        self.ensure_no_auth_override()?;
+        let _lock = self.lock()?;
+
+        let previous_credentials = if self.paths.credentials.is_file() {
+            let status = self.auth_status()?;
+            let credentials = read_credential_bytes(&self.paths.credentials)?;
+            if status.logged_in {
+                validate_credentials(&credentials)?;
+                self.sync_known_active_with_credentials(&status, &credentials)?;
+            }
+            Some(credentials)
+        } else {
+            None
+        };
+        let previous_state = self.load_state()?;
+
+        let mut child = Command::new(&self.paths.claude_bin)
+            .args(["auth", "login", "--claudeai"])
+            .env("BROWSER", "/bin/false")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Claude-Code-Login konnte nicht gestartet werden: {}",
+                    self.paths.claude_bin.display()
+                )
+            })?;
+        let Some(mut child_stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.restore_live(previous_credentials.as_deref(), &previous_state)?;
+            bail!("Claude-Code-Eingabe konnte nicht geöffnet werden");
+        };
+        let (output_tx, output_rx) = mpsc::channel::<String>();
+        if let Some(stream) = child.stdout.take() {
+            let output_tx = output_tx.clone();
+            thread::spawn(move || forward_login_output(stream, output_tx));
+        }
+        if let Some(stream) = child.stderr.take() {
+            let output_tx = output_tx.clone();
+            thread::spawn(move || forward_login_output(stream, output_tx));
+        }
+        drop(output_tx);
+
+        let started = Instant::now();
+        let mut auth_url = None;
+        let login_status = loop {
+            while let Ok(line) = output_rx.try_recv() {
+                if auth_url.is_none()
+                    && let Some(url) = claude_auth_url(&line)
+                {
+                    on_auth_url(url.clone());
+                    auth_url = Some(url);
+                }
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    self.restore_live(previous_credentials.as_deref(), &previous_state)?;
+                    return Err(error).context("Claude-Code-Login konnte nicht überwacht werden");
+                }
+            }
+
+            if started.elapsed() >= Duration::from_secs(15 * 60) {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.restore_live(previous_credentials.as_deref(), &previous_state)?;
+                bail!("Der Device-Code-Login ist nach 15 Minuten abgelaufen");
+            }
+
+            match input.recv_timeout(Duration::from_millis(200)) {
+                Ok(Some(code)) => {
+                    if code.trim().is_empty() || code.chars().any(char::is_control) {
+                        continue;
+                    }
+                    let write_result = child_stdin
+                        .write_all(code.trim().as_bytes())
+                        .and_then(|()| child_stdin.write_all(b"\n"))
+                        .and_then(|()| child_stdin.flush());
+                    if let Err(error) = write_result {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        self.restore_live(previous_credentials.as_deref(), &previous_state)?;
+                        return Err(error)
+                            .context("Code konnte nicht an Claude Code übergeben werden");
+                    }
+                }
+                Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    self.restore_live(previous_credentials.as_deref(), &previous_state)?;
+                    bail!("Device-Code-Login wurde abgebrochen");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        };
+
+        if !login_status.success() {
+            self.restore_live(previous_credentials.as_deref(), &previous_state)?;
+            bail!("Claude-Code-Login wurde abgebrochen oder ist fehlgeschlagen");
         }
 
         match self.save_live_as(name) {
@@ -540,6 +677,126 @@ impl App {
             println!("Hinweis: {hint}");
         }
         Ok(())
+    }
+
+    /// A credential-free view for the local web panel.
+    pub fn web_snapshot(&self) -> Result<serde_json::Value> {
+        let profiles = self.load_profiles()?;
+        let now = unix_timestamp()?;
+        let status = self.auth_status()?;
+        let active_profile = if status.logged_in {
+            self.resolve_active_profile(&status)
+                .ok()
+                .map(|profile| profile.name)
+        } else {
+            None
+        };
+        let active_email = status.email.filter(|email| !email.trim().is_empty());
+
+        let profiles = profiles
+            .iter()
+            .map(|profile| {
+                let cached = self.read_cached_usage(&profile.name);
+                let usage = cached.map(|cached| {
+                    serde_json::json!({
+                        "windows": cached.usage,
+                        "ageSeconds": now.saturating_sub(cached.fetched_at),
+                    })
+                });
+                let usage_error = usage
+                    .is_none()
+                    .then_some("Noch keine Auslastung geladen".to_owned());
+
+                serde_json::json!({
+                    "name": profile.name,
+                    "email": profile.email,
+                    "organization": profile.org_name,
+                    "subscriptionType": profile.subscription_type,
+                    "savedAt": profile.saved_at,
+                    "syncedAt": profile.credentials_synced_at,
+                    "loginFailedAt": profile.login_failed_at,
+                    "limits": profile.limits,
+                    "usage": usage,
+                    "usageError": usage_error,
+                    "active": active_profile.as_deref() == Some(profile.name.as_str()),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let jobs = self.load_jobs()?;
+        let sessions = self
+            .recent_sessions(20)
+            .into_iter()
+            .map(|session| {
+                serde_json::json!({
+                    "id": session.id,
+                    "cwd": session.cwd,
+                    "title": session.title,
+                    "modified": session.modified,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(serde_json::json!({
+            "loggedIn": status.logged_in,
+            "activeProfile": active_profile,
+            "activeEmail": active_email,
+            "profiles": profiles,
+            "config": self.load_config(),
+            "jobs": jobs,
+            "sessions": sessions,
+        }))
+    }
+
+    /// Refresh all saved accounts' usage for the private web panel.
+    pub fn web_refresh_usage(&self) -> Result<String> {
+        let profiles = self.load_profiles()?;
+        if profiles.is_empty() {
+            return Ok("Es sind noch keine Accounts gespeichert.".to_owned());
+        }
+        let active = self
+            .auth_status()
+            .ok()
+            .filter(|status| status.logged_in)
+            .and_then(|status| self.resolve_active_profile(&status).ok())
+            .map(|profile| profile.name);
+        let mut updated = 0;
+        let mut failures = Vec::new();
+        for profile in &profiles {
+            match self.profile_usage(profile, active.as_deref(), true) {
+                Ok(usage) => {
+                    self.write_cached_usage(&profile.name, usage, unix_timestamp()?);
+                    updated += 1;
+                }
+                Err(error) => failures.push(format!("{}: {error:#}", profile.name)),
+            }
+        }
+        if failures.is_empty() {
+            Ok(format!("Auslastung für {updated} Accounts aktualisiert."))
+        } else {
+            Ok(format!(
+                "Auslastung für {updated} von {} Accounts geladen. Nicht verfügbar: {}",
+                profiles.len(),
+                failures.join("; ")
+            ))
+        }
+    }
+
+    /// The tail of a task log for the private web panel.
+    pub fn web_job_log(&self, id: &str) -> Result<String> {
+        if id.is_empty() || id.len() > 12 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("Aufgaben-ID ist ungültig");
+        }
+        let path = self.job_log_path(id);
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                let mut lines = contents.lines().rev().take(160).collect::<Vec<_>>();
+                lines.reverse();
+                Ok(lines.join("\n"))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(error).context("Aufgabenprotokoll konnte nicht gelesen werden"),
+        }
     }
 
     pub fn interactive(&self) -> Result<()> {
@@ -2961,18 +3218,56 @@ fn log_once(spoken: &mut HashMap<String, String>, key: &str, message: &str) {
 }
 
 fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 64 {
-        bail!("Profilname muss 1 bis 64 Zeichen lang sein");
+    if name.trim().is_empty() || name.len() > 64 || name.trim() != name {
+        bail!(
+            "Profilname muss 1 bis 64 UTF-8-Bytes lang sein und darf keine Rand-Leerzeichen haben"
+        );
     }
     if !name
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        .chars()
+        .all(|character| !character.is_control() && !matches!(character, '/' | '\\'))
         || name == "."
         || name == ".."
     {
-        bail!("Profilname darf nur A-Z, a-z, 0-9, Punkt, Minus und Unterstrich enthalten");
+        bail!("Profilname darf keine Schrägstriche oder Steuerzeichen enthalten");
     }
     Ok(())
+}
+
+fn forward_login_output(stream: impl Read, sender: mpsc::Sender<String>) {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if sender.send(line.clone()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn claude_auth_url(line: &str) -> Option<String> {
+    const URL_PREFIXES: &[&str] = &[
+        "https://claude.com/cai/oauth/authorize",
+        "https://claude.com/oauth/authorize",
+        "https://claude.ai/oauth/authorize",
+    ];
+    for prefix in URL_PREFIXES {
+        let Some(start) = line.find(prefix) else {
+            continue;
+        };
+        let remaining = &line[start..];
+        let end = remaining
+            .find(char::is_whitespace)
+            .unwrap_or(remaining.len());
+        let url = remaining[..end].trim_end_matches(['.', ',', ')', '\'', '"']);
+        return Some(url.to_owned());
+    }
+    None
 }
 
 fn prompt_line(label: &str) -> Result<Option<String>> {

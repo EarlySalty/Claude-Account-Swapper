@@ -121,6 +121,12 @@ enum AccountCommand {
     },
     /// Das Fuenf-Stunden-Fenster sofort eroeffnen
     Ping,
+    /// Lokales Webmenü für den privaten Tailscale-Proxy starten
+    Web {
+        /// Lokaler Port des Webmenüs
+        #[arg(long, default_value_t = 8785)]
+        port: u16,
+    },
 }
 
 /// Ein Schalter, den man auf der Kommandozeile ohne Nachdenken trifft.
@@ -273,6 +279,7 @@ fn run() -> Result<()> {
         Some(AccountCommand::Jobs) => app.list_jobs(),
         Some(AccountCommand::Job { command }) => run_job_command(&app, command),
         Some(AccountCommand::Ping) => app.ping_now(),
+        Some(AccountCommand::Web { port }) => claude_account_swapper::web::serve(&app, port),
         None => app.interactive(),
     }
 }

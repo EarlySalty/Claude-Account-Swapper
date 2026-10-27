@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Claude Account Swapper</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand-mark" aria-hidden="true">C</div>
+        <div class="brand-copy">
+          <p class="eyebrow">Privates Menü · Tailscale</p>
+          <h1>Claude Account Swapper</h1>
+        </div>
+        <button class="button button-quiet" id="refresh" type="button">Ansicht neu laden</button>
+      </header>
+
+      <section class="live-strip" aria-live="polite">
+        <span class="live-dot"></span>
+        <span id="active-heading">Status wird geladen …</span>
+        <span id="active-email" class="muted"></span>
+        <span id="updated-at" class="strip-end muted"></span>
+      </section>
+
+      <nav class="tabs" aria-label="Bereiche">
+        <button class="tab active" type="button" data-tab="accounts">Accounts</button>
+        <button class="tab" type="button" data-tab="automation">Automatik</button>
+        <button class="tab" type="button" data-tab="jobs">Aufgaben</button>
+        <button class="tab" type="button" data-tab="system">Status &amp; Protokoll</button>
+      </nav>
+
+      <section class="view active" id="view-accounts" aria-labelledby="accounts-title">
+        <section class="panel quick-switch" aria-labelledby="quick-switch-title">
+          <div><p class="eyebrow">Direktwechsel</p><h3 id="quick-switch-title">Account wechseln</h3><p class="muted">Account auswählen und sofort wechseln. Der gespeicherte Login wird vorher geprüft.</p></div>
+          <div class="quick-switch-controls"><label class="visually-hidden" for="quick-switch-target">Zielaccount</label><select id="quick-switch-target" aria-label="Zielaccount"><option value="">Account auswählen …</option></select><button class="button" id="quick-switch-button" type="button" disabled>Accounts werden geladen …</button></div>
+        </section>
+        <div class="view-heading">
+          <div><p class="eyebrow">Profile</p><h2 id="accounts-title">Deine Accounts</h2></div>
+          <div class="heading-actions"><span class="muted" id="account-count"></span><button class="button button-secondary" id="refresh-usage" type="button">Auslastung laden</button></div>
+        </div>
+        <div id="accounts" class="account-grid" aria-live="polite"><div class="loading-card">Accounts werden geladen …</div></div>
+
+        <div class="two-up form-section">
+          <section class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">Aktiven Login sichern</p><h3>Account speichern</h3></div><span class="icon-chip">01</span></div>
+            <p class="muted">Speichert die aktuell in Claude angemeldeten Zugangsdaten unter einem Profilnamen.</p>
+            <form id="save-form" class="stack-form">
+              <label for="save-name">Profilname</label>
+              <div class="input-action"><input id="save-name" name="name" autocomplete="off" maxlength="64" placeholder="privat" required><button class="button" type="submit">Aktuellen Account speichern</button></div>
+            </form>
+          </section>
+          <section class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">Weiteren Login hinzufügen</p><h3>Account anmelden</h3></div><span class="icon-chip">02</span></div>
+            <fieldset class="login-mode-picker">
+              <legend>Anmeldemethode</legend>
+              <label><input name="login-mode" type="radio" value="local" checked><span>Lokal<small>Öffnet den Login im Browser dieses Rechners.</small></span></label>
+              <label><input name="login-mode" type="radio" value="device"><span>Device Code<small>URL kopieren, im Browser anmelden und den Rückgabecode hier einfügen.</small></span></label>
+            </fieldset>
+            <p class="muted" id="login-mode-help">Der offizielle Claude-Login wird auf diesem Rechner gestartet. Der Browser öffnet sich dort automatisch.</p>
+            <label for="login-name">Neuer Profilname</label>
+            <div class="input-action"><input id="login-name" autocomplete="off" maxlength="64" placeholder="arbeit"><button class="button button-secondary" id="login-start" type="button">Login starten</button></div>
+            <div class="command-row" id="login-command-row"><code id="login-command">Profilname eingeben, um den Login-Befehl zu sehen</code><button class="text-button" id="copy-login" type="button">Befehl kopieren</button></div>
+            <section class="login-device" id="login-device" aria-live="polite" hidden>
+              <p class="muted" id="login-device-status"></p>
+              <div class="command-row login-url-row" id="login-url-row" hidden><a id="login-url" target="_blank" rel="noopener noreferrer"></a><button class="text-button" id="copy-login-url" type="button">URL kopieren</button></div>
+              <form class="stack-form" id="login-code-form" hidden>
+                <label for="login-code">Device Code oder Weiterleitungs-URL</label>
+                <input id="login-code" autocomplete="off" placeholder="Device Code oder URL einfügen">
+                <div class="login-device-actions"><button class="button" id="login-code-submit" type="submit">Login abschließen</button><button class="button button-quiet" id="login-cancel" type="button">Abbrechen</button></div>
+              </form>
+            </section>
+          </section>
+        </div>
+        <section class="panel limits-panel">
+          <div class="panel-heading"><div><p class="eyebrow">Individuelle Reserven</p><h3>Limits pro Account</h3></div></div>
+          <p class="muted">Eine niedrigere Grenze wechselt früher. Eine harte Grenze wird auch im Notfall nicht überschritten.</p>
+          <div id="limits-list" class="limits-list"><p class="muted">Wird geladen …</p></div>
+        </section>
+      </section>
+
+      <section class="view" id="view-automation" aria-labelledby="automation-title" hidden>
+        <div class="view-heading"><div><p class="eyebrow">Verhalten und Wartung</p><h2 id="automation-title">Automatik</h2></div></div>
+        <div class="two-up">
+          <section class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">Regeln</p><h3>Automatische Aktionen</h3></div></div>
+            <form id="config-form" class="stack-form">
+              <label class="toggle-row"><span><strong>Bei vollem Limit zum freien Account wechseln</strong><small>Der Hintergrunddienst prüft die Account-Auslastung regelmäßig.</small></span><input id="auto-switch" type="checkbox"></label>
+              <label class="field-label" for="threshold">Globale Wechselgrenze <span class="range-value" id="threshold-value">98%</span></label>
+              <input id="threshold" type="range" min="50" max="100" step="1">
+              <label class="toggle-row"><span><strong>Fünf-Stunden-Fenster nach Reset starten</strong><small>Sendet einen kurzen Ping, wenn das Fenster ungenutzt ist.</small></span><input id="ping-enabled" type="checkbox"></label>
+              <label for="ping-prompt">Ping-Text</label><input id="ping-prompt" maxlength="2000">
+              <div class="two-fields"><div><label for="ping-model">Modell</label><input id="ping-model" maxlength="80" placeholder="haiku"></div><div><label for="ping-timeout">Zeitlimit in Minuten</label><input id="ping-timeout" type="number" min="1" max="1440"></div></div>
+              <button class="button" type="submit">Einstellungen speichern</button>
+            </form>
+          </section>
+          <section class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">Manuelle Aktionen</p><h3>Jetzt ausführen</h3></div></div>
+            <p class="muted">Die Vorschau zeigt die Entscheidung, ohne den aktiven Account zu ändern.</p>
+            <div class="action-stack">
+              <button class="button button-secondary" id="auto-preview" type="button">Automatik prüfen</button>
+              <button class="button button-warning" id="auto-run" type="button">Entscheidung ausführen</button>
+              <button class="button button-secondary" id="sync-now" type="button">Aktiven Login synchronisieren</button>
+              <div class="inline-action"><label for="keepalive-days">Inaktive Accounts auffrischen, ungenutzt seit (Tagen)</label><input id="keepalive-days" type="number" min="1" max="365" value="7"><button class="button button-secondary" id="keepalive-now" type="button">Auffrischen</button></div>
+              <button class="button button-secondary" id="ping-now" type="button">Fenster-Ping jetzt senden</button>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel service-panel">
+          <div class="panel-heading"><div><p class="eyebrow">Hintergrunddienst</p><h3>Token-Sync und Automatik</h3></div><span id="service-badge" class="status-pill">Wird geladen</span></div>
+          <p class="muted">Der Dienst sichert rotierte Tokens und führt die oben aktivierten Automatikregeln aus. Auto-Wechsel bleibt aus, bis du ihn einschaltest.</p>
+          <div class="service-actions">
+            <button class="button" id="service-start" type="button">Starten</button>
+            <button class="button button-secondary" id="service-stop" type="button">Stoppen</button>
+            <button class="button button-secondary" id="service-restart" type="button">Neu starten</button>
+            <button class="button button-quiet" id="service-enable" type="button">Beim Anmelden starten</button>
+            <button class="button button-quiet" id="service-disable" type="button">Autostart ausschalten</button>
+          </div>
+          <p id="service-note" class="small muted"></p>
+        </section>
+      </section>
+
+      <section class="view" id="view-jobs" aria-labelledby="jobs-title" hidden>
+        <div class="view-heading"><div><p class="eyebrow">Warteschlange</p><h2 id="jobs-title">Aufgaben und Sitzungen</h2></div><span class="muted" id="job-count"></span></div>
+        <div class="two-up">
+          <section class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">Neue Warteschlangenaufgabe</p><h3>Aufgabe vorbereiten</h3></div></div>
+            <form id="job-form" class="stack-form">
+              <label for="job-kind">Art der Aufgabe</label>
+              <select id="job-kind"><option value="prompt">Neuer Auftrag</option><option value="resume">Sitzung fortsetzen</option></select>
+              <div id="session-picker" hidden><label for="session-id">Sitzung auswählen</label><select id="session-id"><option value="">Sitzung wählen …</option></select></div>
+              <label for="job-text">Anweisung</label><textarea id="job-text" rows="5" maxlength="30000" placeholder="Was soll Claude erledigen?"></textarea>
+              <div class="two-fields"><div><label for="job-cwd">Arbeitsverzeichnis</label><input id="job-cwd" required placeholder="/home/nathanael/Projekt"></div><div><label for="job-title">Name in der Liste</label><input id="job-title" maxlength="70" placeholder="Optional"></div></div>
+              <div class="two-fields"><div><label for="job-model">Modell</label><input id="job-model" placeholder="Standard"></div><div><label for="job-timeout">Zeitlimit in Minuten</label><input id="job-timeout" type="number" min="1" max="10080" placeholder="60"></div></div>
+              <label for="job-settings">Eigene Settings-Datei <span class="muted">(optional)</span></label><input id="job-settings" placeholder="/pfad/zu/settings.json">
+              <label class="toggle-row"><span><strong>Bei jedem neuen Fenster erneut ausführen</strong><small>Ausgeschaltet bedeutet einmalige Ausführung.</small></span><input id="job-repeat" type="checkbox"></label>
+              <label class="toggle-row caution-row"><span><strong>Berechtigungsfragen zulassen</strong><small>Unbeaufsichtigte Aufgaben bleiben sonst bei Rückfragen hängen. Standardmäßig läuft Claude ohne Rückfragen.</small></span><input id="job-permissions" type="checkbox"></label>
+              <button class="button" type="submit">Aufgabe zur Warteschlange hinzufügen</button>
+            </form>
+          </section>
+          <section class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">Zuletzt verwendet</p><h3>Claude-Sitzungen</h3></div></div>
+            <p class="muted">Wähle eine Sitzung, um den Auftrag im passenden Arbeitsverzeichnis fortzusetzen.</p>
+            <div id="sessions" class="session-list"><p class="muted">Sitzungen werden geladen …</p></div>
+          </section>
+        </div>
+        <section class="panel queue-panel">
+          <div class="panel-heading"><div><p class="eyebrow">Geplant und zuletzt ausgeführt</p><h3>Aufgabenliste</h3></div></div>
+          <div id="jobs" class="jobs-list"><p class="muted">Aufgaben werden geladen …</p></div>
+        </section>
+      </section>
+
+      <section class="view" id="view-system" aria-labelledby="system-title" hidden>
+        <div class="view-heading"><div><p class="eyebrow">Übersicht</p><h2 id="system-title">Status &amp; Protokoll</h2></div></div>
+        <div class="two-up">
+          <section class="panel"><div class="panel-heading"><div><p class="eyebrow">Aktive Sitzung</p><h3>Claude-Status</h3></div></div><dl id="system-status" class="detail-list"></dl></section>
+          <section class="panel"><div class="panel-heading"><div><p class="eyebrow">Hintergrundaktionen</p><h3>Aktionsverlauf</h3></div></div><div id="task-list" class="task-list"></div></section>
+        </div>
+        <section class="panel log-panel"><div class="panel-heading"><div><p class="eyebrow">systemd-Protokoll</p><h3>Automatik-Protokoll</h3></div><button class="button button-quiet" id="refresh-logs" type="button">Protokoll laden</button></div><pre id="automation-logs" class="log-view">Protokoll noch nicht geladen.</pre></section>
+      </section>
+
+      <div id="notice" class="notice" role="status" aria-live="polite"></div>
+      <footer><span>Nur über Tailscale erreichbar</span><span>Wechsel gelten für Claude-Sitzungen auf diesem Rechner</span></footer>
+    </main>
+  </body>
+</html>

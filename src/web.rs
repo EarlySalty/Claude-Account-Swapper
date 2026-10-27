@@ -1,0 +1,719 @@
+use std::collections::{HashMap, VecDeque};
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use anyhow::Result;
+use serde::Deserialize;
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+
+use crate::config::Config;
+use crate::jobs::JobKind;
+use crate::{App, JobOptions};
+
+const PRIVATE_PROXY_HEADER: &str = "X-Account-Swapper-Private-Proxy";
+const PRIVATE_PROXY_MARKER: &str = "tailscale-caddy-v50671";
+const MAX_BODY_BYTES: usize = 64 * 1024;
+const TASK_HISTORY: usize = 24;
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebTask {
+    id: u64,
+    action: String,
+    status: String,
+    message: String,
+    auth_url: Option<String>,
+}
+
+#[derive(Default)]
+struct TaskStore {
+    next_id: AtomicU64,
+    tasks: Mutex<VecDeque<WebTask>>,
+    device_login_inputs: Mutex<HashMap<u64, Sender<Option<String>>>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceStatus {
+    installed: bool,
+    active: bool,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct NameRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LoginRequest {
+    name: String,
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DeviceLoginInputRequest {
+    task_id: u64,
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DeviceLoginCancelRequest {
+    task_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SwitchRequest {
+    name: String,
+    #[serde(default)]
+    skip_check: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LimitsRequest {
+    name: String,
+    five_hour: Option<f64>,
+    seven_day: Option<f64>,
+    hard: Option<bool>,
+    #[serde(default)]
+    clear: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct KeepaliveRequest {
+    #[serde(default = "default_keepalive_days")]
+    max_age_days: u64,
+}
+
+fn default_keepalive_days() -> u64 {
+    crate::DEFAULT_KEEPALIVE_MAX_AGE_DAYS
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct JobRequest {
+    kind: String,
+    text: String,
+    session_id: Option<String>,
+    cwd: String,
+    title: Option<String>,
+    settings: Option<String>,
+    model: Option<String>,
+    timeout_minutes: Option<u64>,
+    #[serde(default)]
+    allow_permissions: bool,
+    #[serde(default)]
+    repeat: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ServiceRequest {
+    action: String,
+}
+
+pub fn serve(app: &App, port: u16) -> Result<()> {
+    let server = Server::http(("127.0.0.1", port))
+        .map_err(|error| anyhow::anyhow!("Webmenü konnte nicht gestartet werden: {error}"))?;
+    println!("Claude Account Swapper Webmenü auf 127.0.0.1:{port}");
+    println!("Zugriff nur über den privaten Tailscale-Proxy.");
+
+    let app = Arc::new(app.clone());
+    let tasks = Arc::new(TaskStore::default());
+    for request in server.incoming_requests() {
+        let app = Arc::clone(&app);
+        let tasks = Arc::clone(&tasks);
+        thread::spawn(move || handle_request(request, app, tasks));
+    }
+    Ok(())
+}
+
+fn handle_request(mut request: Request, app: Arc<App>, tasks: Arc<TaskStore>) {
+    let response = match route(&mut request, &app, &tasks) {
+        Ok(response) => response,
+        Err((status, message)) => json_response(status, &serde_json::json!({"error": message})),
+    };
+    let _ = request.respond(response);
+}
+
+fn route(
+    request: &mut Request,
+    app: &App,
+    tasks: &Arc<TaskStore>,
+) -> std::result::Result<Response<std::io::Cursor<Vec<u8>>>, (StatusCode, String)> {
+    if !authorized(request) {
+        return Err((
+            StatusCode(403),
+            "Zugriff nur über das private Tailscale-Menü.".into(),
+        ));
+    }
+    let path = request.url().split('?').next().unwrap_or("/").to_owned();
+    match (request.method(), path.as_str()) {
+        (&Method::Get, "/") => Ok(asset(
+            include_bytes!("../web/index.html"),
+            "text/html; charset=utf-8",
+        )),
+        (&Method::Get, "/app.js") => Ok(asset(
+            include_bytes!("../web/app.js"),
+            "text/javascript; charset=utf-8",
+        )),
+        (&Method::Get, "/style.css") => Ok(asset(
+            include_bytes!("../web/style.css"),
+            "text/css; charset=utf-8",
+        )),
+        (&Method::Get, "/api/dashboard") => {
+            let mut dashboard = app.web_snapshot().map_err(internal_error)?;
+            if let Some(object) = dashboard.as_object_mut() {
+                object.insert(
+                    "service".into(),
+                    serde_json::to_value(service_status()).unwrap_or_default(),
+                );
+                object.insert(
+                    "tasks".into(),
+                    serde_json::to_value(task_snapshot(tasks)).unwrap_or_default(),
+                );
+            }
+            Ok(json_response(StatusCode(200), &dashboard))
+        }
+        (&Method::Get, "/api/automation/logs") => {
+            let output = Command::new("journalctl")
+                .args([
+                    "--user",
+                    "-u",
+                    "claude-account-sync.service",
+                    "-n",
+                    "120",
+                    "--no-pager",
+                    "-o",
+                    "short-iso",
+                ])
+                .output()
+                .map_err(anyhow::Error::from)
+                .map_err(internal_error)?;
+            let text = if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            } else {
+                String::from_utf8_lossy(&output.stderr).trim().to_owned()
+            };
+            Ok(json_response(
+                StatusCode(200),
+                &serde_json::json!({"logs": text}),
+            ))
+        }
+        (&Method::Get, path) if path.starts_with("/api/jobs/") && path.ends_with("/log") => {
+            let id = path
+                .trim_start_matches("/api/jobs/")
+                .trim_end_matches("/log")
+                .trim_end_matches('/');
+            let text = app.web_job_log(id).map_err(internal_error)?;
+            Ok(json_response(
+                StatusCode(200),
+                &serde_json::json!({"log": text}),
+            ))
+        }
+        (&Method::Post, path) if path.starts_with("/api/") => {
+            if !same_origin(request) {
+                return Err((
+                    StatusCode(403),
+                    "Die Anfrage stammt nicht von dieser Seite.".into(),
+                ));
+            }
+            dispatch_post(request, app, tasks, &path)
+        }
+        _ => Err((StatusCode(404), "Diese Seite wurde nicht gefunden.".into())),
+    }
+}
+
+fn dispatch_post(
+    request: &mut Request,
+    app: &App,
+    tasks: &Arc<TaskStore>,
+    path: &str,
+) -> std::result::Result<Response<std::io::Cursor<Vec<u8>>>, (StatusCode, String)> {
+    match path {
+        "/api/accounts/save" => {
+            let input: NameRequest = read_json(request)?;
+            app.save(&input.name).map_err(internal_error)?;
+            Ok(message_response("Aktiver Account wurde gespeichert."))
+        }
+        "/api/accounts/login" => {
+            let input: LoginRequest = read_json(request)?;
+            match input.mode.as_str() {
+                "local" => {
+                    let name = input.name;
+                    let task = start_task(tasks, "Login (lokal)", move |app| {
+                        app.login(&name)?;
+                        Ok(format!("Login für {name} abgeschlossen."))
+                    });
+                    Ok(task_response(task))
+                }
+                "device" => Ok(task_response(start_device_login_task(tasks, input.name))),
+                _ => Err((
+                    StatusCode(400),
+                    "Bitte Lokal oder Device Code als Anmeldemethode wählen.".into(),
+                )),
+            }
+        }
+        "/api/accounts/login/complete" => {
+            let input: DeviceLoginInputRequest = read_json(request)?;
+            let code = input.code.trim();
+            if code.is_empty() || code.len() > 16 * 1024 || code.chars().any(char::is_control) {
+                return Err((
+                    StatusCode(400),
+                    "Bitte den vollständigen Code oder die Weiterleitungs-URL einfügen.".into(),
+                ));
+            }
+            let sender = tasks
+                .device_login_inputs
+                .lock()
+                .ok()
+                .and_then(|inputs| inputs.get(&input.task_id).cloned())
+                .ok_or_else(|| {
+                    (
+                        StatusCode(404),
+                        "Dieser Device-Code-Login läuft nicht mehr.".into(),
+                    )
+                })?;
+            sender.send(Some(code.to_owned())).map_err(|_| {
+                (
+                    StatusCode(404),
+                    "Dieser Device-Code-Login läuft nicht mehr.".into(),
+                )
+            })?;
+            Ok(message_response("Code wurde an Claude Code übergeben."))
+        }
+        "/api/accounts/login/cancel" => {
+            let input: DeviceLoginCancelRequest = read_json(request)?;
+            let sender = tasks
+                .device_login_inputs
+                .lock()
+                .ok()
+                .and_then(|inputs| inputs.get(&input.task_id).cloned())
+                .ok_or_else(|| {
+                    (
+                        StatusCode(404),
+                        "Dieser Device-Code-Login läuft nicht mehr.".into(),
+                    )
+                })?;
+            sender.send(None).map_err(|_| {
+                (
+                    StatusCode(404),
+                    "Dieser Device-Code-Login läuft nicht mehr.".into(),
+                )
+            })?;
+            Ok(message_response("Device-Code-Login wird abgebrochen."))
+        }
+        "/api/accounts/switch" => {
+            let input: SwitchRequest = read_json(request)?;
+            let name = input.name;
+            let check = !input.skip_check;
+            let task = start_task(tasks, "Account wechseln", move |app| {
+                app.switch_checked(&name, check)?;
+                Ok(format!("Aktiver Account ist jetzt {name}."))
+            });
+            Ok(task_response(task))
+        }
+        "/api/accounts/limits" => {
+            let input: LimitsRequest = read_json(request)?;
+            app.set_limits(
+                &input.name,
+                input.five_hour,
+                input.seven_day,
+                input.hard,
+                input.clear,
+            )
+            .map_err(internal_error)?;
+            Ok(message_response("Account-Grenzen wurden gespeichert."))
+        }
+        "/api/config" => {
+            let config: Config = read_json(request)?;
+            app.write_config(&config).map_err(internal_error)?;
+            Ok(message_response(
+                "Automatik-Einstellungen wurden gespeichert.",
+            ))
+        }
+        "/api/actions/auto" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields, rename_all = "camelCase")]
+            struct Input {
+                threshold: f64,
+                #[serde(default)]
+                dry_run: bool,
+            }
+            let input: Input = read_json(request)?;
+            let task = start_task(
+                tasks,
+                if input.dry_run {
+                    "Automatik prüfen"
+                } else {
+                    "Automatisch wechseln"
+                },
+                move |app| {
+                    let decision = app.auto_switch(input.threshold, input.dry_run)?;
+                    Ok(format!("{decision:?}"))
+                },
+            );
+            Ok(task_response(task))
+        }
+        "/api/actions/sync" => {
+            let task = start_task(tasks, "Account synchronisieren", |app| {
+                Ok(app.sync()?.to_string())
+            });
+            Ok(task_response(task))
+        }
+        "/api/actions/usage" => {
+            let task = start_task(tasks, "Auslastung aktualisieren", |app| {
+                app.web_refresh_usage()
+            });
+            Ok(task_response(task))
+        }
+        "/api/actions/keepalive" => {
+            let input: KeepaliveRequest = read_json(request)?;
+            let task = start_task(tasks, "Inaktive Accounts auffrischen", move |app| {
+                app.keepalive(input.max_age_days)?;
+                Ok("Auffrischung abgeschlossen.".into())
+            });
+            Ok(task_response(task))
+        }
+        "/api/actions/ping" => {
+            let task = start_task(tasks, "Fenster-Ping", |app| {
+                app.ping_now()?;
+                Ok("Fenster-Ping abgeschlossen.".into())
+            });
+            Ok(task_response(task))
+        }
+        "/api/jobs" => {
+            let input: JobRequest = read_json(request)?;
+            let cwd = PathBuf::from(input.cwd);
+            let settings = input.settings.map(PathBuf::from);
+            let kind = match input.kind.as_str() {
+                "prompt" => JobKind::Prompt { text: input.text },
+                "resume" => JobKind::Resume {
+                    session_id: input
+                        .session_id
+                        .ok_or_else(|| (StatusCode(400), "Bitte eine Sitzung auswählen.".into()))?,
+                    text: input.text,
+                },
+                _ => return Err((StatusCode(400), "Aufgabentyp ist ungültig.".into())),
+            };
+            let job = app
+                .add_job(
+                    kind,
+                    cwd,
+                    JobOptions {
+                        title: input.title,
+                        settings,
+                        model: input.model,
+                        timeout_minutes: input.timeout_minutes,
+                        skip_permissions: !input.allow_permissions,
+                        repeat: input.repeat,
+                    },
+                )
+                .map_err(anyhow::Error::from)
+                .map_err(internal_error)?;
+            Ok(json_response(
+                StatusCode(201),
+                &serde_json::json!({"message": format!("Aufgabe [{}] wurde angelegt.", job.id), "job": job}),
+            ))
+        }
+        _ if path.starts_with("/api/jobs/") => job_action(request, app, tasks, path),
+        "/api/service" => {
+            let input: ServiceRequest = read_json(request)?;
+            let verb = match input.action.as_str() {
+                "start" | "stop" | "restart" | "enable" | "disable" => input.action,
+                _ => return Err((StatusCode(400), "Unbekannte Dienstaktion.".into())),
+            };
+            let output = Command::new("systemctl")
+                .args(["--user", verb.as_str(), "claude-account-sync.service"])
+                .output()
+                .map_err(anyhow::Error::from)
+                .map_err(internal_error)?;
+            if !output.status.success() {
+                return Err((
+                    StatusCode(400),
+                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                ));
+            }
+            Ok(message_response(&format!(
+                "Hintergrunddienst: {verb} ausgeführt."
+            )))
+        }
+        _ => Err((StatusCode(404), "Diese Aktion wurde nicht gefunden.".into())),
+    }
+}
+
+fn job_action(
+    request: &mut Request,
+    app: &App,
+    tasks: &Arc<TaskStore>,
+    path: &str,
+) -> std::result::Result<Response<std::io::Cursor<Vec<u8>>>, (StatusCode, String)> {
+    let suffix = path.strip_prefix("/api/jobs/").unwrap_or_default();
+    let Some((id, action)) = suffix.split_once('/') else {
+        return Err((StatusCode(404), "Aufgabenaktion fehlt.".into()));
+    };
+    if id.is_empty() || id.len() > 12 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err((StatusCode(400), "Aufgaben-ID ist ungültig.".into()));
+    }
+    match (request.method(), action) {
+        (&Method::Post, "enable") => {
+            app.set_job_enabled(id, true).map_err(internal_error)?;
+            Ok(message_response("Aufgabe wurde aktiviert."))
+        }
+        (&Method::Post, "disable") => {
+            app.set_job_enabled(id, false).map_err(internal_error)?;
+            Ok(message_response("Aufgabe wurde pausiert."))
+        }
+        (&Method::Post, "remove") => {
+            app.remove_job(id).map_err(internal_error)?;
+            Ok(message_response("Aufgabe wurde gelöscht."))
+        }
+        (&Method::Post, "run") => {
+            let id = id.to_owned();
+            let task = start_task(tasks, "Aufgabe sofort ausführen", move |app| {
+                app.run_job_now(&id)?;
+                Ok(format!("Aufgabe [{id}] ist abgeschlossen."))
+            });
+            Ok(task_response(task))
+        }
+        _ => Err((
+            StatusCode(404),
+            "Diese Aufgabenaktion wurde nicht gefunden.".into(),
+        )),
+    }
+}
+
+fn start_task(
+    store: &Arc<TaskStore>,
+    action: &str,
+    run: impl FnOnce(&App) -> Result<String> + Send + 'static,
+) -> WebTask {
+    let id = store.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let task = WebTask {
+        id,
+        action: action.into(),
+        status: "läuft".into(),
+        message: String::new(),
+        auth_url: None,
+    };
+    if let Ok(mut tasks) = store.tasks.lock() {
+        tasks.push_back(task.clone());
+        while tasks.len() > TASK_HISTORY {
+            tasks.pop_front();
+        }
+    }
+    let store = Arc::clone(store);
+    let app = App::discover();
+    thread::spawn(move || {
+        let result = match app {
+            Ok(app) => run(&app),
+            Err(error) => Err(error),
+        };
+        if let Ok(mut tasks) = store.tasks.lock()
+            && let Some(task) = tasks.iter_mut().find(|task| task.id == id)
+        {
+            match result {
+                Ok(message) => {
+                    task.status = "fertig".into();
+                    task.message = message;
+                }
+                Err(error) => {
+                    task.status = "fehler".into();
+                    task.message = format!("{error:#}");
+                }
+            }
+        }
+    });
+    task
+}
+
+fn start_device_login_task(store: &Arc<TaskStore>, name: String) -> WebTask {
+    let id = store.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let task = WebTask {
+        id,
+        action: "Login mit Device Code".into(),
+        status: "läuft".into(),
+        message: "Claude-Code-Login wird gestartet …".into(),
+        auth_url: None,
+    };
+    if let Ok(mut tasks) = store.tasks.lock() {
+        tasks.push_back(task.clone());
+        while tasks.len() > TASK_HISTORY {
+            tasks.pop_front();
+        }
+    }
+
+    let (input_tx, input_rx) = mpsc::channel();
+    if let Ok(mut inputs) = store.device_login_inputs.lock() {
+        inputs.insert(id, input_tx);
+    }
+    let store = Arc::clone(store);
+    thread::spawn(move || {
+        let result = match App::discover() {
+            Ok(app) => app.login_device(&name, input_rx, |url| {
+                if let Ok(mut tasks) = store.tasks.lock()
+                    && let Some(task) = tasks.iter_mut().find(|task| task.id == id)
+                {
+                    task.auth_url = Some(url);
+                    task.message = "Öffne die URL, melde dich an und füge danach den Code oder die Weiterleitungs-URL hier ein.".into();
+                }
+            }),
+            Err(error) => Err(error),
+        };
+
+        if let Ok(mut inputs) = store.device_login_inputs.lock() {
+            inputs.remove(&id);
+        }
+        if let Ok(mut tasks) = store.tasks.lock()
+            && let Some(task) = tasks.iter_mut().find(|task| task.id == id)
+        {
+            task.auth_url = None;
+            match result {
+                Ok(()) => {
+                    task.status = "fertig".into();
+                    task.message = format!("Login für {name} abgeschlossen und gespeichert.");
+                }
+                Err(error) => {
+                    task.status = "fehler".into();
+                    task.message = format!("{error:#}");
+                }
+            }
+        }
+    });
+    task
+}
+
+fn task_snapshot(store: &TaskStore) -> Vec<WebTask> {
+    store
+        .tasks
+        .lock()
+        .map(|tasks| tasks.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn service_status() -> ServiceStatus {
+    let active = systemctl_state("is-active");
+    let enabled = systemctl_state("is-enabled");
+    ServiceStatus {
+        installed: Command::new("systemctl")
+            .args(["--user", "cat", "claude-account-sync.service"])
+            .output()
+            .is_ok_and(|output| output.status.success()),
+        active: active == "active",
+        enabled: enabled == "enabled",
+    }
+}
+
+fn systemctl_state(action: &str) -> String {
+    Command::new("systemctl")
+        .args(["--user", action, "claude-account-sync.service"])
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn authorized(request: &Request) -> bool {
+    request.headers().iter().any(|header| {
+        header.field.equiv(PRIVATE_PROXY_HEADER) && header.value.as_str() == PRIVATE_PROXY_MARKER
+    })
+}
+
+fn same_origin(request: &Request) -> bool {
+    let host = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Host"));
+    let origin = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Origin"));
+    match (host, origin) {
+        (Some(host), Some(origin)) => {
+            let host = host.value.as_str();
+            let origin = origin.value.as_str();
+            origin == format!("http://{host}") || origin == format!("https://{host}")
+        }
+        _ => false,
+    }
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(
+    request: &mut Request,
+) -> std::result::Result<T, (StatusCode, String)> {
+    let mut body = Vec::new();
+    request
+        .as_reader()
+        .take((MAX_BODY_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|error| {
+            (
+                StatusCode(400),
+                format!("Anfrage konnte nicht gelesen werden: {error}"),
+            )
+        })?;
+    if body.len() > MAX_BODY_BYTES {
+        return Err((StatusCode(413), "Die Anfrage ist zu groß.".into()));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| (StatusCode(400), format!("Eingaben sind ungültig: {error}")))
+}
+
+fn asset(bytes: &'static [u8], content_type: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_data(bytes.to_vec());
+    add_header(&mut response, "Content-Type", content_type);
+    add_header(&mut response, "Cache-Control", "no-store");
+    add_header(&mut response, "X-Content-Type-Options", "nosniff");
+    add_header(&mut response, "X-Frame-Options", "DENY");
+    add_header(
+        &mut response,
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    );
+    response
+}
+
+fn json_response(
+    status: StatusCode,
+    value: &serde_json::Value,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_string(value.to_string()).with_status_code(status);
+    add_header(
+        &mut response,
+        "Content-Type",
+        "application/json; charset=utf-8",
+    );
+    add_header(&mut response, "Cache-Control", "no-store");
+    add_header(&mut response, "X-Content-Type-Options", "nosniff");
+    response
+}
+
+fn message_response(message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    json_response(StatusCode(200), &serde_json::json!({"message": message}))
+}
+
+fn task_response(task: WebTask) -> Response<std::io::Cursor<Vec<u8>>> {
+    json_response(StatusCode(202), &serde_json::json!({"task": task}))
+}
+
+fn add_header(response: &mut Response<std::io::Cursor<Vec<u8>>>, name: &str, value: &str) {
+    if let Ok(header) = Header::from_bytes(name, value) {
+        response.add_header(header);
+    }
+}
+
+fn internal_error(error: anyhow::Error) -> (StatusCode, String) {
+    (StatusCode(400), format!("{error:#}"))
+}
