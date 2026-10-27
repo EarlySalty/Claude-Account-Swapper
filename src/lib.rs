@@ -47,6 +47,26 @@ const USAGE_CACHE_FRESH_SECONDS: u64 = 45;
 /// dadurch unbrauchbar wuerde - eine ausgefallene Bewertung dagegen schon.
 const USAGE_CACHE_MAX_AGE_SECONDS: u64 = 30 * 60;
 const PACING_CACHE_MAX_AGE_SECONDS: u64 = 5 * 60;
+const USAGE_BACKOFF_DEFAULT_SECONDS: u64 = 5 * 60;
+const USAGE_BACKOFF_MIN_SECONDS: u64 = 60;
+const USAGE_BACKOFF_MAX_SECONDS: u64 = 15 * 60;
+
+#[derive(Debug)]
+struct UsageThrottled {
+    remaining: u64,
+}
+
+impl std::fmt::Display for UsageThrottled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Auslastungs-API drosselt, naechste Abfrage in {} s",
+            self.remaining
+        )
+    }
+}
+
+impl std::error::Error for UsageThrottled {}
 const PACING_MIN_DWELL_SECONDS: u64 = 3 * 60 * 60;
 const FAILED_LOGIN_RETRY_SECONDS: u64 = 6 * 60 * 60;
 /// Ein haengender Request wuerde den Dienst sonst dauerhaft anhalten.
@@ -1843,7 +1863,9 @@ impl App {
                 Ok((usage, 0))
             }
             Err(error) => {
+                let throttled = error.downcast_ref::<UsageThrottled>().is_some();
                 match cached.filter(|cached| age(cached) <= USAGE_CACHE_MAX_AGE_SECONDS) {
+                    Some(cached) if throttled => Ok((cached.usage, age(&cached))),
                     Some(cached) => {
                         log_problem(&format!(
                             "Auslastung von {} nicht abrufbar ({error:#}); \
@@ -1947,6 +1969,7 @@ impl App {
     /// sein Snapshot kann aelter sein, und ein abgelaufener Token aus dem Snapshot wuerde eine
     /// Auffrischung ausloesen, die den laufenden Login unter offenen Sessions wegrotiert.
     fn profile_usage(&self, profile: &Profile, allow_renew: bool) -> Result<Usage> {
+        let now = unix_timestamp()?;
         let (credentials, is_live) = self.usage_credentials(profile)?;
         let credentials = if needs_refresh(&credentials) {
             if is_live {
@@ -1980,7 +2003,48 @@ impl App {
             credentials
         };
 
-        usage::fetch(&read_access_token(&credentials)?)
+        let token = read_access_token(&credentials)?;
+        let key = backoff_key(&token);
+        if let Some(until) = self
+            .read_usage_backoff(&profile.name, &key)
+            .filter(|until| *until > now)
+        {
+            return Err(UsageThrottled {
+                remaining: until - now,
+            }
+            .into());
+        }
+        let result = usage::fetch(&token);
+        if let Some(limited) = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<usage::RateLimited>())
+        {
+            let wait = limited
+                .retry_after
+                .unwrap_or(USAGE_BACKOFF_DEFAULT_SECONDS)
+                .clamp(USAGE_BACKOFF_MIN_SECONDS, USAGE_BACKOFF_MAX_SECONDS);
+            self.write_usage_backoff(&profile.name, &key, now + wait);
+        }
+        result
+    }
+
+    fn usage_backoff_path(&self, name: &str) -> PathBuf {
+        self.profile_dir(name).join("usage-backoff")
+    }
+
+    fn read_usage_backoff(&self, name: &str, key: &str) -> Option<u64> {
+        let stored = fs::read_to_string(self.usage_backoff_path(name)).ok()?;
+        let (until, stored_key) = stored.trim().split_once(' ')?;
+        (stored_key == key).then(|| until.parse().ok()).flatten()
+    }
+
+    fn write_usage_backoff(&self, name: &str, key: &str, until: u64) {
+        if let Err(error) = fs::write(self.usage_backoff_path(name), format!("{until} {key}")) {
+            log_problem(&format!(
+                "Drosselpause fuer {name} konnte nicht gemerkt werden: {error}"
+            ));
+        }
     }
 
     fn usage_credentials(&self, profile: &Profile) -> Result<(Vec<u8>, bool)> {
@@ -3746,6 +3810,14 @@ fn format_timestamp(seconds: i64) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| format!("ungueltiger Zeitstempel ({seconds})"))
+}
+
+fn backoff_key(token: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    usage::usage_url().hash(&mut hasher);
+    token.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn log_event(message: &str) {

@@ -444,11 +444,28 @@ fn compare_utilization(left: &Usage, right: &Usage) -> Ordering {
 /// Der Token wandert ausschliesslich in den Authorization-Header: als Kommandozeilenargument
 /// stuende er in der Prozessliste, und in einer Fehlermeldung stuende er dauerhaft im Journal.
 /// Deshalb enthaelt auch kein Fehlertext dieser Funktion den Token.
-pub fn fetch(access_token: &str) -> Result<Usage> {
-    let url = std::env::var("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL")
+#[derive(Debug)]
+pub struct RateLimited {
+    pub retry_after: Option<u64>,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Auslastungs-API antwortete mit HTTP 429")
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+pub fn usage_url() -> String {
+    std::env::var("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_USAGE_URL.to_owned());
+        .unwrap_or_else(|| DEFAULT_USAGE_URL.to_owned())
+}
+
+pub fn fetch(access_token: &str) -> Result<Usage> {
+    let url = usage_url();
 
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -466,6 +483,14 @@ pub fn fetch(access_token: &str) -> Result<Usage> {
         .map_err(|error| anyhow::anyhow!("Auslastung konnte nicht abgefragt werden: {error}"))?;
 
     let status = response.status().as_u16();
+    if status == 429 {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse().ok());
+        return Err(RateLimited { retry_after }.into());
+    }
     let body = response
         .body_mut()
         .read_to_string()

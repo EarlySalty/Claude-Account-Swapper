@@ -2303,6 +2303,39 @@ fn auto_falls_back_to_the_remembered_usage_when_the_api_rate_limits() {
     );
 }
 
+#[test]
+fn a_rate_limited_account_is_not_asked_again_during_the_backoff() {
+    let harness = harness_with_two_accounts();
+    write_cached_usage(&harness, "work", 100.0, 20.0, 300);
+    write_cached_usage(&harness, "personal", 5.0, 5.0, 300);
+    let server = UsageServer::start(vec![
+        ("access-work", 429, r#"{"error":{}}"#.to_owned()),
+        ("access-personal", 429, r#"{"error":{}}"#.to_owned()),
+    ]);
+    let run = || {
+        harness
+            .command()
+            .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+            .args(["auto", "--dry-run"])
+            .output()
+            .expect("auto")
+    };
+
+    let first = run();
+    assert_success(&first);
+    assert!(String::from_utf8_lossy(&first.stderr).contains("HTTP 429"));
+
+    let second = run();
+    assert_success(&second);
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stdout.contains("Wuerde wechseln zu personal"), "{stdout}");
+    assert!(
+        !stderr.contains("HTTP 429"),
+        "waehrend der Drosselpause darf keine Anfrage rausgehen: {stderr}"
+    );
+}
+
 /// Zu alte gemerkte Zahlen sind schlechter als keine: sie wuerden einen Wechsel auf einen
 /// laengst vollen Account begruenden.
 #[test]
