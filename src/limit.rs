@@ -303,17 +303,15 @@ fn verdict(
                 .as_ref()
                 .is_some_and(|usage| usage.five_hour.utilization >= limit.threshold)
         });
-    let free = |name: &String, usage: &Option<Usage>| {
-        let candidate = config.auto_switch || active_profile == Some(name.as_str());
-        candidate
+    let active_usable = levels.iter().any(|(name, usage)| {
+        active_profile == Some(name.as_str())
             && usage
                 .as_ref()
                 .is_some_and(|usage| usable(usage, limit, config.threshold))
-    };
-    let any_free = levels.iter().any(|(name, usage)| free(name, usage));
+    });
     Verdict {
         at_limit: limit.enabled && (limit.force || all_at_limit),
-        released: !limit.enabled || (!limit.force && any_free),
+        released: !limit.enabled || (!limit.force && active_usable),
     }
 }
 
@@ -980,8 +978,9 @@ mod tests {
             ("a".to_owned(), Some(usage(99.0, 10.0))),
             ("b".to_owned(), Some(usage(10.0, 10.0))),
         ];
-        assert!(verdict(&config(true), &levels, Some("a")).released);
+        assert!(!verdict(&config(true), &levels, Some("a")).released);
         assert!(!verdict(&config(false), &levels, Some("a")).released);
+        assert!(!verdict(&config(true), &levels, None).released);
         assert!(verdict(&config(false), &levels, Some("b")).released);
         let weekly_full = vec![("a".to_owned(), Some(usage(0.0, 100.0)))];
         assert!(!verdict(&config(true), &weekly_full, Some("a")).released);

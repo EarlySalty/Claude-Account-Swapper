@@ -6,7 +6,7 @@ Goal: when every saved account is at the 5h limit, running Claude sessions wrap 
 
 - `watch` evaluates the pause every 60s after the usage refresh (`limit::App::limit_tick`).
   - Enter: `limit_compact.enabled` and (`force` or every profile's cached 5h utilization >= `threshold`).
-  - Leave: `force` off and usable quota: the active account (or, with auto switch on, any account) has fresh cached 5h usage below `resume_below` and weekly usage below the switch threshold. Disabling the feature also leaves; parked sessions are then dropped with one log line each.
+  - Leave: `force` off and usable quota: the active account (the one that runs every resumed turn; the auto switch moves there first) has fresh cached 5h usage below `resume_below` and weekly usage below the switch threshold. Disabling the feature also leaves; parked sessions are then dropped with one log line each.
   - On leave the hooks stop telling sessions (`active=false`), but Stops of already parked sessions are still recorded. Only one watcher runs a tick at a time (`.limit-tick.lock`).
 - Hook `claude-account hook` (wired in `~/.claude/settings.json` for `PostToolUse` matcher `*` and `Stop`):
   - Inactive pause: reads one small JSON file and exits silently.
@@ -30,7 +30,7 @@ T3 access: own token `~/.claude-account-switcher/t3-bearer` (0600, scopes orches
 | enabled | false (live: true) | feature switch |
 | force | false | test mode: pause regardless of usage |
 | threshold | 95 | all accounts >= this 5h % enters the pause |
-| resume_below | 80 | usable account below this releases it (must be > 0 and <= threshold) |
+| resume_below | 80 | active account below this releases it (must be > 0 and <= threshold) |
 | min_context_tokens | 60000 | smaller threads are not compacted |
 | cache_ttl_minutes | 55 | only compact if the last run ended within this (T3 reports a 1h prompt cache TTL) |
 | idle_minutes | 2 | do not compact a thread that just finished |
