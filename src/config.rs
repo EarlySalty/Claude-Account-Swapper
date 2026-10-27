@@ -23,6 +23,7 @@ pub struct Config {
     pub threshold: f64,
     pub weekly_pacing: bool,
     pub ping: Ping,
+    pub limit_compact: LimitCompact,
 }
 
 /// Startet das Fuenf-Stunden-Fenster von selbst neu, sobald es zurueckgesetzt wurde.
@@ -35,6 +36,38 @@ pub struct Ping {
     pub timeout_minutes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitCompact {
+    pub enabled: bool,
+    pub force: bool,
+    pub threshold: f64,
+    pub resume_below: f64,
+    pub min_context_tokens: u64,
+    pub cache_ttl_minutes: u64,
+    pub idle_minutes: u64,
+    pub max_compactions: usize,
+    pub scope_sessions: Vec<String>,
+    pub t3_url: String,
+}
+
+impl Default for LimitCompact {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            force: false,
+            threshold: 95.0,
+            resume_below: 80.0,
+            min_context_tokens: 60_000,
+            cache_ttl_minutes: 55,
+            idle_minutes: 2,
+            max_compactions: 8,
+            scope_sessions: Vec::new(),
+            t3_url: "http://127.0.0.1:3773".to_owned(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -42,6 +75,7 @@ impl Default for Config {
             threshold: DEFAULT_SWITCH_THRESHOLD,
             weekly_pacing: true,
             ping: Ping::default(),
+            limit_compact: LimitCompact::default(),
         }
     }
 }
@@ -78,6 +112,19 @@ impl Config {
             self.ping.timeout_minutes > 0,
             "Zeitlimit des Pings muss größer als 0 sein"
         );
+        let limit = &self.limit_compact;
+        anyhow::ensure!(
+            (0.0..=100.0).contains(&limit.threshold),
+            "Limit-Schwelle muss zwischen 0 und 100 liegen"
+        );
+        anyhow::ensure!(
+            (0.0..=limit.threshold).contains(&limit.resume_below),
+            "Fortsetzen-Schwelle muss zwischen 0 und der Limit-Schwelle liegen"
+        );
+        anyhow::ensure!(
+            limit.t3_url.starts_with("http://"),
+            "T3-Adresse muss mit http:// beginnen"
+        );
         Ok(())
     }
 
@@ -85,12 +132,25 @@ impl Config {
     /// sonst stuende dieselbe Zeile jede Minute im Journal.
     pub fn describe(&self) -> String {
         format!(
-            "Auto-Wechsel {} (Schwelle {:.0}%, Wochen-Pacing {}), Fenster-Ping {}",
+            "Auto-Wechsel {} (Schwelle {:.0}%, Wochen-Pacing {}), Fenster-Ping {}{}",
             if self.auto_switch { "an" } else { "aus" },
             self.threshold,
             if self.weekly_pacing { "an" } else { "aus" },
-            if self.ping.enabled { "an" } else { "aus" }
+            if self.ping.enabled { "an" } else { "aus" },
+            self.describe_limit_compact()
         )
+    }
+
+    fn describe_limit_compact(&self) -> String {
+        let limit = &self.limit_compact;
+        match (limit.enabled, limit.force) {
+            (false, _) => String::new(),
+            (true, false) => format!(
+                ", Limit-Pause ab {:.0}% (Kompaktieren ab {} Tokens)",
+                limit.threshold, limit.min_context_tokens
+            ),
+            (true, true) => ", Limit-Pause erzwungen".to_owned(),
+        }
     }
 }
 

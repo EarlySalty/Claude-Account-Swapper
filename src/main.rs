@@ -121,6 +121,21 @@ enum AccountCommand {
     },
     /// Das Fuenf-Stunden-Fenster sofort eroeffnen
     Ping,
+    /// Claude-Code-Hook der Limit-Pause; liest das Hook-JSON von stdin
+    Hook,
+    /// Limit-Pause anzeigen oder einstellen
+    LimitCompact {
+        #[arg(long)]
+        enabled: Option<Switch>,
+        #[arg(long)]
+        force: Option<Switch>,
+        #[arg(long)]
+        threshold: Option<f64>,
+        #[arg(long)]
+        min_context_tokens: Option<u64>,
+        #[arg(long = "scope-session")]
+        scope_sessions: Option<Vec<String>>,
+    },
     /// Lokales Webmenü für den privaten Tailscale-Proxy starten
     Web {
         /// Unix-Socket, über den Caddy das Webmenü erreicht
@@ -282,11 +297,63 @@ fn run() -> Result<()> {
         Some(AccountCommand::Jobs) => app.list_jobs(),
         Some(AccountCommand::Job { command }) => run_job_command(&app, command),
         Some(AccountCommand::Ping) => app.ping_now(),
+        Some(AccountCommand::Hook) => {
+            run_hook(&app);
+            Ok(())
+        }
+        Some(AccountCommand::LimitCompact {
+            enabled,
+            force,
+            threshold,
+            min_context_tokens,
+            scope_sessions,
+        }) => {
+            let unchanged = enabled.is_none()
+                && force.is_none()
+                && threshold.is_none()
+                && min_context_tokens.is_none()
+                && scope_sessions.is_none();
+            if !unchanged {
+                app.update_config(|config| {
+                    let limit = &mut config.limit_compact;
+                    if let Some(value) = enabled {
+                        limit.enabled = value.is_on();
+                    }
+                    if let Some(value) = force {
+                        limit.force = value.is_on();
+                    }
+                    if let Some(value) = threshold {
+                        limit.threshold = value;
+                    }
+                    if let Some(value) = min_context_tokens {
+                        limit.min_context_tokens = value;
+                    }
+                    if let Some(value) = scope_sessions {
+                        limit.scope_sessions =
+                            value.into_iter().filter(|id| !id.is_empty()).collect();
+                    }
+                })?;
+            }
+            app.show_limit_state()
+        }
         Some(AccountCommand::Web {
             socket,
             allowed_hosts,
         }) => claude_account_swapper::web::serve(&app, socket, allowed_hosts),
         None => app.interactive(),
+    }
+}
+
+fn run_hook(app: &App) {
+    let mut input = String::new();
+    if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input) {
+        claude_account_swapper::limit::log_hook_failure(&error.into());
+        return;
+    }
+    match app.hook(&input) {
+        Ok(Some(reply)) => println!("{reply}"),
+        Ok(None) => {}
+        Err(error) => claude_account_swapper::limit::log_hook_failure(&error),
     }
 }
 

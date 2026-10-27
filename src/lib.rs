@@ -19,6 +19,8 @@ use wait_timeout::ChildExt;
 
 pub mod config;
 pub mod jobs;
+pub mod limit;
+pub mod t3;
 pub mod usage;
 pub mod web;
 
@@ -2569,6 +2571,9 @@ impl App {
         self.refresh_all_usage(renew, spoken)?;
         if config.auto_switch {
             self.auto_switch_tick(config.threshold, renew)?;
+        }
+        if let Err(error) = self.limit_tick(config, spoken) {
+            log_problem(&format!("Limit-Pause fehlgeschlagen: {error:#}"));
         }
         let jobs = match self.load_jobs() {
             Ok(jobs) => jobs,
