@@ -21,6 +21,7 @@ pub struct Config {
     pub auto_switch: bool,
     /// Ab dieser Auslastung in Prozent gilt ein Fenster als verbraucht.
     pub threshold: f64,
+    pub weekly_pacing: bool,
     pub ping: Ping,
 }
 
@@ -39,6 +40,7 @@ impl Default for Config {
         Self {
             auto_switch: false,
             threshold: DEFAULT_SWITCH_THRESHOLD,
+            weekly_pacing: true,
             ping: Ping::default(),
         }
     }
@@ -83,9 +85,10 @@ impl Config {
     /// sonst stuende dieselbe Zeile jede Minute im Journal.
     pub fn describe(&self) -> String {
         format!(
-            "Auto-Wechsel {} (Schwelle {:.0}%), Fenster-Ping {}",
+            "Auto-Wechsel {} (Schwelle {:.0}%, Wochen-Pacing {}), Fenster-Ping {}",
             if self.auto_switch { "an" } else { "aus" },
             self.threshold,
+            if self.weekly_pacing { "an" } else { "aus" },
             if self.ping.enabled { "an" } else { "aus" }
         )
     }
@@ -128,13 +131,13 @@ mod tests {
         let mut config = Config::default();
         assert_eq!(
             config.describe(),
-            "Auto-Wechsel aus (Schwelle 98%), Fenster-Ping aus"
+            "Auto-Wechsel aus (Schwelle 98%, Wochen-Pacing an), Fenster-Ping aus"
         );
         config.auto_switch = true;
         config.ping.enabled = true;
         assert_eq!(
             config.describe(),
-            "Auto-Wechsel an (Schwelle 98%), Fenster-Ping an"
+            "Auto-Wechsel an (Schwelle 98%, Wochen-Pacing an), Fenster-Ping an"
         );
     }
 }

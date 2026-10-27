@@ -43,10 +43,101 @@ function percent(value) {
   return Number.isFinite(Number(value)) ? `${Math.round(Number(value))}%` : "–";
 }
 
+function durationLabel(milliseconds) {
+  const minutes = Math.max(0, Math.round(milliseconds / 60000));
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const rest = minutes % 60;
+  if (days) return `${days} T. ${hours} Std.`;
+  if (hours) return `${hours} Std. ${rest} Min.`;
+  return `${rest} Min.`;
+}
+
 function resetLabel(value) {
   if (!value) return "Fenster ungenutzt oder zurückgesetzt";
   const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? "Reset-Zeit unbekannt" : `Reset ${date.toLocaleString("de-DE", { dateStyle: "medium", timeStyle: "short" })}`;
+  if (Number.isNaN(date.valueOf())) return "Reset-Zeit unbekannt";
+  const at = date.toLocaleString("de-DE", { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  const remaining = date.valueOf() - Date.now();
+  return remaining > 0 ? `Reset in ${durationLabel(remaining)} · ${at}` : `Zurückgesetzt seit ${at}`;
+}
+
+function weeklyPace(profile, threshold) {
+  const week = profile.usage?.windows?.seven_day;
+  if (!week) return null;
+  const stop = profile.limits?.seven_day ?? threshold;
+  const headroom = Math.max(0, stop - (Number(week.utilization) || 0));
+  const reset = week.resets_at ? new Date(week.resets_at).valueOf() : NaN;
+  const hours = Number.isNaN(reset) ? 168 : Math.max(1, (reset - Date.now()) / 3600000);
+  return { headroom, hours, pace: headroom / hours };
+}
+
+function paceLabel(profile) {
+  const pace = weeklyPace(profile, Number(dashboard?.config?.threshold) || 98);
+  if (!pace) return "";
+  return `Wochenrest ${Math.round(pace.headroom)}% · braucht ${pace.pace.toLocaleString("de-DE", { maximumFractionDigits: 2 })}%/Std. bis zum Reset`;
+}
+
+function renderFlow() {
+  const config = dashboard?.config || {};
+  const service = dashboard?.service || {};
+  const profiles = dashboard?.profiles || [];
+  const running = Boolean(service.active);
+  const auto = Boolean(config.auto_switch);
+  const threshold = Math.round(Number(config.threshold) || 0);
+  const others = profiles.filter((profile) => !profile.active).map((profile) => profile.name);
+  let title;
+  let note;
+  if (!service.installed) {
+    title = "Hintergrunddienst fehlt";
+    note = "Ohne den Dienst bleibt die Auslastung stehen und es wird nicht automatisch gewechselt.";
+  } else if (!running) {
+    title = "Hintergrunddienst ist gestoppt";
+    note = "Auslastung und Reset-Zeiten werden nicht aktualisiert, Logins werden nicht vorbereitet und es gibt keinen Auto-Wechsel.";
+  } else if (!auto) {
+    title = "Auslastung wird jede Minute geladen";
+    note = "Auto-Wechsel ist aus. Bei vollem Limit wird nicht von selbst gewechselt.";
+  } else {
+    title = `Auto-Wechsel aktiv ab ${threshold}%`;
+    const pacing = config.weekly_pacing !== false;
+    const urgent = [...profiles].map((profile) => ({ profile, pace: weeklyPace(profile, threshold) })).filter((entry) => entry.pace).sort((left, right) => right.pace.pace - left.pace.pace)[0];
+    note = !others.length
+      ? "Speichere einen zweiten Account, damit gewechselt werden kann."
+      : pacing
+        ? `Bei ${threshold}% im 5h- oder Wochenfenster wird sofort gewechselt. Dazwischen wird das Wochenkontingent gleichmäßig verbraucht${urgent ? `, gerade bevorzugt: ${urgent.profile.name}` : ""}.`
+        : `Erreicht der aktive Account ${threshold}% oder seine eigene Grenze, wechselt der Dienst zum freiesten Account (${others.join(", ")}).`;
+  }
+  $("#flow-title").textContent = title;
+  $("#flow-note").textContent = note;
+  $("#flow-strip").classList.toggle("is-good", running && auto);
+  $("#flow-strip").classList.toggle("is-warn", !running);
+  $("#flow-enable").hidden = running && auto;
+  $("#flow-enable").disabled = !service.installed;
+  $("#flow-disable").hidden = !auto;
+}
+
+async function enableAutomation() {
+  try {
+    const config = { ...(dashboard?.config || {}), auto_switch: true };
+    await api("api/config", config);
+    const service = dashboard?.service || {};
+    if (!service.enabled) await api("api/service", { action: "enable" });
+    await api("api/service", { action: service.active ? "restart" : "start" });
+    showNotice("Automatik ist eingeschaltet. Die Auslastung wird ab jetzt jede Minute geladen.");
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+  await loadDashboard();
+}
+
+async function disableAutoSwitch() {
+  try {
+    await api("api/config", { ...(dashboard?.config || {}), auto_switch: false });
+    showNotice("Auto-Wechsel ist aus. Die Auslastung wird weiter geladen.");
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+  await loadDashboard();
 }
 
 function timeLabel(unixSeconds) {
@@ -116,6 +207,8 @@ function profileCard(profile) {
   }
   card.append(usageGrid);
 
+  const pace = paceLabel(profile);
+  if (pace) card.append(el("p", "muted pace-line", pace));
   const metadata = el("div", "account-meta");
   metadata.append(el("span", "muted", `Zuletzt gesichert: ${timeLabel(profile.syncedAt || profile.savedAt)}`));
   if (profile.loginFailedAt) metadata.append(el("span", "warning-text", `Login zuletzt fehlgeschlagen: ${timeLabel(profile.loginFailedAt)}`));
@@ -207,6 +300,7 @@ function fillConfig() {
   const config = dashboard?.config;
   if (!config) return;
   $("#auto-switch").checked = Boolean(config.auto_switch);
+  $("#weekly-pacing").checked = config.weekly_pacing !== false;
   $("#threshold").value = config.threshold;
   $("#threshold-value").textContent = `${Math.round(config.threshold)}%`;
   $("#ping-enabled").checked = Boolean(config.ping?.enabled);
@@ -347,7 +441,7 @@ function render() {
   $("#active-heading").textContent = active;
   $("#active-email").textContent = dashboard?.activeEmail || "";
   $("#updated-at").textContent = `Stand ${new Date().toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" })}`;
-  renderAccounts(); fillConfig(); renderService(); renderSessions(); renderJobs(); renderTasks(); renderDeviceLogin(); renderStatus();
+  renderAccounts(); if (!$("#config-form").contains(document.activeElement)) fillConfig(); renderService(); renderFlow(); renderSessions(); renderJobs(); renderTasks(); renderDeviceLogin(); renderStatus();
 }
 
 async function loadDashboard() {
@@ -381,6 +475,8 @@ function selectTab(name) {
 document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => selectTab(tab.dataset.tab)));
 $("#refresh").addEventListener("click", () => { showNotice(""); loadDashboard(); });
 $("#refresh-usage").addEventListener("click", () => run("api/actions/usage", {}));
+$("#flow-enable").addEventListener("click", enableAutomation);
+$("#flow-disable").addEventListener("click", disableAutoSwitch);
 $("#threshold").addEventListener("input", (event) => { $("#threshold-value").textContent = `${event.target.value}%`; });
 
 $("#save-form").addEventListener("submit", async (event) => {
@@ -488,6 +584,7 @@ $("#config-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const config = {
     auto_switch: $("#auto-switch").checked,
+    weekly_pacing: $("#weekly-pacing").checked,
     threshold: Number($("#threshold").value),
     ping: { enabled: $("#ping-enabled").checked, prompt: $("#ping-prompt").value, model: $("#ping-model").value.trim(), timeout_minutes: Number($("#ping-timeout").value) },
   };
@@ -567,10 +664,10 @@ $("#refresh-logs").addEventListener("click", loadAutomationLogs);
 updateLoginCommand();
 loadDashboard();
 function scheduleDashboardRefresh() {
-  const deviceLoginRunning = dashboard?.tasks?.some((task) => task.action === "Login mit Device Code" && task.status === "läuft");
-  window.setTimeout(() => {
-    if (!document.hidden) loadDashboard();
+  const taskRunning = dashboard?.tasks?.some((task) => task.status === "läuft");
+  window.setTimeout(async () => {
+    if (!document.hidden) await loadDashboard();
     scheduleDashboardRefresh();
-  }, deviceLoginRunning ? 2000 : 12000);
+  }, taskRunning ? 1000 : 10000);
 }
 scheduleDashboardRefresh();

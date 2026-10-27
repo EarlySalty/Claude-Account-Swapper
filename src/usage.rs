@@ -119,6 +119,25 @@ impl Candidate {
         }
     }
 
+    fn weekly_headroom(&self, threshold: f64) -> f64 {
+        self.stops.seven_day_or(threshold) - self.usage.seven_day.utilization
+    }
+
+    pub fn weekly_pace(&self, threshold: f64, now: DateTime<Utc>) -> f64 {
+        let hours_left = self
+            .usage
+            .seven_day
+            .resets_at
+            .map(|reset| (reset - now).num_minutes() as f64 / 60.0)
+            .unwrap_or(WEEK_HOURS)
+            .max(PACE_MIN_HOURS);
+        self.weekly_headroom(threshold).max(0.0) / hours_left
+    }
+
+    fn five_hour_headroom(&self, threshold: f64) -> f64 {
+        self.stops.five_hour_or(threshold) - self.usage.five_hour.utilization
+    }
+
     fn describe(&self, threshold: f64) -> String {
         let five_stop = self.stops.five_hour_or(threshold);
         let seven_stop = self.stops.seven_day_or(threshold);
@@ -201,6 +220,20 @@ impl Decision {
 /// Accounts mit echtem Restkontingent, deren Reserve dafuer angebrochen wird, und zuletzt der
 /// Account, der am fruehesten wieder frei ist.
 pub fn pick_target(active: &str, accounts: &[Candidate], threshold: f64) -> Decision {
+    pick_target_with(active, accounts, threshold, None)
+}
+
+const WEEK_HOURS: f64 = 7.0 * 24.0;
+const PACE_MIN_HOURS: f64 = 1.0;
+pub const PACE_SWITCH_RATIO: f64 = 1.15;
+pub const PACE_MIN_FIVE_HOUR_HEADROOM: f64 = 10.0;
+
+pub fn pick_target_with(
+    active: &str,
+    accounts: &[Candidate],
+    threshold: f64,
+    pacing: Option<DateTime<Utc>>,
+) -> Decision {
     let Some(current) = accounts.iter().find(|candidate| candidate.name == active) else {
         return Decision::NoCandidate {
             reason: format!(
@@ -210,6 +243,11 @@ pub fn pick_target(active: &str, accounts: &[Candidate], threshold: f64) -> Deci
     };
 
     if current.within_stops(threshold) {
+        if let Some(now) = pacing
+            && let Some(decision) = pacing_switch(current, accounts, threshold, now)
+        {
+            return decision;
+        }
         return Decision::Stay {
             reason: format!(
                 "`{active}` ist unter seiner Grenze ({})",
@@ -218,7 +256,9 @@ pub fn pick_target(active: &str, accounts: &[Candidate], threshold: f64) -> Deci
         };
     }
 
-    if let Some(target) = best(
+    if let Some(target) = rank(
+        pacing,
+        threshold,
         accounts
             .iter()
             .filter(|candidate| candidate.name != active && candidate.within_stops(threshold)),
@@ -237,7 +277,9 @@ pub fn pick_target(active: &str, accounts: &[Candidate], threshold: f64) -> Deci
     // Kein Account unter seiner eigenen Grenze. Wer noch echtes Kontingent hat, kommt jetzt
     // trotzdem in Frage - seine Reserve wird angebrochen, und genau das steht auch so im Log.
     // Der aktive Account ist hier bewusst dabei: bringt ein Wechsel nichts, bleibt er stehen.
-    if let Some(target) = best(
+    if let Some(target) = rank(
+        pacing,
+        threshold,
         accounts
             .iter()
             .filter(|candidate| candidate.within_global_limit(threshold)),
@@ -302,6 +344,64 @@ pub fn pick_target(active: &str, accounts: &[Candidate], threshold: f64) -> Deci
             unblocked.with_timezone(&chrono::Local).format("%F %H:%M")
         ),
     }
+}
+
+fn pacing_switch(
+    current: &Candidate,
+    accounts: &[Candidate],
+    threshold: f64,
+    now: DateTime<Utc>,
+) -> Option<Decision> {
+    let current_pace = current.weekly_pace(threshold, now);
+    let target = most_urgent(
+        accounts.iter().filter(|candidate| {
+            candidate.name != current.name
+                && candidate.within_stops(threshold)
+                && candidate.five_hour_headroom(threshold) >= PACE_MIN_FIVE_HOUR_HEADROOM
+        }),
+        threshold,
+        now,
+    )?;
+    let target_pace = target.weekly_pace(threshold, now);
+    if target_pace < current_pace * PACE_SWITCH_RATIO || target_pace <= 0.0 {
+        return None;
+    }
+    Some(Decision::SwitchTo {
+        name: target.name.clone(),
+        reason: format!(
+            "Wochenkontingent von `{}` muss schneller verbraucht werden ({:.2}%/h bis zum Reset \
+             statt {:.2}%/h bei `{}`, {})",
+            target.name,
+            target_pace,
+            current_pace,
+            current.name,
+            current.describe(threshold)
+        ),
+    })
+}
+
+fn rank<'a>(
+    pacing: Option<DateTime<Utc>>,
+    threshold: f64,
+    candidates: impl Iterator<Item = &'a Candidate>,
+) -> Option<&'a Candidate> {
+    match pacing {
+        Some(now) => most_urgent(candidates, threshold, now),
+        None => best(candidates),
+    }
+}
+
+fn most_urgent<'a>(
+    candidates: impl Iterator<Item = &'a Candidate>,
+    threshold: f64,
+    now: DateTime<Utc>,
+) -> Option<&'a Candidate> {
+    candidates.max_by(|left, right| {
+        left.weekly_pace(threshold, now)
+            .total_cmp(&right.weekly_pace(threshold, now))
+            .then_with(|| compare_utilization(&right.usage, &left.usage))
+            .then_with(|| right.name.cmp(&left.name))
+    })
 }
 
 /// Der freieste Account einer Auswahl - deterministisch auch bei Gleichstand.
@@ -452,6 +552,67 @@ mod tests {
                 stops: *stops,
             })
             .collect()
+    }
+
+    fn weekly(five: f64, seven: f64, seven_reset: &str) -> Usage {
+        usage_at(five, seven, "2026-08-03T20:00:00Z", seven_reset)
+    }
+
+    fn decide(active: &str, accounts: &[Candidate]) -> Decision {
+        pick_target_with(active, accounts, 98.0, Some(at("2026-08-03T18:00:00Z")))
+    }
+
+    #[test]
+    fn gleichmaessiges_tempo_loest_keinen_wechsel_aus() {
+        let accounts = accounts(&[
+            ("a", weekly(20.0, 42.0, "2026-08-08T01:00:00Z")),
+            ("b", weekly(2.0, 0.0, "2026-08-10T18:00:00Z")),
+        ]);
+        assert!(matches!(decide("a", &accounts), Decision::Stay { .. }));
+        assert!(matches!(decide("b", &accounts), Decision::Stay { .. }));
+    }
+
+    #[test]
+    fn kurz_vor_dem_reset_wird_der_rest_verbraucht() {
+        let decision = decide(
+            "b",
+            &accounts(&[
+                ("a", weekly(0.0, 60.0, "2026-08-05T06:00:00Z")),
+                ("b", weekly(20.0, 30.0, "2026-08-07T22:00:00Z")),
+            ]),
+        );
+        assert!(
+            matches!(&decision, Decision::SwitchTo { name, .. } if name == "a"),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn volles_fuenf_stunden_fenster_blockiert_den_vorzug() {
+        let decision = decide(
+            "b",
+            &accounts(&[
+                ("a", weekly(92.0, 60.0, "2026-08-05T06:00:00Z")),
+                ("b", weekly(20.0, 30.0, "2026-08-07T22:00:00Z")),
+            ]),
+        );
+        assert!(matches!(decision, Decision::Stay { .. }), "{decision:?}");
+    }
+
+    #[test]
+    fn beim_vollen_limit_gewinnt_der_dringendste_wochenrest() {
+        let decision = decide(
+            "a",
+            &accounts(&[
+                ("a", weekly(99.0, 50.0, "2026-08-08T00:00:00Z")),
+                ("b", weekly(5.0, 5.0, "2026-08-10T00:00:00Z")),
+                ("c", weekly(40.0, 70.0, "2026-08-04T12:00:00Z")),
+            ]),
+        );
+        assert!(
+            matches!(&decision, Decision::SwitchTo { name, .. } if name == "c"),
+            "{decision:?}"
+        );
     }
 
     #[test]

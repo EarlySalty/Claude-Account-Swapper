@@ -2388,7 +2388,7 @@ fn auto_asks_no_other_account_while_the_active_one_is_fine() {
 }
 
 /// Der automatische Wechsel greift in laufende Sitzungen ein und ist deshalb opt-in. Ohne das
-/// Flag darf der Dienst die Auslastung nicht einmal abfragen.
+/// Flag laedt der Dienst nur die Anzeige der Auslastung und bewertet keinen Wechsel.
 #[test]
 fn watch_switches_nothing_without_the_opt_in() {
     let harness = harness_with_two_accounts();
@@ -2420,7 +2420,7 @@ fn watch_switches_nothing_without_the_opt_in() {
     );
     assert!(
         !log.contains("Auslastung work"),
-        "ohne Opt-in darf nichts abgefragt werden: {log}"
+        "ohne Opt-in darf kein Wechsel bewertet werden: {log}"
     );
     assert_eq!(
         fs::read(harness.active_credentials()).expect("live"),

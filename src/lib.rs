@@ -45,6 +45,8 @@ const USAGE_CACHE_FRESH_SECONDS: u64 = 45;
 /// Ein Fuenf-Stunden-Fenster bewegt sich in 30 Minuten nicht so weit, dass die Entscheidung
 /// dadurch unbrauchbar wuerde - eine ausgefallene Bewertung dagegen schon.
 const USAGE_CACHE_MAX_AGE_SECONDS: u64 = 30 * 60;
+const PACING_CACHE_MAX_AGE_SECONDS: u64 = 5 * 60;
+const PACING_MIN_DWELL_SECONDS: u64 = 3 * 60 * 60;
 /// Ein haengender Request wuerde den Dienst sonst dauerhaft anhalten.
 const KEEPALIVE_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 /// Restlaufzeit, ab der ein Access-Token vor einem Wechsel als sicher gilt. Darunter muesste
@@ -522,6 +524,7 @@ impl App {
             return Err(error).context("Wechsel wurde zurueckgerollt");
         }
 
+        self.record_switch();
         println!(
             "Gewechselt: {} ({}) -> {} ({})",
             outgoing.name, outgoing.email, target.name, target.email
@@ -1634,15 +1637,24 @@ impl App {
         let Some(active_profile) = profiles.iter().find(|profile| profile.name == active) else {
             bail!("aktives Profil `{active}` wurde nicht gefunden");
         };
+        let pacing = self.load_config().weekly_pacing.then(chrono::Utc::now);
         let mut usages = Vec::new();
         if let Some(candidate) = self.candidate(active_profile, Some(active.as_str())) {
             // Solange der aktive Account unter seiner Grenze liegt, aendert keine weitere Zahl
             // das Ergebnis. Die Abfrage ist selbst ratenbegrenzt; jede vermeidbare Anfrage
             // erhoeht die Wahrscheinlichkeit, im entscheidenden Moment keine Antwort zu haben.
             if candidate.within_stops(threshold) {
-                let decision = usage::pick_target(&active, &[candidate], threshold);
-                log_event(&format!("Kein Wechsel: {}", decision.reason()));
-                return Ok(decision);
+                let mut known = vec![candidate];
+                if pacing.is_some() && self.proactive_switch_allowed() {
+                    known.extend(
+                        profiles
+                            .iter()
+                            .filter(|profile| profile.name != active)
+                            .filter_map(|profile| self.cached_candidate(profile)),
+                    );
+                }
+                let decision = usage::pick_target_with(&active, &known, threshold, pacing);
+                return self.apply_decision(decision, dry_run);
             }
             usages.push(candidate);
         }
@@ -1652,7 +1664,11 @@ impl App {
             }
         }
 
-        let decision = usage::pick_target(&active, &usages, threshold);
+        let decision = usage::pick_target_with(&active, &usages, threshold, pacing);
+        self.apply_decision(decision, dry_run)
+    }
+
+    fn apply_decision(&self, decision: Decision, dry_run: bool) -> Result<Decision> {
         match &decision {
             Decision::Stay { reason } => log_event(&format!("Kein Wechsel: {reason}")),
             Decision::NoCandidate { reason } => log_problem(&format!("Kein Wechsel: {reason}")),
@@ -1665,6 +1681,43 @@ impl App {
             }
         }
         Ok(decision)
+    }
+
+    fn last_switch_path(&self) -> PathBuf {
+        self.paths.store.join("last-switch")
+    }
+
+    fn record_switch(&self) {
+        let written = unix_timestamp().and_then(|now| {
+            atomic_write(&self.last_switch_path(), now.to_string().as_bytes(), 0o600)
+        });
+        if let Err(error) = written {
+            log_problem(&format!(
+                "Wechselzeitpunkt konnte nicht gemerkt werden: {error:#}"
+            ));
+        }
+    }
+
+    fn proactive_switch_allowed(&self) -> bool {
+        let Ok(now) = unix_timestamp() else {
+            return false;
+        };
+        fs::read_to_string(self.last_switch_path())
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .is_none_or(|at| now.saturating_sub(at) >= PACING_MIN_DWELL_SECONDS)
+    }
+
+    fn cached_candidate(&self, profile: &Profile) -> Option<Candidate> {
+        let now = unix_timestamp().ok()?;
+        let cached = self.read_cached_usage(&profile.name).filter(|cached| {
+            now.saturating_sub(cached.fetched_at) <= PACING_CACHE_MAX_AGE_SECONDS
+        })?;
+        Some(Candidate {
+            name: profile.name.clone(),
+            usage: cached.usage,
+            stops: profile.limits,
+        })
     }
 
     /// Baut den Bewertungskandidaten zu einem Profil und protokolliert dabei, worauf die
@@ -2378,6 +2431,7 @@ impl App {
     /// Entscheidung, auch jedes "noch nicht" - aber erst wieder, wenn sie sich aendert. Sonst
     /// stuende dieselbe Zeile jede Minute im Journal, und niemand laese sie mehr.
     fn automation_tick(&self, config: &Config, spoken: &mut HashMap<String, String>) -> Result<()> {
+        self.refresh_all_usage(spoken)?;
         if config.auto_switch {
             self.auto_switch_tick(config.threshold)?;
         }
@@ -2467,6 +2521,24 @@ impl App {
     }
 
     /// Die Auslastung des aktiven Accounts; ein junger gemerkter Stand genuegt hier.
+    fn refresh_all_usage(&self, spoken: &mut HashMap<String, String>) -> Result<()> {
+        let active = self.active_profile_name().ok();
+        for profile in self.load_profiles()? {
+            let key = format!("usage-{}", profile.name);
+            match self.profile_usage_cached(&profile, active.as_deref()) {
+                Ok(_) => {
+                    spoken.remove(&key);
+                }
+                Err(error) => log_once(
+                    spoken,
+                    &key,
+                    &format!("Auslastung von {} nicht abrufbar: {error:#}", profile.name),
+                ),
+            }
+        }
+        Ok(())
+    }
+
     fn active_usage(&self) -> Result<Usage> {
         let active = self.active_profile_name()?;
         let profile = self.load_profile(&active)?;

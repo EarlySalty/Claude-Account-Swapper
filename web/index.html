@@ -34,6 +34,10 @@
       </nav>
 
       <section class="view active" id="view-accounts" aria-labelledby="accounts-title">
+        <section class="panel flow-strip" id="flow-strip" aria-live="polite">
+          <div><p class="eyebrow">Automatik</p><h3 id="flow-title">Wird geladen …</h3><p class="muted" id="flow-note"></p></div>
+          <div class="flow-actions"><button class="button" id="flow-enable" type="button" hidden>Automatik einschalten</button><button class="button button-quiet" id="flow-disable" type="button" hidden>Auto-Wechsel ausschalten</button></div>
+        </section>
         <section class="panel quick-switch" aria-labelledby="quick-switch-title">
           <div><p class="eyebrow">Direktwechsel</p><h3 id="quick-switch-title">Account wechseln</h3><p class="muted">Account auswählen und sofort wechseln. Der gespeicherte Login wird vorher geprüft.</p></div>
           <div class="quick-switch-controls"><label class="visually-hidden" for="quick-switch-target">Zielaccount</label><select id="quick-switch-target" aria-label="Zielaccount"><option value="">Account auswählen …</option></select><button class="button" id="quick-switch-button" type="button" disabled>Accounts werden geladen …</button></div>
@@ -89,6 +93,7 @@
             <div class="panel-heading"><div><p class="eyebrow">Regeln</p><h3>Automatische Aktionen</h3></div></div>
             <form id="config-form" class="stack-form">
               <label class="toggle-row"><span><strong>Bei vollem Limit zum freien Account wechseln</strong><small>Der Hintergrunddienst prüft die Account-Auslastung regelmäßig.</small></span><input id="auto-switch" type="checkbox"></label>
+              <label class="toggle-row"><span><strong>Wochenkontingent gleichmäßig verbrauchen</strong><small>Bevorzugt den Account, dessen Wochenrest bis zum Reset schneller verbraucht werden muss. Höchstens alle 3 Stunden ein vorausschauender Wechsel.</small></span><input id="weekly-pacing" type="checkbox"></label>
               <label class="field-label" for="threshold">Globale Wechselgrenze <span class="range-value" id="threshold-value">98%</span></label>
               <input id="threshold" type="range" min="50" max="100" step="1">
               <label class="toggle-row"><span><strong>Fünf-Stunden-Fenster nach Reset starten</strong><small>Sendet einen kurzen Ping, wenn das Fenster ungenutzt ist.</small></span><input id="ping-enabled" type="checkbox"></label>
