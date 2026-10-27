@@ -275,15 +275,22 @@ function limitRowInUse(row) {
 function renderLimits(profiles) {
   const host = $("#limits-list");
   const existing = new Map([...host.querySelectorAll("form.limit-row")].map((row) => [row.dataset.name, row]));
-  host.replaceChildren();
   if (!profiles.length) {
-    host.append(el("p", "muted", "Speichere zuerst einen Account."));
+    host.replaceChildren(el("p", "muted", "Speichere zuerst einen Account."));
     return;
   }
-  for (const profile of profiles) {
+  syncChildren(host, profiles.map((profile) => {
     const current = existing.get(profile.name);
-    host.append(limitRowInUse(current) ? current : limitRow(profile));
-  }
+    return limitRowInUse(current) ? current : limitRow(profile);
+  }));
+}
+
+function syncChildren(host, nodes) {
+  const keep = new Set(nodes);
+  for (const child of [...host.children]) if (!keep.has(child)) child.remove();
+  nodes.forEach((node, index) => {
+    if (host.children[index] !== node) host.insertBefore(node, host.children[index] || null);
+  });
 }
 
 function limitRow(profile) {
@@ -450,7 +457,7 @@ function renderDeviceLogin() {
     updateDeviceLoginSection(section, task);
     return section;
   });
-  host.replaceChildren(...sections);
+  syncChildren(host, sections);
   host.hidden = !sections.length;
 }
 
