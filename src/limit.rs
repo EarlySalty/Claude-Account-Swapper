@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -13,24 +13,30 @@ use serde_json::{Value, json};
 use crate::config::{Config, LimitCompact};
 use crate::jobs::JobKind;
 use crate::t3::{self, ThreadSummary};
+use crate::usage::Usage;
 use crate::{App, JobOptions, log_event, log_once, log_problem, unix_timestamp};
 
 const STATE_FILE: &str = "limit-compact.json";
 const LOCK_FILE: &str = ".limit-compact.lock";
+const TICK_LOCK_FILE: &str = ".limit-tick.lock";
 const TOKEN_FILE: &str = "t3-bearer";
 const COMPACT_COMMAND: &str = "/compact";
 const MAPPING_SLACK_SECONDS: i64 = 10 * 60;
-const MAX_PROJECTIONS_PER_TICK: usize = 60;
 const USER_MESSAGE_SLACK_SECONDS: i64 = 5;
 const TRANSCRIPT_SLACK_SECONDS: u64 = 120;
 const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+const TRANSCRIPT_HEAD_BYTES: u64 = 64 * 1024;
+const RESUME_GRACE_SECONDS: u64 = 30 * 60;
 const TODO_FILE: &str = "TODO.md";
+const T3_ENTRYPOINT: &str = "sdk-ts";
+const ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LimitState {
     pub active: bool,
     pub since: Option<u64>,
+    pub released_at: Option<u64>,
     pub reason: String,
     pub scope: Vec<String>,
     pub sessions: BTreeMap<String, Parked>,
@@ -46,8 +52,9 @@ pub struct Parked {
     pub cwd: Option<PathBuf>,
     pub transcript: Option<PathBuf>,
     pub stopped_at: Option<u64>,
-    pub todo: Option<PathBuf>,
     pub thread_id: Option<String>,
+    pub entrypoint: Option<String>,
+    pub continued_by_user: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -59,12 +66,20 @@ struct HookInput {
     transcript_path: Option<PathBuf>,
     stop_hook_active: bool,
     agent_id: Option<String>,
+    #[serde(skip)]
+    entrypoint: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
 enum Outcome {
     Pending,
     Done(String),
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct Verdict {
+    at_limit: bool,
+    released: bool,
 }
 
 pub fn wrap_up_message(reason: &str) -> String {
@@ -77,8 +92,8 @@ pub fn wrap_up_message(reason: &str) -> String {
     )
 }
 
-pub fn resume_message(parked: &Parked) -> String {
-    let pointer = match (&parked.todo, &parked.cwd) {
+pub fn resume_message(parked: &Parked, todo: Option<&Path>) -> String {
+    let pointer = match (todo, &parked.cwd) {
         (Some(todo), _) => format!("Read {} first", todo.display()),
         (None, Some(cwd)) => format!(
             "Read the TODO.md you wrote under .tasks/ (working directory {}) first",
@@ -102,19 +117,33 @@ pub fn find_todo_path(text: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn last_assistant_text(transcript: &Path) -> Option<String> {
-    let mut file = fs::File::open(transcript).ok()?;
+fn read_range(path: &Path, from_end: bool, bytes: u64) -> Option<String> {
+    let mut file = File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(
-        length.saturating_sub(TRANSCRIPT_TAIL_BYTES),
-    ))
-    .ok()?;
-    let mut tail = Vec::new();
-    file.read_to_end(&mut tail).ok()?;
-    let tail = String::from_utf8_lossy(&tail);
+    let start = if from_end {
+        length.saturating_sub(bytes)
+    } else {
+        0
+    };
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buffer = Vec::new();
+    file.take(bytes).read_to_end(&mut buffer).ok()?;
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn entry_time(value: &Value) -> Option<u64> {
+    let stamp = value.get("timestamp").and_then(Value::as_str)?;
+    let time = DateTime::parse_from_rfc3339(stamp).ok()?;
+    u64::try_from(time.timestamp()).ok()
+}
+
+fn assistant_text_since(tail: &str, since: u64) -> Option<String> {
     tail.lines().rev().find_map(|line| {
         let value: Value = serde_json::from_str(line).ok()?;
         if value.get("type").and_then(Value::as_str) != Some("assistant") {
+            return None;
+        }
+        if entry_time(&value).is_none_or(|time| time < since) {
             return None;
         }
         let text: String = value
@@ -128,22 +157,50 @@ fn last_assistant_text(transcript: &Path) -> Option<String> {
     })
 }
 
-fn todo_from_transcript(transcript: Option<&Path>) -> Option<PathBuf> {
-    transcript
-        .and_then(last_assistant_text)
-        .and_then(|text| find_todo_path(&text))
+fn todo_after(parked: &Parked) -> Option<PathBuf> {
+    let tail = read_range(parked.transcript.as_deref()?, true, TRANSCRIPT_TAIL_BYTES)?;
+    find_todo_path(&assistant_text_since(&tail, parked.told_at)?)
 }
 
-fn with_todo(parked: &Parked) -> Parked {
-    let mut parked = parked.clone();
-    if parked.todo.is_none() {
-        parked.todo = todo_from_transcript(parked.transcript.as_deref());
-    }
-    parked
+fn entrypoint_from_transcript(transcript: &Path) -> Option<String> {
+    let head = read_range(transcript, false, TRANSCRIPT_HEAD_BYTES)?;
+    head.lines().find_map(|line| {
+        let value: Value = serde_json::from_str(line).ok()?;
+        value
+            .get("entrypoint")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn runs_in_t3(parked: &Parked) -> bool {
+    let entrypoint = parked.entrypoint.clone().or_else(|| {
+        parked
+            .transcript
+            .as_deref()
+            .and_then(entrypoint_from_transcript)
+    });
+    entrypoint.as_deref() == Some(T3_ENTRYPOINT)
 }
 
 fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Value> {
-    if !state.active || input.session_id.is_empty() || input.agent_id.is_some() {
+    if input.session_id.is_empty() || input.agent_id.is_some() {
+        return None;
+    }
+    if input.hook_event_name == "Stop"
+        && state
+            .compacting_sessions
+            .remove(&input.session_id)
+            .is_some()
+    {
+        return None;
+    }
+    if !state.active {
+        if input.hook_event_name == "Stop"
+            && let Some(parked) = state.sessions.get_mut(&input.session_id)
+        {
+            parked.stopped_at.get_or_insert(now);
+        }
         return None;
     }
     if !state.scope.is_empty() && !state.scope.contains(&input.session_id) {
@@ -165,27 +222,19 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
                 }
             }))
         }
-        "Stop" => {
-            if state.compacting_sessions.contains_key(&input.session_id) {
-                return None;
+        "Stop" => match state.sessions.get_mut(&input.session_id) {
+            Some(parked) => {
+                parked.stopped_at.get_or_insert(now);
+                None
             }
-            match state.sessions.get_mut(&input.session_id) {
-                Some(parked) => {
-                    parked.stopped_at = Some(now);
-                    if let Some(todo) = todo_from_transcript(input.transcript_path.as_deref()) {
-                        parked.todo = Some(todo);
-                    }
-                    None
-                }
-                None if input.stop_hook_active => None,
-                None => {
-                    state
-                        .sessions
-                        .insert(input.session_id.clone(), parked_from(input, now));
-                    Some(json!({ "decision": "block", "reason": message }))
-                }
+            None if input.stop_hook_active => None,
+            None => {
+                state
+                    .sessions
+                    .insert(input.session_id.clone(), parked_from(input, now));
+                Some(json!({ "decision": "block", "reason": message }))
             }
-        }
+        },
         _ => None,
     }
 }
@@ -195,6 +244,7 @@ fn parked_from(input: &HookInput, now: u64) -> Parked {
         told_at: now,
         cwd: input.cwd.clone(),
         transcript: input.transcript_path.clone(),
+        entrypoint: input.entrypoint.clone(),
         ..Parked::default()
     }
 }
@@ -236,6 +286,53 @@ fn user_continued(thread: &ThreadSummary, since: u64) -> bool {
     })
 }
 
+fn usable(usage: &Usage, limit: &LimitCompact, switch_threshold: f64) -> bool {
+    usage.five_hour.utilization < limit.resume_below
+        && usage.seven_day.utilization < switch_threshold
+}
+
+fn verdict(
+    config: &Config,
+    levels: &[(String, Option<Usage>)],
+    active_profile: Option<&str>,
+) -> Verdict {
+    let limit = &config.limit_compact;
+    let all_at_limit = !levels.is_empty()
+        && levels.iter().all(|(_, usage)| {
+            usage
+                .as_ref()
+                .is_some_and(|usage| usage.five_hour.utilization >= limit.threshold)
+        });
+    let free = |name: &String, usage: &Option<Usage>| {
+        let candidate = config.auto_switch || active_profile == Some(name.as_str());
+        candidate
+            && usage
+                .as_ref()
+                .is_some_and(|usage| usable(usage, limit, config.threshold))
+    };
+    let any_free = levels.iter().any(|(name, usage)| free(name, usage));
+    Verdict {
+        at_limit: limit.enabled && (limit.force || all_at_limit),
+        released: !limit.enabled || (!limit.force && any_free),
+    }
+}
+
+fn mtime_seconds(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
+}
+
+fn grace_over(state: &LimitState, now: u64) -> bool {
+    state
+        .released_at
+        .is_none_or(|released| now.saturating_sub(released) >= RESUME_GRACE_SECONDS)
+}
+
 impl App {
     fn limit_state_path(&self) -> PathBuf {
         self.paths.store.join(STATE_FILE)
@@ -248,16 +345,20 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn update_limit_state<T>(&self, change: impl FnOnce(&mut LimitState) -> T) -> Result<T> {
+    fn open_lock(&self, name: &str) -> Result<File> {
         self.ensure_store()?;
-        let lock = OpenOptions::new()
+        OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .open(self.paths.store.join(LOCK_FILE))
-            .context("Limit-Lock nicht zu oeffnen")?;
+            .open(self.paths.store.join(name))
+            .with_context(|| format!("{name} nicht zu oeffnen"))
+    }
+
+    fn update_limit_state<T>(&self, change: impl FnOnce(&mut LimitState) -> T) -> Result<T> {
+        let lock = self.open_lock(LOCK_FILE)?;
         FileExt::lock_exclusive(&lock).context("Limit-Lock nicht zu setzen")?;
         let mut state = self.load_limit_state();
         let before = state.clone();
@@ -270,10 +371,13 @@ impl App {
     }
 
     pub fn hook(&self, input: &str) -> Result<Option<String>> {
-        if !self.load_limit_state().active {
+        let state = self.load_limit_state();
+        if !state.active && state.sessions.is_empty() && state.compacting_sessions.is_empty() {
             return Ok(None);
         }
-        let input: HookInput = serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
+        let mut input: HookInput =
+            serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
+        input.entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
         let now = unix_timestamp()?;
         let reply = self.update_limit_state(|state| hook_reply(&input, state, now))?;
         Ok(reply.map(|value| value.to_string()))
@@ -290,23 +394,21 @@ impl App {
         )
     }
 
-    fn five_hour_levels(&self) -> Result<Option<Vec<f64>>> {
+    fn cached_levels(&self) -> Result<Vec<(String, Option<Usage>)>> {
         let now = unix_timestamp()?;
-        let profiles = self.load_profiles()?;
-        if profiles.is_empty() {
-            return Ok(None);
-        }
-        let levels: Option<Vec<f64>> = profiles
-            .iter()
+        Ok(self
+            .load_profiles()?
+            .into_iter()
             .map(|profile| {
-                self.read_cached_usage(&profile.name)
+                let usage = self
+                    .read_cached_usage(&profile.name)
                     .filter(|cached| {
                         now.saturating_sub(cached.fetched_at) <= crate::USAGE_CACHE_MAX_AGE_SECONDS
                     })
-                    .map(|cached| cached.usage.five_hour.utilization)
+                    .map(|cached| cached.usage);
+                (profile.name, usage)
             })
-            .collect();
-        Ok(levels)
+            .collect())
     }
 
     pub(crate) fn limit_tick(
@@ -314,60 +416,87 @@ impl App {
         config: &Config,
         spoken: &mut HashMap<String, String>,
     ) -> Result<()> {
-        let limit = &config.limit_compact;
-        let levels = self.five_hour_levels()?;
-        let all_at_limit = levels
-            .as_ref()
-            .is_some_and(|levels| levels.iter().all(|level| *level >= limit.threshold));
-        let any_free = levels
-            .as_ref()
-            .is_some_and(|levels| levels.iter().any(|level| *level < limit.resume_below));
-        let at_limit = limit.enabled && (limit.force || all_at_limit);
-        let released = !limit.enabled || (!limit.force && any_free);
-        let state = self.load_limit_state();
-
-        if at_limit && !state.active {
-            let reason = if limit.force {
-                "forced test mode of the account switcher".to_owned()
-            } else {
-                format!(
-                    "every saved Claude account is at or above {:.0}% of its 5-hour window",
-                    limit.threshold
-                )
-            };
-            let now = unix_timestamp()?;
-            self.update_limit_state(|state| {
-                state.active = true;
-                state.since = Some(now);
-                state.reason = reason.clone();
-                state.scope = limit.scope_sessions.clone();
-            })?;
-            log_event(&format!("Limit-Pause beginnt: {reason}"));
-        }
-        let state = self.load_limit_state();
-        if !state.active {
+        let tick_lock = self.open_lock(TICK_LOCK_FILE)?;
+        if FileExt::try_lock_exclusive(&tick_lock).is_err() {
             return Ok(());
         }
-        if at_limit {
-            if let Err(error) = self.compact_pass(limit, &state) {
-                log_once(
+        let limit = &config.limit_compact;
+        let levels = self.cached_levels()?;
+        let active_profile = self.active_profile_name_memoized(None);
+        let verdict = verdict(config, &levels, active_profile.as_deref());
+        let now = unix_timestamp()?;
+        self.enter_or_release(limit, &verdict, now)?;
+
+        let state = self.load_limit_state();
+        if state.active {
+            if verdict.at_limit {
+                let result = self.compact_pass(limit, &state);
+                report(
                     spoken,
                     "limit-compact",
-                    &format!("Kompaktieren fehlgeschlagen: {error:#}"),
+                    "Kompaktieren fehlgeschlagen",
+                    result,
                 );
-            } else {
-                spoken.remove("limit-compact");
             }
-        } else if released {
-            if let Err(error) = self.resume_pass(limit, &state) {
-                log_once(
-                    spoken,
-                    "limit-resume",
-                    &format!("Fortsetzen fehlgeschlagen: {error:#}"),
-                );
-            } else {
-                spoken.remove("limit-resume");
+            return Ok(());
+        }
+        if state.sessions.is_empty() {
+            if state != LimitState::default() {
+                self.update_limit_state(|state| *state = LimitState::default())?;
             }
+            return Ok(());
+        }
+        if !limit.enabled {
+            self.drop_parked("nicht fortgesetzt: Limit-Pause wurde abgeschaltet")?;
+        } else if verdict.released {
+            let result = self.resume_pass(limit, spoken, now);
+            report(spoken, "limit-resume", "Fortsetzen fehlgeschlagen", result);
+        }
+        Ok(())
+    }
+
+    fn enter_or_release(&self, limit: &LimitCompact, verdict: &Verdict, now: u64) -> Result<()> {
+        let reason = if limit.force {
+            "forced test mode of the account switcher".to_owned()
+        } else {
+            format!(
+                "every saved Claude account is at or above {:.0}% of its 5-hour window",
+                limit.threshold
+            )
+        };
+        let change = self.update_limit_state(|state| {
+            if verdict.at_limit && !state.active {
+                state.active = true;
+                state.since = Some(now);
+                state.released_at = None;
+                state.reason = reason.clone();
+                state.scope = limit.scope_sessions.clone();
+                Some(format!("Limit-Pause beginnt: {reason}"))
+            } else if verdict.released && state.active {
+                state.active = false;
+                state.released_at = Some(now);
+                Some(format!(
+                    "Limit-Pause aufgehoben, {} angehaltene Sitzung(en) werden fortgesetzt",
+                    state.sessions.len()
+                ))
+            } else {
+                None
+            }
+        })?;
+        if let Some(line) = change {
+            log_event(&line);
+        }
+        Ok(())
+    }
+
+    fn drop_parked(&self, why: &str) -> Result<()> {
+        let dropped = self.update_limit_state(|state| {
+            let sessions: Vec<String> = state.sessions.keys().cloned().collect();
+            *state = LimitState::default();
+            sessions
+        })?;
+        for session in dropped {
+            log_event(&format!("Limit-Pause: Sitzung {session} {why}"));
         }
         Ok(())
     }
@@ -381,7 +510,7 @@ impl App {
         let unmapped: Vec<(&String, &Parked)> = state
             .sessions
             .iter()
-            .filter(|(_, parked)| parked.thread_id.is_none())
+            .filter(|(_, parked)| parked.thread_id.is_none() && runs_in_t3(parked))
             .collect();
         let Some(earliest) = unmapped.iter().map(|(_, parked)| parked.told_at).min() else {
             return Ok(BTreeMap::new());
@@ -399,7 +528,7 @@ impl App {
             .collect();
         recent.sort_by_key(|thread| std::cmp::Reverse(thread.updated_at));
         let mut found = BTreeMap::new();
-        for thread in recent.into_iter().take(MAX_PROJECTIONS_PER_TICK) {
+        for thread in recent {
             let detail = rpc.thread_detail(&thread.id)?;
             for (session, _) in &unmapped {
                 if detail.native_session_ids.iter().any(|id| id == *session) {
@@ -438,7 +567,7 @@ impl App {
         let unmapped = state
             .sessions
             .values()
-            .any(|parked| parked.thread_id.is_none());
+            .any(|parked| parked.thread_id.is_none() && runs_in_t3(parked));
         if candidates.is_empty() && !unmapped {
             return Ok(());
         }
@@ -453,6 +582,7 @@ impl App {
                 .last_run_completed_at
                 .map(|time| time.to_rfc3339())
                 .unwrap_or_default();
+            self.note_manual_continuation(thread, &detail)?;
             let in_scope = limit.scope_sessions.is_empty()
                 || detail
                     .native_session_ids
@@ -482,42 +612,79 @@ impl App {
         Ok(())
     }
 
-    fn resume_pass(&self, limit: &LimitCompact, state: &LimitState) -> Result<()> {
-        let outcomes: Vec<(String, Outcome)> = if state.sessions.is_empty() {
-            Vec::new()
-        } else {
-            let client = self.t3_client(limit);
-            let threads = client.claude_threads()?;
-            let mut rpc = client.connect()?;
-            let found = self.map_sessions(&mut rpc, &threads, state)?;
-            let mut outcomes = Vec::new();
-            for (session, parked) in &state.sessions {
-                let thread_id = parked
-                    .thread_id
-                    .clone()
-                    .or_else(|| found.get(session).cloned());
-                let outcome = match thread_id {
-                    Some(thread_id) => {
-                        self.resume_thread(&mut rpc, &threads, &thread_id, parked, state)?
+    fn note_manual_continuation(
+        &self,
+        thread: &ThreadSummary,
+        detail: &t3::ThreadDetail,
+    ) -> Result<()> {
+        self.update_limit_state(|state| {
+            for session in &detail.native_session_ids {
+                if let Some(parked) = state.sessions.get_mut(session) {
+                    parked.thread_id.get_or_insert_with(|| thread.id.clone());
+                    if user_continued(thread, parked.told_at) {
+                        parked.continued_by_user = true;
                     }
-                    None => self.resume_without_thread(session, parked)?,
-                };
-                outcomes.push((session.clone(), outcome));
+                }
             }
-            outcomes
+        })
+    }
+
+    fn resume_pass(
+        &self,
+        limit: &LimitCompact,
+        spoken: &mut HashMap<String, String>,
+        now: u64,
+    ) -> Result<()> {
+        let client = self.t3_client(limit);
+        let mut t3 = match client.claude_threads() {
+            Ok(threads) => client.connect().map(|rpc| (threads, rpc)),
+            Err(error) => Err(error),
         };
-        let mut done = Vec::new();
-        for (session, outcome) in outcomes {
-            if let Outcome::Done(what) = outcome {
-                log_event(&format!("Limit-Pause: Sitzung {session} {what}"));
-                done.push(session);
+        let problem = match t3.as_mut() {
+            Ok((threads, rpc)) => {
+                let state = self.load_limit_state();
+                self.map_sessions(rpc, threads, &state)
+                    .err()
+                    .map(|error| format!("Zuordnung zu T3-Threads fehlgeschlagen: {error:#}"))
+            }
+            Err(error) => Some(format!("T3 nicht erreichbar: {error:#}")),
+        };
+        let mapped = problem.is_none();
+        let state = self.load_limit_state();
+        for (session, parked) in &state.sessions {
+            let outcome = match (&parked.thread_id, t3.as_mut()) {
+                _ if parked.continued_by_user => {
+                    Ok(Outcome::Done("wurde schon von Hand fortgesetzt".to_owned()))
+                }
+                (Some(thread_id), Ok((threads, rpc))) => {
+                    self.resume_thread(rpc, threads, thread_id, parked, &state)
+                }
+                (Some(_), Err(_)) => Ok(Outcome::Pending),
+                (None, _) if runs_in_t3(parked) => Ok(match mapped && grace_over(&state, now) {
+                    true => Outcome::Done(
+                        "nicht fortgesetzt: kein passender T3-Thread gefunden".to_owned(),
+                    ),
+                    false => Outcome::Pending,
+                }),
+                (None, _) => self.resume_without_thread(session, parked, &state, now),
+            };
+            let key = format!("limit-resume-{session}");
+            match outcome {
+                Ok(Outcome::Done(what)) => {
+                    self.update_limit_state(|state| state.sessions.remove(session))?;
+                    spoken.remove(&key);
+                    log_event(&format!("Limit-Pause: Sitzung {session} {what}"));
+                }
+                Ok(Outcome::Pending) => {}
+                Err(error) => log_once(
+                    spoken,
+                    &key,
+                    &format!("Limit-Pause: Sitzung {session} nicht fortgesetzt: {error:#}"),
+                ),
             }
         }
         let finished = self.update_limit_state(|state| {
-            for session in &done {
-                state.sessions.remove(session);
-            }
-            if state.sessions.is_empty() {
+            if !state.active && state.sessions.is_empty() {
                 *state = LimitState::default();
                 true
             } else {
@@ -527,7 +694,10 @@ impl App {
         if finished {
             log_event("Limit-Pause beendet: alle angehaltenen Sitzungen sind versorgt");
         }
-        Ok(())
+        match problem {
+            Some(problem) => anyhow::bail!("{problem}"),
+            None => Ok(()),
+        }
     }
 
     fn resume_thread(
@@ -557,36 +727,51 @@ impl App {
         if thread.busy {
             return Ok(Outcome::Pending);
         }
-        rpc.send_message(thread_id, &resume_message(&with_todo(parked)))?;
+        rpc.send_message(
+            thread_id,
+            &resume_message(parked, todo_after(parked).as_deref()),
+        )?;
         Ok(Outcome::Done(format!("in Thread {thread_id} fortgesetzt")))
     }
 
-    fn resume_without_thread(&self, session: &str, parked: &Parked) -> Result<Outcome> {
-        let (Some(stopped_at), Some(cwd)) = (parked.stopped_at, parked.cwd.clone()) else {
+    fn resume_without_thread(
+        &self,
+        session: &str,
+        parked: &Parked,
+        state: &LimitState,
+        now: u64,
+    ) -> Result<Outcome> {
+        let Some(stopped_at) = parked.stopped_at else {
+            return Ok(match grace_over(state, now) {
+                true => Outcome::Done("nicht fortgesetzt: Turn-Ende nie gesehen".to_owned()),
+                false => Outcome::Pending,
+            });
+        };
+        let Some(cwd) = parked.cwd.clone() else {
             return Ok(Outcome::Done(
-                "nicht fortgesetzt: kein T3-Thread und kein Turn-Ende gesehen".to_owned(),
+                "nicht fortgesetzt: Arbeitsverzeichnis unbekannt".to_owned(),
             ));
         };
-        let modified = parked
-            .transcript
-            .as_deref()
-            .and_then(|path| fs::metadata(path).ok())
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|elapsed| elapsed.as_secs());
+        let modified = parked.transcript.as_deref().and_then(mtime_seconds);
         if modified.is_some_and(|modified| modified > stopped_at + TRANSCRIPT_SLACK_SECONDS) {
             return Ok(Outcome::Done(
                 "lief nach dem Stopp schon weiter, kein Fortsetzen noetig".to_owned(),
             ));
         }
-        let job = self.add_job(
+        let mut job = self.add_job(
             JobKind::Resume {
                 session_id: session.to_owned(),
-                text: resume_message(&with_todo(parked)),
+                text: resume_message(parked, todo_after(parked).as_deref()),
             },
             cwd,
-            JobOptions::default(),
+            JobOptions {
+                title: Some("Nach der Limit-Pause fortsetzen".to_owned()),
+                skip_permissions: false,
+                ..JobOptions::default()
+            },
         )?;
+        job.last_window = None;
+        self.write_job(&job)?;
         Ok(Outcome::Done(format!(
             "als Aufgabe [{}] eingeplant",
             job.id
@@ -612,11 +797,14 @@ impl App {
             limit.max_compactions
         );
         let state = self.load_limit_state();
-        if !state.active {
-            println!("Zustand: keine Pause aktiv");
-            return Ok(());
+        match (state.active, state.sessions.is_empty()) {
+            (true, _) => println!("Zustand: Pause aktiv ({})", state.reason),
+            (false, false) => println!("Zustand: Pause aufgehoben, Fortsetzen laeuft"),
+            (false, true) => {
+                println!("Zustand: keine Pause aktiv");
+                return Ok(());
+            }
         }
-        println!("Zustand: Pause aktiv ({})", state.reason);
         for (session, parked) in &state.sessions {
             println!(
                 "  Sitzung {session}: Thread {}, {}, TODO {}",
@@ -626,9 +814,7 @@ impl App {
                 } else {
                     "angewiesen"
                 },
-                parked
-                    .todo
-                    .as_deref()
+                todo_after(parked)
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "-".to_owned())
             );
@@ -637,6 +823,15 @@ impl App {
             println!("  kompaktiert: Thread {thread}");
         }
         Ok(())
+    }
+}
+
+fn report(spoken: &mut HashMap<String, String>, key: &str, what: &str, result: Result<()>) {
+    match result {
+        Ok(()) => {
+            spoken.remove(key);
+        }
+        Err(error) => log_once(spoken, key, &format!("{what}: {error:#}")),
     }
 }
 
@@ -726,6 +921,96 @@ mod tests {
             Some(PathBuf::from("/home/x/repo/.tasks/2026-10-27-a/TODO.md"))
         );
         assert_eq!(find_todo_path("see .tasks/x/TODO.md"), None);
+    }
+
+    #[test]
+    fn released_pause_still_records_stops_and_keeps_the_first() {
+        let mut state = active();
+        hook_reply(&input("PostToolUse", "s"), &mut state, 10);
+        state.active = false;
+        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 15).is_none());
+        assert!(hook_reply(&input("Stop", "s"), &mut state, 20).is_none());
+        assert!(hook_reply(&input("Stop", "s"), &mut state, 30).is_none());
+        assert_eq!(state.sessions["s"].stopped_at, Some(20));
+        assert!(hook_reply(&input("Stop", "new"), &mut state, 30).is_none());
+        assert!(!state.sessions.contains_key("new"));
+    }
+
+    #[test]
+    fn compaction_exemption_ends_with_its_stop() {
+        let mut state = active();
+        state.compacting_sessions.insert("s".to_owned(), 1);
+        assert!(hook_reply(&input("Stop", "s"), &mut state, 10).is_none());
+        assert!(state.compacting_sessions.is_empty());
+        assert!(hook_reply(&input("Stop", "s"), &mut state, 11).is_some());
+    }
+
+    fn usage(five_hour: f64, seven_day: f64) -> Usage {
+        let bucket = |utilization| crate::usage::Bucket {
+            utilization,
+            resets_at: None,
+        };
+        Usage {
+            five_hour: bucket(five_hour),
+            seven_day: bucket(seven_day),
+        }
+    }
+
+    fn config(auto_switch: bool) -> Config {
+        Config {
+            auto_switch,
+            threshold: 98.0,
+            limit_compact: LimitCompact {
+                enabled: true,
+                ..LimitCompact::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn verdict_needs_usable_quota_to_release() {
+        let levels = vec![
+            ("a".to_owned(), Some(usage(99.0, 10.0))),
+            ("b".to_owned(), None),
+        ];
+        let partial = verdict(&config(true), &levels, Some("a"));
+        assert!(!partial.at_limit && !partial.released);
+        let levels = vec![
+            ("a".to_owned(), Some(usage(99.0, 10.0))),
+            ("b".to_owned(), Some(usage(10.0, 10.0))),
+        ];
+        assert!(verdict(&config(true), &levels, Some("a")).released);
+        assert!(!verdict(&config(false), &levels, Some("a")).released);
+        assert!(verdict(&config(false), &levels, Some("b")).released);
+        let weekly_full = vec![("a".to_owned(), Some(usage(0.0, 100.0)))];
+        assert!(!verdict(&config(true), &weekly_full, Some("a")).released);
+        let mut off = config(true);
+        off.limit_compact.enabled = false;
+        assert!(verdict(&off, &weekly_full, Some("a")).released);
+    }
+
+    #[test]
+    fn todo_comes_only_from_replies_after_the_instruction() {
+        let line = |time: &str, text: &str| {
+            json!({
+                "type": "assistant",
+                "timestamp": time,
+                "message": {"content": [{"type": "text", "text": text}]}
+            })
+            .to_string()
+        };
+        let tail = [
+            line("2026-10-27T10:00:00Z", "TODO: /old/.tasks/a/TODO.md"),
+            line("2026-10-27T10:10:00Z", "Done reading."),
+        ]
+        .join("\n");
+        let told = 1_793_095_500;
+        assert_eq!(
+            assistant_text_since(&tail, told).and_then(|text| find_todo_path(&text)),
+            None
+        );
+        assert!(assistant_text_since(&tail, told - 1000).is_some());
     }
 
     #[test]

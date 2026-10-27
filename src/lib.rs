@@ -2569,12 +2569,14 @@ impl App {
         spoken: &mut HashMap<String, String>,
     ) -> Result<()> {
         self.refresh_all_usage(renew, spoken)?;
-        if config.auto_switch {
-            self.auto_switch_tick(config.threshold, renew)?;
-        }
+        let switched = match config.auto_switch {
+            true => self.auto_switch_tick(config.threshold, renew),
+            false => Ok(()),
+        };
         if let Err(error) = self.limit_tick(config, spoken) {
             log_problem(&format!("Limit-Pause fehlgeschlagen: {error:#}"));
         }
+        switched?;
         let jobs = match self.load_jobs() {
             Ok(jobs) => jobs,
             Err(error) => {

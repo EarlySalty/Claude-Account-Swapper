@@ -412,7 +412,8 @@ fn dispatch_post(
             Ok(message_response("Account-Grenzen wurden gespeichert."))
         }
         "/api/config" => {
-            let config: Config = read_json(request)?;
+            let mut config: Config = read_json(request)?;
+            config.limit_compact = app.load_config().limit_compact;
             app.write_config(&config).map_err(internal_error)?;
             Ok(message_response(
                 "Automatik-Einstellungen wurden gespeichert.",

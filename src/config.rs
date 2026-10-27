@@ -118,8 +118,8 @@ impl Config {
             "Limit-Schwelle muss zwischen 0 und 100 liegen"
         );
         anyhow::ensure!(
-            (0.0..=limit.threshold).contains(&limit.resume_below),
-            "Fortsetzen-Schwelle muss zwischen 0 und der Limit-Schwelle liegen"
+            limit.resume_below > 0.0 && limit.resume_below <= limit.threshold,
+            "Fortsetzen-Schwelle muss über 0 und höchstens bei der Limit-Schwelle liegen"
         );
         anyhow::ensure!(
             limit.t3_url.starts_with("http://"),
