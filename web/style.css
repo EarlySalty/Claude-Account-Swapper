@@ -1,3 +1,4 @@
+[hidden] { display: none !important; }
 :root {
   color-scheme: light dark;
   --page: #0b0d0f;
@@ -105,6 +106,7 @@ h4 { margin: 0 0 5px; font-size: .96rem; font-weight: 630; }
 .login-mode-picker label { display: flex; align-items: flex-start; gap: 9px; cursor: pointer; }
 .login-mode-picker input[type="radio"] { width: 16px; height: 16px; flex: 0 0 auto; margin-top: 2px; accent-color: var(--accent); }
 .login-mode-picker label span { font-size: .8rem; }
+.login-devices { display: grid; gap: 10px; }
 .login-device { display: grid; gap: 10px; margin-top: 12px; padding: 12px; border: 1px solid var(--line-strong); border-radius: 10px; background: #0d1011; }
 .login-device > .muted { margin: 0; font-size: .78rem; line-height: 1.5; }
 .login-device .command-row { margin: 0; }

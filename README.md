@@ -95,7 +95,7 @@ Ohne Argument öffnet `claude-account` dasselbe Hauptmenü wie der Desktop-Start
 | `claude-account auto` | Wechselt auf den Account mit den meisten freien Kontingenten, wenn das aktive Limit voll ist. `--threshold <prozent>`, Standard 98. `--dry-run` zeigt nur die Entscheidung. |
 | `claude-account limit <name>` | Setzt die eigene Grenze eines Accounts: `--five-hour <prozent>`, `--seven-day <prozent>`. `--hard` verbietet das Anbrechen, `--soft` erlaubt es wieder, `--clear` entfernt die Grenzen. |
 | `claude-account sync` | Sichert von Claude rotierte Tokens einmalig ins aktive Profil. |
-| `claude-account watch` | Macht dasselbe dauerhaft und frischt untaetige Profile auf; laeuft als Hintergrunddienst. `--interval <sekunden>`, Standard 5. `--auto-switch` schaltet den Wechsel bei vollem Limit ein (standardmaessig aus), `--auto-switch-threshold <prozent>` aendert die Schwelle. |
+| `claude-account watch` | Macht dasselbe dauerhaft und frischt untaetige Profile auf; laeuft als Hintergrunddienst. `--interval <sekunden>`, Standard 5. `--auto-switch` schaltet den Wechsel bei vollem Limit einmalig ein, solange noch keine Einstellungsdatei existiert (`--auto-switch-threshold <prozent>` setzt dabei die Schwelle); danach gelten allein die Einstellungen. |
 | `claude-account keepalive` | Benutzt untaetige Profile, damit ihr Login nicht abläuft. `--max-age-days <tage>`, Standard 7. |
 | `claude-account config` | Zeigt die Einstellungen der Automatik. Aendern: `--auto-switch on\|off`, `--ping on\|off`, `--ping-prompt <text>`, `--ping-model <name>`, `--threshold <prozent>`. |
 | `claude-account ping` | Eroeffnet das Fuenf-Stunden-Fenster sofort mit einer kurzen Nachricht. |
@@ -166,7 +166,7 @@ Manuell: `claude-account keepalive`. Abschalten: `watch --no-keepalive`. Ein ber
 
 Anthropic meldet die Auslastung zum Login, nicht zum Geraet. Damit laesst sich auch die Auslastung eines Accounts lesen, der gerade nicht aktiv ist — und genau das macht einen Wechsel moeglich, bevor die Arbeit steht. Die Abfrage verbraucht selbst kein Kontingent.
 
-Der automatische Wechsel ist **standardmaessig aus**: er greift in laufende Sitzungen ein, und das gehoert eingeschaltet, nicht vorausgesetzt. Eingeschaltet wird er mit `claude-account watch --auto-switch` — in der Dienstdatei also die `ExecStart`-Zeile um das Flag ergaenzen und `systemctl --user daemon-reload && systemctl --user restart claude-account-sync`. Auch ohne das Flag laedt der Dienst jede Minute die Auslastung aller Accounts. Das haelt die Anzeige samt Reset-Zeiten aktuell und frischt dabei den Login untaetiger Accounts auf, bevor sein Access-Token ablaeuft; ein spaeterer Wechsel muss ihn dann nicht erst pruefen und geht sofort.
+Der automatische Wechsel ist **standardmaessig aus**: er greift in laufende Sitzungen ein, und das gehoert eingeschaltet, nicht vorausgesetzt. Eingeschaltet wird er in den Einstellungen: `claude-account config --auto-switch on`, im Menue oder im Webpanel. Der Dienst liest die Einstellungen bei jeder Pruefung neu, ein Neustart ist nicht noetig. `watch --auto-switch` schaltet ihn nur ein, solange noch keine Einstellungsdatei existiert; danach gilt allein die Datei. Auch bei ausgeschaltetem Wechsel laedt der Dienst jede Minute die Auslastung aller Accounts. Das haelt die Anzeige samt Reset-Zeiten aktuell und frischt dabei den Login untaetiger Accounts auf, bevor sein Access-Token ablaeuft; ein spaeterer Wechsel muss ihn dann nicht erst pruefen und geht sofort. Mit `watch --no-keepalive` unterbleibt diese Auffrischung: die Auslastung wird dann nur mit noch gueltigem Access-Token geladen.
 
 Ist er eingeschaltet, prueft der Dienst jede Minute. Erreicht das Fuenf-Stunden-Fenster des aktiven Accounts 98 Prozent, wechselt er auf den Account mit der niedrigsten Auslastung. Ein Account, dessen Wochenlimit voll ist, faellt dabei aus, auch wenn sein kurzes Fenster leer ist. Ist kein Account frei, gewinnt der mit dem fruehesten Reset — wobei ein Account erst dann als frei gilt, wenn *alle* seine vollen Fenster zurueckgesetzt sind.
 
@@ -176,7 +176,7 @@ Ist er eingeschaltet, prueft der Dienst jede Minute. Erreicht das Fuenf-Stunden-
 [2026-08-03 18:38:35] Wuerde wechseln zu arbeit: alle Accounts sind voll; `privat` (5h 96%, 7d 37%, Schwelle 90%) wartet laenger als `arbeit` (5h 100%, 7d 76%, Schwelle 90%, frei ab 2026-08-03 21:39)
 ```
 
-Ein Account, dessen Auslastung sich nicht abrufen laesst, wird als Ziel ausgeschlossen und mit Grund gemeldet: ein Wechsel auf gut Glueck kann im naechsten vollen Limit landen. Schwelle aendern: `watch --auto-switch --auto-switch-threshold 95`. Wieder abschalten: das Flag aus der `ExecStart`-Zeile entfernen. Einzeln pruefen: `claude-account usage`, `claude-account auto --dry-run`.
+Ein Account, dessen Auslastung sich nicht abrufen laesst, wird als Ziel ausgeschlossen und mit Grund gemeldet: ein Wechsel auf gut Glueck kann im naechsten vollen Limit landen. Schwelle aendern: `claude-account config --threshold 95`. Wieder abschalten: `claude-account config --auto-switch off`. Einzeln pruefen: `claude-account usage`, `claude-account auto --dry-run`.
 
 #### Wochenkontingent gleichmaessig verbrauchen
 

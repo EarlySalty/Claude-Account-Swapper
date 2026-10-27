@@ -2464,6 +2464,40 @@ fn watch_switches_with_the_opt_in() {
     );
 }
 
+#[test]
+fn watch_auto_switch_flag_does_not_override_saved_settings() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["config", "--auto-switch", "off"]));
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(100.0, 100.0)),
+        ("access-personal", 200, usage_body(0.0, 0.0)),
+    ]);
+
+    let mut child = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["watch", "--interval", "1", "--auto-switch"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(log.contains("Auto-Wechsel aus"), "{log}");
+    assert_eq!(
+        fs::read(harness.active_credentials()).expect("live"),
+        fs::read(harness.saved_credentials("work")).expect("snapshot"),
+        "gespeicherte Einstellungen muessen die Aufrufoption schlagen"
+    );
+}
+
 /// Die Schwelle allein schaltet nichts ein - das waere eine stille Falle.
 #[test]
 fn watch_rejects_a_threshold_without_the_opt_in() {

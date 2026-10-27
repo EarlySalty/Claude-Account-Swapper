@@ -13,12 +13,14 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::config::Config;
 use crate::jobs::JobKind;
+use crate::usage::Stops;
 use crate::{App, JobOptions};
 
 const PRIVATE_PROXY_HEADER: &str = "X-Account-Swapper-Private-Proxy";
 const PRIVATE_PROXY_MARKER: &str = "tailscale-caddy-v50671";
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const TASK_HISTORY: usize = 24;
+const RUNNING: &str = "läuft";
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -230,7 +232,7 @@ fn route(
                     "Die Anfrage stammt nicht von dieser Seite.".into(),
                 ));
             }
-            dispatch_post(request, app, tasks, &path)
+            dispatch_post(request, app, tasks, path)
         }
         _ => Err((StatusCode(404), "Diese Seite wurde nicht gefunden.".into())),
     }
@@ -327,14 +329,16 @@ fn dispatch_post(
         }
         "/api/accounts/limits" => {
             let input: LimitsRequest = read_json(request)?;
-            app.set_limits(
-                &input.name,
-                input.five_hour,
-                input.seven_day,
-                input.hard,
-                input.clear,
-            )
-            .map_err(internal_error)?;
+            let limits = match input.clear {
+                true => Stops::default(),
+                false => Stops {
+                    five_hour: input.five_hour,
+                    seven_day: input.seven_day,
+                    hard: input.hard.unwrap_or_default(),
+                },
+            };
+            app.replace_limits(&input.name, limits)
+                .map_err(internal_error)?;
             Ok(message_response("Account-Grenzen wurden gespeichert."))
         }
         "/api/config" => {
@@ -421,7 +425,6 @@ fn dispatch_post(
                         repeat: input.repeat,
                     },
                 )
-                .map_err(anyhow::Error::from)
                 .map_err(internal_error)?;
             Ok(json_response(
                 StatusCode(201),
@@ -500,20 +503,8 @@ fn start_task(
     action: &str,
     run: impl FnOnce(&App) -> Result<String> + Send + 'static,
 ) -> WebTask {
-    let id = store.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let task = WebTask {
-        id,
-        action: action.into(),
-        status: "läuft".into(),
-        message: String::new(),
-        auth_url: None,
-    };
-    if let Ok(mut tasks) = store.tasks.lock() {
-        tasks.push_back(task.clone());
-        while tasks.len() > TASK_HISTORY {
-            tasks.pop_front();
-        }
-    }
+    let task = register_task(store, action, String::new());
+    let id = task.id;
     let store = Arc::clone(store);
     let app = App::discover();
     thread::spawn(move || {
@@ -540,20 +531,12 @@ fn start_task(
 }
 
 fn start_device_login_task(store: &Arc<TaskStore>, name: String) -> WebTask {
-    let id = store.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let task = WebTask {
-        id,
-        action: "Login mit Device Code".into(),
-        status: "läuft".into(),
-        message: "Claude-Code-Login wird gestartet …".into(),
-        auth_url: None,
-    };
-    if let Ok(mut tasks) = store.tasks.lock() {
-        tasks.push_back(task.clone());
-        while tasks.len() > TASK_HISTORY {
-            tasks.pop_front();
-        }
-    }
+    let task = register_task(
+        store,
+        "Login mit Device Code",
+        "Claude-Code-Login wird gestartet …".into(),
+    );
+    let id = task.id;
 
     let (input_tx, input_rx) = mpsc::channel();
     if let Ok(mut inputs) = store.device_login_inputs.lock() {
@@ -593,6 +576,30 @@ fn start_device_login_task(store: &Arc<TaskStore>, name: String) -> WebTask {
         }
     });
     task
+}
+
+fn register_task(store: &TaskStore, action: &str, message: String) -> WebTask {
+    let task = WebTask {
+        id: store.next_id.fetch_add(1, Ordering::Relaxed) + 1,
+        action: action.into(),
+        status: RUNNING.into(),
+        message,
+        auth_url: None,
+    };
+    if let Ok(mut tasks) = store.tasks.lock() {
+        tasks.push_back(task.clone());
+        prune_finished(&mut tasks);
+    }
+    task
+}
+
+fn prune_finished(tasks: &mut VecDeque<WebTask>) {
+    while tasks.len() > TASK_HISTORY {
+        let Some(index) = tasks.iter().position(|task| task.status != RUNNING) else {
+            return;
+        };
+        tasks.remove(index);
+    }
 }
 
 fn task_snapshot(store: &TaskStore) -> Vec<WebTask> {
@@ -716,4 +723,31 @@ fn add_header(response: &mut Response<std::io::Cursor<Vec<u8>>>, name: &str, val
 
 fn internal_error(error: anyhow::Error) -> (StatusCode, String) {
     (StatusCode(400), format!("{error:#}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: u64, status: &str) -> WebTask {
+        WebTask {
+            id,
+            action: "Login mit Device Code".into(),
+            status: status.into(),
+            message: String::new(),
+            auth_url: None,
+        }
+    }
+
+    #[test]
+    fn pruning_never_drops_a_running_task() {
+        let mut tasks: VecDeque<WebTask> = (0..TASK_HISTORY as u64)
+            .map(|id| task(id, RUNNING))
+            .collect();
+        tasks.push_back(task(99, "fertig"));
+        tasks.push_back(task(100, RUNNING));
+        prune_finished(&mut tasks);
+        assert!(tasks.iter().all(|task| task.status == RUNNING));
+        assert_eq!(tasks.len(), TASK_HISTORY + 1);
+    }
 }

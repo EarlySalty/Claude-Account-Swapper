@@ -68,15 +68,17 @@
             <label for="login-name">Neuer Profilname</label>
             <div class="input-action"><input id="login-name" autocomplete="off" maxlength="64" placeholder="arbeit"><button class="button button-secondary" id="login-start" type="button">Login starten</button></div>
             <div class="command-row" id="login-command-row"><code id="login-command">Profilname eingeben, um den Login-Befehl zu sehen</code><button class="text-button" id="copy-login" type="button">Befehl kopieren</button></div>
-            <section class="login-device" id="login-device" aria-live="polite" hidden>
-              <p class="muted" id="login-device-status"></p>
-              <div class="command-row login-url-row" id="login-url-row" hidden><a id="login-url" target="_blank" rel="noopener noreferrer"></a><button class="text-button" id="copy-login-url" type="button">URL kopieren</button></div>
-              <form class="stack-form" id="login-code-form" hidden>
-                <label for="login-code">Device Code oder Weiterleitungs-URL</label>
-                <input id="login-code" autocomplete="off" placeholder="Device Code oder URL einfügen">
-                <div class="login-device-actions"><button class="button" id="login-code-submit" type="submit">Login abschließen</button><button class="button button-quiet" id="login-cancel" type="button">Abbrechen</button></div>
-              </form>
-            </section>
+            <div id="login-devices" class="login-devices" aria-live="polite" hidden></div>
+            <template id="login-device-template">
+              <section class="login-device">
+                <p class="muted login-device-status"></p>
+                <div class="command-row login-url-row" hidden><a class="login-url" target="_blank" rel="noopener noreferrer"></a><button class="text-button copy-login-url" type="button">URL kopieren</button></div>
+                <form class="stack-form login-code-form" hidden>
+                  <label>Device Code oder Weiterleitungs-URL<input class="login-code" autocomplete="off" placeholder="Device Code oder URL einfügen"></label>
+                  <div class="login-device-actions"><button class="button login-code-submit" type="submit">Login abschließen</button><button class="button button-quiet login-cancel" type="button">Abbrechen</button></div>
+                </form>
+              </section>
+            </template>
           </section>
         </div>
         <section class="panel limits-panel">

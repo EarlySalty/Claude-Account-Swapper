@@ -473,6 +473,7 @@ impl App {
     pub fn switch_checked(&self, name: &str, check: bool) -> Result<()> {
         validate_name(name)?;
         self.ensure_no_auth_override()?;
+        let _renewal = self.lock_renewal(name)?;
         let _lock = self.lock()?;
 
         let target = self.load_profile(name)?;
@@ -757,16 +758,10 @@ impl App {
         if profiles.is_empty() {
             return Ok("Es sind noch keine Accounts gespeichert.".to_owned());
         }
-        let active = self
-            .auth_status()
-            .ok()
-            .filter(|status| status.logged_in)
-            .and_then(|status| self.resolve_active_profile(&status).ok())
-            .map(|profile| profile.name);
         let mut updated = 0;
         let mut failures = Vec::new();
         for profile in &profiles {
-            match self.profile_usage(profile, active.as_deref(), true) {
+            match self.profile_usage(profile, true) {
                 Ok(usage) => {
                     self.write_cached_usage(&profile.name, usage, unix_timestamp()?);
                     updated += 1;
@@ -1354,17 +1349,15 @@ impl App {
             )),
             None => log_event("Auffrischung untaetiger Profile ist abgeschaltet"),
         }
-        match auto_switch_threshold {
-            Some(threshold) => log_event(&format!(
-                "Auslastung wird alle {USAGE_CHECK_INTERVAL_SECONDS}s geprueft; \
-                 ab {threshold:.0}% wird der Account gewechselt (per Aufrufoption erzwungen)"
-            )),
-            None => log_event(&format!(
-                "Auslastung wird alle {USAGE_CHECK_INTERVAL_SECONDS}s geprueft; \
-                 Wechsel, Fenster-Ping und Aufgaben richten sich nach {}",
-                self.config_path().display()
-            )),
+        if let Some(threshold) = auto_switch_threshold {
+            self.seed_auto_switch(threshold)?;
         }
+        log_event(&format!(
+            "Auslastung wird alle {USAGE_CHECK_INTERVAL_SECONDS}s geprueft; \
+             Wechsel, Fenster-Ping und Aufgaben richten sich nach {}",
+            self.config_path().display()
+        ));
+        let renew = keepalive_max_age_days.is_some();
 
         let mut synced_stamp: Option<CredentialStamp> = None;
         let mut last_problem: Option<String> = None;
@@ -1386,19 +1379,13 @@ impl App {
             if SystemTime::now() >= next_usage_check {
                 next_usage_check =
                     SystemTime::now() + Duration::from_secs(USAGE_CHECK_INTERVAL_SECONDS);
-                // Die Einstellungen werden bei jeder Pruefung neu gelesen: eine Aenderung im
-                // Menue soll sofort wirken, ohne dass jemand den Dienst neu startet.
-                let mut config = self.load_config();
-                if let Some(threshold) = auto_switch_threshold {
-                    config.auto_switch = true;
-                    config.threshold = threshold;
-                }
+                let config = self.load_config();
                 log_once(
                     &mut spoken,
                     "config",
                     &format!("Einstellungen: {}", config.describe()),
                 );
-                if let Err(error) = self.automation_tick(&config, &mut spoken) {
+                if let Err(error) = self.automation_tick(&config, renew, &mut spoken) {
                     log_problem(&format!("Limitpruefung fehlgeschlagen: {error:#}"));
                 }
             }
@@ -1431,6 +1418,24 @@ impl App {
             }
             thread::sleep(interval);
         }
+    }
+
+    fn seed_auto_switch(&self, threshold: f64) -> Result<()> {
+        if self.config_path().exists() {
+            log_event(&format!(
+                "--auto-switch wird ignoriert: {} legt den Auto-Wechsel fest",
+                self.config_path().display()
+            ));
+            return Ok(());
+        }
+        let config = Config {
+            auto_switch: true,
+            threshold,
+            ..Config::default()
+        };
+        self.write_config(&config)?;
+        log_event("Auto-Wechsel aus der Aufrufoption in die Einstellungen uebernommen");
+        Ok(())
     }
 
     /// Haelt Profile am Leben, die gerade nicht aktiv sind.
@@ -1551,7 +1556,7 @@ impl App {
                 profile.email,
                 describe_stops(&profile.limits)
             );
-            match self.profile_usage(profile, active.as_deref(), true) {
+            match self.profile_usage(profile, true) {
                 Ok(usage) => {
                     println!(
                         "    5h:  {:>5.1}%  {}",
@@ -1583,27 +1588,44 @@ impl App {
         hard: Option<bool>,
         clear: bool,
     ) -> Result<()> {
+        self.update_limits(name, [five_hour, seven_day], |limits| {
+            if clear {
+                *limits = Stops::default();
+                return;
+            }
+            if let Some(five_hour) = five_hour {
+                limits.five_hour = Some(five_hour);
+            }
+            if let Some(seven_day) = seven_day {
+                limits.seven_day = Some(seven_day);
+            }
+            if let Some(hard) = hard {
+                limits.hard = hard;
+            }
+        })
+    }
+
+    pub fn replace_limits(&self, name: &str, limits: Stops) -> Result<()> {
+        self.update_limits(name, [limits.five_hour, limits.seven_day], |current| {
+            *current = limits;
+        })
+    }
+
+    fn update_limits(
+        &self,
+        name: &str,
+        values: [Option<f64>; 2],
+        change: impl FnOnce(&mut Stops),
+    ) -> Result<()> {
         validate_name(name)?;
-        for value in [five_hour, seven_day].into_iter().flatten() {
+        for value in values.into_iter().flatten() {
             if !(0.0..=100.0).contains(&value) {
                 bail!("Grenzen muessen zwischen 0 und 100 liegen");
             }
         }
         let _lock = self.lock()?;
         let mut profile = self.load_profile(name)?;
-        if clear {
-            profile.limits = Stops::default();
-        } else {
-            if let Some(five_hour) = five_hour {
-                profile.limits.five_hour = Some(five_hour);
-            }
-            if let Some(seven_day) = seven_day {
-                profile.limits.seven_day = Some(seven_day);
-            }
-            if let Some(hard) = hard {
-                profile.limits.hard = hard;
-            }
-        }
+        change(&mut profile.limits);
         self.write_profile(&profile)?;
         match profile.limits.is_set() {
             true => println!(
@@ -1624,6 +1646,10 @@ impl App {
     /// `dry_run` entscheidet nur ueber die Ausfuehrung, nicht ueber die Auskunft: die
     /// Entscheidung samt Zahlen wird in jedem Fall protokolliert.
     pub fn auto_switch(&self, threshold: f64, dry_run: bool) -> Result<Decision> {
+        self.auto_switch_with(threshold, dry_run, true)
+    }
+
+    fn auto_switch_with(&self, threshold: f64, dry_run: bool, renew: bool) -> Result<Decision> {
         self.ensure_no_auth_override()?;
         if !(0.0..=100.0).contains(&threshold) {
             bail!("Schwelle muss zwischen 0 und 100 liegen");
@@ -1639,7 +1665,7 @@ impl App {
         };
         let pacing = self.load_config().weekly_pacing.then(chrono::Utc::now);
         let mut usages = Vec::new();
-        if let Some(candidate) = self.candidate(active_profile, Some(active.as_str())) {
+        if let Some(candidate) = self.candidate(active_profile, renew) {
             // Solange der aktive Account unter seiner Grenze liegt, aendert keine weitere Zahl
             // das Ergebnis. Die Abfrage ist selbst ratenbegrenzt; jede vermeidbare Anfrage
             // erhoeht die Wahrscheinlichkeit, im entscheidenden Moment keine Antwort zu haben.
@@ -1659,7 +1685,7 @@ impl App {
             usages.push(candidate);
         }
         for profile in profiles.iter().filter(|profile| profile.name != active) {
-            if let Some(candidate) = self.candidate(profile, Some(active.as_str())) {
+            if let Some(candidate) = self.candidate(profile, renew) {
                 usages.push(candidate);
             }
         }
@@ -1723,8 +1749,8 @@ impl App {
     /// Baut den Bewertungskandidaten zu einem Profil und protokolliert dabei, worauf die
     /// spaetere Entscheidung beruht. `None` heisst: dieser Account faellt als Ziel aus - ein
     /// Wechsel auf gut Glueck kann in einem ebenfalls vollen Limit landen.
-    fn candidate(&self, profile: &Profile, active: Option<&str>) -> Option<Candidate> {
-        let (usage, age) = match self.profile_usage_cached(profile, active) {
+    fn candidate(&self, profile: &Profile, renew: bool) -> Option<Candidate> {
+        let (usage, age) = match self.profile_usage_cached(profile, renew) {
             Ok(value) => value,
             Err(error) => {
                 log_problem(&format!(
@@ -1757,11 +1783,7 @@ impl App {
     /// Ein junger gemerkter Stand wird ohne Anfrage benutzt, ein aelterer nur dann, wenn die
     /// Anfrage scheitert. Beides zusammen haelt die Bewertung auch dann am Leben, wenn der
     /// Endpunkt gerade mit `429` antwortet - und der Aufrufer erfaehrt, wie alt die Zahl ist.
-    fn profile_usage_cached(
-        &self,
-        profile: &Profile,
-        active: Option<&str>,
-    ) -> Result<(Usage, u64)> {
+    fn profile_usage_cached(&self, profile: &Profile, renew: bool) -> Result<(Usage, u64)> {
         let now = unix_timestamp()?;
         let cached = self.read_cached_usage(&profile.name);
         let age = |cached: &CachedUsage| now.saturating_sub(cached.fetched_at);
@@ -1769,7 +1791,7 @@ impl App {
             return Ok((cached.usage, age(&cached)));
         }
 
-        match self.profile_usage(profile, active, true) {
+        match self.profile_usage(profile, renew) {
             Ok(usage) => {
                 self.write_cached_usage(&profile.name, usage, now);
                 Ok((usage, 0))
@@ -1825,24 +1847,8 @@ impl App {
     /// Der Token stammt aus der Live-Datei, sobald das Profil der aktuell benutzte Login ist -
     /// sein Snapshot kann aelter sein, und ein abgelaufener Token aus dem Snapshot wuerde eine
     /// Auffrischung ausloesen, die den laufenden Login unter offenen Sessions wegrotiert.
-    fn profile_usage(
-        &self,
-        profile: &Profile,
-        active: Option<&str>,
-        allow_renew: bool,
-    ) -> Result<Usage> {
-        let live = fs::read(&self.paths.credentials).ok();
-        let snapshot = fs::read(self.profile_credentials(&profile.name)).ok();
-        let is_live = active == Some(profile.name.as_str())
-            || (snapshot.is_some() && snapshot == live && live.is_some());
-
-        let credentials = if is_live {
-            live.or(snapshot)
-                .context("weder aktiver Login noch Snapshot lesbar")?
-        } else {
-            snapshot.context("kein gespeicherter Login vorhanden")?
-        };
-
+    fn profile_usage(&self, profile: &Profile, allow_renew: bool) -> Result<Usage> {
+        let (credentials, is_live) = self.usage_credentials(profile)?;
         let credentials = if needs_refresh(&credentials) {
             if is_live {
                 bail!(
@@ -1872,14 +1878,32 @@ impl App {
         usage::fetch(&read_access_token(&credentials)?)
     }
 
-    fn auto_switch_tick(&self, threshold: f64) -> Result<()> {
+    fn usage_credentials(&self, profile: &Profile) -> Result<(Vec<u8>, bool)> {
+        let Some(_lock) = self.try_lock()? else {
+            bail!("Switcher wird gerade benutzt");
+        };
+        let live = fs::read(&self.paths.credentials).ok();
+        let snapshot = fs::read(self.profile_credentials(&profile.name)).ok();
+        let name = profile.name.as_str();
+        let is_live = (live.is_some() && snapshot == live)
+            || self.active_profile_name().ok().as_deref() == Some(name);
+        let credentials = if is_live {
+            live.or(snapshot)
+                .context("weder aktiver Login noch Snapshot lesbar")?
+        } else {
+            snapshot.context("kein gespeicherter Login vorhanden")?
+        };
+        Ok((credentials, is_live))
+    }
+
+    fn auto_switch_tick(&self, threshold: f64, renew: bool) -> Result<()> {
         // Eigenes Lock: zwei ueberlappende Pruefungen wuerden dieselben Zahlen zweimal holen
         // und im schlimmsten Fall zweimal hintereinander wechseln.
         let Some(_lock) = self.try_lock_file("autoswitch")? else {
             log_event("Limitpruefung laeuft bereits");
             return Ok(());
         };
-        self.auto_switch(threshold, false).map(|_| ())
+        self.auto_switch_with(threshold, false, renew).map(|_| ())
     }
 
     // ---- Einstellungen ----
@@ -1916,6 +1940,7 @@ impl App {
     }
 
     pub fn write_config(&self, config: &Config) -> Result<()> {
+        config.validate()?;
         self.ensure_store()?;
         let payload = serde_json::to_vec_pretty(config)?;
         atomic_write(&self.config_path(), &payload, 0o600)
@@ -1948,15 +1973,6 @@ impl App {
     pub fn update_config(&self, change: impl FnOnce(&mut Config)) -> Result<Config> {
         let mut config = self.load_config();
         change(&mut config);
-        if !(0.0..=100.0).contains(&config.threshold) {
-            bail!("Schwelle muss zwischen 0 und 100 liegen");
-        }
-        if config.ping.prompt.trim().is_empty() {
-            bail!("Ping-Text darf nicht leer sein");
-        }
-        if config.ping.timeout_minutes == 0 {
-            bail!("Zeitlimit des Pings muss groesser als 0 sein");
-        }
         self.write_config(&config)?;
         Ok(config)
     }
@@ -2051,7 +2067,9 @@ impl App {
         if options.timeout_minutes == Some(0) {
             bail!("Zeitlimit muss groesser als 0 sein");
         }
+        let last_window = self.current_window();
         create_private_dir(&self.jobs_dir())?;
+        let _lock = self.lock_named("jobs-add")?;
         let existing = self.load_jobs()?;
         let mut job = Job::new(jobs::next_id(&existing), kind, cwd, unix_timestamp()?);
         job.repeat = options.repeat;
@@ -2064,7 +2082,13 @@ impl App {
         if let Some(timeout_minutes) = options.timeout_minutes {
             job.timeout_minutes = timeout_minutes;
         }
-        job.last_window = match self.active_usage() {
+        job.last_window = last_window;
+        self.write_job(&job)?;
+        Ok(job)
+    }
+
+    fn current_window(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self.active_usage() {
             Ok(usage) => usage.five_hour.resets_at,
             Err(error) => {
                 log_problem(&format!(
@@ -2073,9 +2097,7 @@ impl App {
                 ));
                 None
             }
-        };
-        self.write_job(&job)?;
-        Ok(job)
+        }
     }
 
     pub fn list_jobs(&self) -> Result<()> {
@@ -2430,10 +2452,15 @@ impl App {
     /// `spoken` haelt die zuletzt gemeldete Begruendung je Gegenstand fest. Gemeldet wird jede
     /// Entscheidung, auch jedes "noch nicht" - aber erst wieder, wenn sie sich aendert. Sonst
     /// stuende dieselbe Zeile jede Minute im Journal, und niemand laese sie mehr.
-    fn automation_tick(&self, config: &Config, spoken: &mut HashMap<String, String>) -> Result<()> {
-        self.refresh_all_usage(spoken)?;
+    fn automation_tick(
+        &self,
+        config: &Config,
+        renew: bool,
+        spoken: &mut HashMap<String, String>,
+    ) -> Result<()> {
+        self.refresh_all_usage(renew, spoken)?;
         if config.auto_switch {
-            self.auto_switch_tick(config.threshold)?;
+            self.auto_switch_tick(config.threshold, renew)?;
         }
         let jobs = match self.load_jobs() {
             Ok(jobs) => jobs,
@@ -2520,12 +2547,10 @@ impl App {
         });
     }
 
-    /// Die Auslastung des aktiven Accounts; ein junger gemerkter Stand genuegt hier.
-    fn refresh_all_usage(&self, spoken: &mut HashMap<String, String>) -> Result<()> {
-        let active = self.active_profile_name().ok();
+    fn refresh_all_usage(&self, renew: bool, spoken: &mut HashMap<String, String>) -> Result<()> {
         for profile in self.load_profiles()? {
             let key = format!("usage-{}", profile.name);
-            match self.profile_usage_cached(&profile, active.as_deref()) {
+            match self.profile_usage_cached(&profile, renew) {
                 Ok(_) => {
                     spoken.remove(&key);
                 }
@@ -2542,7 +2567,7 @@ impl App {
     fn active_usage(&self) -> Result<Usage> {
         let active = self.active_profile_name()?;
         let profile = self.load_profile(&active)?;
-        self.profile_usage_cached(&profile, Some(active.as_str()))
+        self.profile_usage_cached(&profile, false)
             .map(|(usage, _age)| usage)
     }
 
@@ -2551,7 +2576,7 @@ impl App {
     fn active_usage_fresh(&self) -> Result<Usage> {
         let active = self.active_profile_name()?;
         let profile = self.load_profile(&active)?;
-        let usage = self.profile_usage(&profile, Some(active.as_str()), true)?;
+        let usage = self.profile_usage(&profile, false)?;
         self.write_cached_usage(&active, usage, unix_timestamp()?);
         Ok(usage)
     }
@@ -2649,6 +2674,10 @@ impl App {
     /// `locking` sagt, ob das Switcher-Lock hier genommen werden muss. Der Wechsel haelt es
     /// bereits; ein zweiter Versuch auf dieselbe Datei wuerde den eigenen Prozess blockieren.
     fn renew_snapshot(&self, profile: &Profile, locking: Locking) -> Result<RenewResult> {
+        let _renewal = match locking {
+            Locking::Acquire => Some(self.lock_renewal(&profile.name)?),
+            Locking::AlreadyHeld => None,
+        };
         let snapshot = read_valid_credentials(&self.profile_credentials(&profile.name))?;
         let workspace = self.renew_workspace(&profile.name)?;
         let result = self.renew_in_workspace(&workspace, &snapshot);
@@ -2994,6 +3023,17 @@ impl App {
     fn lock(&self) -> Result<File> {
         let lock = self.open_lock_file(".lock")?;
         FileExt::lock_exclusive(&lock).context("Account-Switcher ist bereits in Benutzung")?;
+        Ok(lock)
+    }
+
+    fn lock_renewal(&self, name: &str) -> Result<File> {
+        self.lock_named(&format!("renew-{name}"))
+    }
+
+    fn lock_named(&self, name: &str) -> Result<File> {
+        let lock = self.open_lock_file(&format!(".{name}.lock"))?;
+        FileExt::lock_exclusive(&lock)
+            .with_context(|| format!("Sperre `{name}` konnte nicht gesetzt werden"))?;
         Ok(lock)
     }
 

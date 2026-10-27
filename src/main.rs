@@ -81,10 +81,10 @@ enum AccountCommand {
         /// Untaetige Profile gar nicht auffrischen
         #[arg(long)]
         no_keepalive: bool,
-        /// Bei vollem Limit selbst den Account wechseln (standardmaessig aus)
+        /// Auto-Wechsel einschalten, solange noch keine Einstellungsdatei existiert; danach gilt die Datei
         #[arg(long)]
         auto_switch: bool,
-        /// Ab dieser Auslastung in Prozent wird gewechselt; wirkt nur mit --auto-switch
+        /// Schwelle fuer den erstmals eingeschalteten Auto-Wechsel; wirkt nur mit --auto-switch
         #[arg(long, default_value_t = DEFAULT_SWITCH_THRESHOLD, requires = "auto_switch")]
         auto_switch_threshold: f64,
     },

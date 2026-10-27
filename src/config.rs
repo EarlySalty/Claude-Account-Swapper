@@ -65,7 +65,7 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             (0.0..=100.0).contains(&self.threshold),
             "Schwelle muss zwischen 0 und 100 liegen"
@@ -76,7 +76,7 @@ impl Config {
         );
         anyhow::ensure!(
             self.ping.timeout_minutes > 0,
-            "Zeitlimit des Pings muss groesser als 0 sein"
+            "Zeitlimit des Pings muss größer als 0 sein"
         );
         Ok(())
     }

@@ -2,6 +2,8 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const notice = $("#notice");
 let dashboard = null;
 let refreshing = false;
+let configDirty = false;
+const dirtyLimits = new Set();
 
 function showNotice(message, isError = false) {
   notice.textContent = message || "";
@@ -266,14 +268,25 @@ function updateQuickSwitchButton() {
   button.textContent = selected ? selected.active ? "Bereits aktiv" : "Jetzt wechseln" : profiles.length ? "Account auswählen" : "Kein Account gespeichert";
 }
 
+function limitRowInUse(row) {
+  return Boolean(row) && (dirtyLimits.has(row.dataset.name) || row.contains(document.activeElement));
+}
+
 function renderLimits(profiles) {
   const host = $("#limits-list");
+  const existing = new Map([...host.querySelectorAll("form.limit-row")].map((row) => [row.dataset.name, row]));
   host.replaceChildren();
   if (!profiles.length) {
     host.append(el("p", "muted", "Speichere zuerst einen Account."));
     return;
   }
   for (const profile of profiles) {
+    const current = existing.get(profile.name);
+    host.append(limitRowInUse(current) ? current : limitRow(profile));
+  }
+}
+
+function limitRow(profile) {
     const row = el("form", "limit-row");
     row.dataset.name = profile.name;
     const name = el("div", "limit-account");
@@ -292,13 +305,12 @@ function renderLimits(profiles) {
     const save = el("button", "button button-secondary", "Speichern"); save.type = "submit";
     const clear = actionButton("Grenzen löschen", "clear-limits", "text-button", { name: profile.name });
     row.append(name, fiveWrap, sevenWrap, hardWrap, save, clear);
-    host.append(row);
-  }
+    return row;
 }
 
 function fillConfig() {
   const config = dashboard?.config;
-  if (!config) return;
+  if (!config || configDirty || $("#config-form").contains(document.activeElement)) return;
   $("#auto-switch").checked = Boolean(config.auto_switch);
   $("#weekly-pacing").checked = config.weekly_pacing !== false;
   $("#threshold").value = config.threshold;
@@ -395,30 +407,51 @@ function renderTasks() {
   }
 }
 
-function renderDeviceLogin() {
-  const host = $("#login-device");
-  const task = [...(dashboard?.tasks || [])].reverse().find((item) => item.action === "Login mit Device Code");
-  if (!task) {
-    host.hidden = true;
-    return;
-  }
-  host.hidden = false;
-  host.dataset.taskId = task.id;
-  const active = task.status === "läuft";
-  $("#login-device-status").textContent = task.message || "Claude-Code-Login wird gestartet …";
-  const urlRow = $("#login-url-row");
-  const link = $("#login-url");
-  let safeUrl = "";
+function deviceLoginTasks() {
+  const logins = (dashboard?.tasks || []).filter((item) => item.action === "Login mit Device Code");
+  const latest = logins[logins.length - 1];
+  return logins.filter((task) => task.status === "läuft" || task === latest);
+}
+
+function safeAuthUrl(task) {
   try {
     const parsed = new URL(task.authUrl || "");
-    if (parsed.protocol === "https:" && ["claude.com", "claude.ai"].includes(parsed.hostname) && parsed.pathname.includes("oauth/authorize")) safeUrl = parsed.href;
+    if (parsed.protocol === "https:" && ["claude.com", "claude.ai"].includes(parsed.hostname) && parsed.pathname.includes("oauth/authorize")) return parsed.href;
   } catch {}
-  urlRow.hidden = !safeUrl;
+  return "";
+}
+
+function deviceLoginSection(host, task) {
+  const existing = host.querySelector(`[data-task-id="${task.id}"]`);
+  if (existing) return existing;
+  const section = $("#login-device-template").content.firstElementChild.cloneNode(true);
+  section.dataset.taskId = task.id;
+  return section;
+}
+
+function updateDeviceLoginSection(section, task) {
+  const active = task.status === "läuft";
+  const safeUrl = safeAuthUrl(task);
+  $(".login-device-status", section).textContent = task.message || "Claude-Code-Login wird gestartet …";
+  $(".login-url-row", section).hidden = !safeUrl;
+  const link = $(".login-url", section);
   link.href = safeUrl || "#";
   link.textContent = safeUrl;
-  $("#login-code-form").hidden = !active || !safeUrl;
-  $("#login-code-submit").disabled = !active;
-  $("#login-cancel").hidden = !active;
+  $(".login-code-form", section).hidden = !active || !safeUrl;
+  $(".login-cancel", section).hidden = !active;
+  if (!active) $(".login-code-submit", section).disabled = true;
+}
+
+function renderDeviceLogin() {
+  const host = $("#login-devices");
+  const tasks = deviceLoginTasks();
+  const sections = tasks.map((task) => {
+    const section = deviceLoginSection(host, task);
+    updateDeviceLoginSection(section, task);
+    return section;
+  });
+  host.replaceChildren(...sections);
+  host.hidden = !sections.length;
 }
 
 function renderStatus() {
@@ -441,7 +474,7 @@ function render() {
   $("#active-heading").textContent = active;
   $("#active-email").textContent = dashboard?.activeEmail || "";
   $("#updated-at").textContent = `Stand ${new Date().toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" })}`;
-  renderAccounts(); if (!$("#config-form").contains(document.activeElement)) fillConfig(); renderService(); renderFlow(); renderSessions(); renderJobs(); renderTasks(); renderDeviceLogin(); renderStatus();
+  renderAccounts(); fillConfig(); renderService(); renderFlow(); renderSessions(); renderJobs(); renderTasks(); renderDeviceLogin(); renderStatus();
 }
 
 async function loadDashboard() {
@@ -483,8 +516,9 @@ $("#save-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const name = $("#save-name").value.trim();
   if (!validName(name)) return showNotice("Profilnamen dürfen normale Buchstaben und Zeichen enthalten. Schrägstriche, Steuerzeichen und Rand-Leerzeichen sind nicht erlaubt, maximal 64 UTF-8-Bytes.", true);
+  const form = event.currentTarget;
   await run("api/accounts/save", { name });
-  event.currentTarget.reset();
+  form.reset();
 });
 
 function selectedLoginMode() {
@@ -524,33 +558,49 @@ $("#copy-login").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText(command); showNotice("Login-Befehl kopiert. Auf diesem Rechner im Terminal ausführen."); }
   catch { showNotice("Kopieren nicht möglich. Den angezeigten Befehl kannst du markieren und kopieren.", true); }
 });
-$("#copy-login-url").addEventListener("click", async () => {
-  const url = $("#login-url").href;
+async function copyLoginUrl(section) {
+  const url = $(".login-url", section).href;
   if (!url || url.endsWith("#")) return;
   try { await navigator.clipboard.writeText(url); showNotice("Login-URL kopiert."); }
   catch { showNotice("Kopieren nicht möglich. Die angezeigte URL kannst du markieren und kopieren.", true); }
-});
-$("#login-code-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const code = $("#login-code").value.trim();
-  const taskId = Number($("#login-device").dataset.taskId);
+}
+
+async function completeDeviceLogin(section) {
+  const input = $(".login-code", section);
+  const submit = $(".login-code-submit", section);
+  const code = input.value.trim();
+  const taskId = Number(section.dataset.taskId);
   if (!code) return showNotice("Bitte den Code oder die Rückgabe-URL einfügen.", true);
-  $("#login-code-submit").disabled = true;
+  submit.disabled = true;
   try {
     const data = await api("api/accounts/login/complete", { taskId, code });
-    $("#login-code").value = "";
+    input.value = "";
     showNotice(data.message);
     await loadDashboard();
   } catch (error) { showNotice(error.message, true); }
-  finally { $("#login-code-submit").disabled = false; }
-});
-$("#login-cancel").addEventListener("click", async () => {
-  const taskId = Number($("#login-device").dataset.taskId);
+  finally { submit.disabled = false; }
+}
+
+async function cancelDeviceLogin(section) {
+  const taskId = Number(section.dataset.taskId);
   try {
     const data = await api("api/accounts/login/cancel", { taskId });
     showNotice(data.message);
     await loadDashboard();
   } catch (error) { showNotice(error.message, true); }
+}
+
+$("#login-devices").addEventListener("click", (event) => {
+  const section = event.target.closest("[data-task-id]");
+  if (!section) return;
+  if (event.target.closest(".copy-login-url")) copyLoginUrl(section);
+  if (event.target.closest(".login-cancel")) cancelDeviceLogin(section);
+});
+$("#login-devices").addEventListener("submit", (event) => {
+  const section = event.target.closest("[data-task-id]");
+  if (!section || !event.target.matches(".login-code-form")) return;
+  event.preventDefault();
+  completeDeviceLogin(section);
 });
 
 $("#accounts").addEventListener("click", (event) => {
@@ -573,14 +623,22 @@ $("#limits-list").addEventListener("submit", async (event) => {
   const value = (name) => form.elements[name].value === "" ? null : Number(form.elements[name].value);
   const body = { name: form.dataset.name, fiveHour: value("fiveHour"), sevenDay: value("sevenDay"), hard: form.elements.hard.checked };
   if ([body.fiveHour, body.sevenDay].some((number) => number !== null && (number < 0 || number > 100))) return showNotice("Grenzen müssen zwischen 0 und 100 Prozent liegen.", true);
+  dirtyLimits.delete(body.name);
   await run("api/accounts/limits", body);
+});
+$("#limits-list").addEventListener("input", (event) => {
+  const row = event.target.closest("form.limit-row");
+  if (row) dirtyLimits.add(row.dataset.name);
 });
 $("#limits-list").addEventListener("click", (event) => {
   const button = event.target.closest('[data-action="clear-limits"]');
-  if (button && window.confirm(`Alle eigenen Grenzen für „${button.dataset.name}“ entfernen?`)) run("api/accounts/limits", { name: button.dataset.name, clear: true });
+  if (!button || !window.confirm(`Alle eigenen Grenzen für „${button.dataset.name}“ entfernen?`)) return;
+  dirtyLimits.delete(button.dataset.name);
+  run("api/accounts/limits", { name: button.dataset.name, clear: true });
 });
 
-$("#config-form").addEventListener("submit", (event) => {
+$("#config-form").addEventListener("input", () => { configDirty = true; });
+$("#config-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const config = {
     auto_switch: $("#auto-switch").checked,
@@ -589,7 +647,14 @@ $("#config-form").addEventListener("submit", (event) => {
     ping: { enabled: $("#ping-enabled").checked, prompt: $("#ping-prompt").value, model: $("#ping-model").value.trim(), timeout_minutes: Number($("#ping-timeout").value) },
   };
   if (!config.ping.prompt.trim() || !config.ping.model || config.ping.timeout_minutes < 1) return showNotice("Ping-Text, Modell und ein Zeitlimit ab einer Minute werden benötigt.", true);
-  run("api/config", config);
+  try {
+    const data = await api("api/config", config);
+    configDirty = false;
+    showNotice(data.message);
+  } catch (error) {
+    showNotice(error.message, true);
+  }
+  await loadDashboard();
 });
 
 $("#auto-preview").addEventListener("click", () => run("api/actions/auto", { threshold: Number($("#threshold").value), dryRun: true }));
@@ -641,8 +706,9 @@ $("#job-form").addEventListener("submit", async (event) => {
     timeoutMinutes: $("#job-timeout").value ? Number($("#job-timeout").value) : null,
     allowPermissions: $("#job-permissions").checked, repeat: $("#job-repeat").checked,
   };
+  const form = event.currentTarget;
   await run("api/jobs", body);
-  event.currentTarget.reset(); $("#session-picker").hidden = true;
+  form.reset(); $("#session-picker").hidden = true;
 });
 $("#jobs").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-action]"); if (!button) return;
