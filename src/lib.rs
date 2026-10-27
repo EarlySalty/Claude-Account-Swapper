@@ -2327,6 +2327,20 @@ impl App {
             return self.write_job(&job).map(|()| false);
         }
 
+        if let Some(guard) = &job.continuation_guard {
+            let since = guard.since.max(job.last_run_at.unwrap_or(0));
+            if limit::user_prompt_after(&guard.transcript, since) {
+                job.enabled = false;
+                job.last_status =
+                    Some("nicht gestartet: die Sitzung lief schon von Hand weiter".to_owned());
+                log_event(&format!(
+                    "Aufgabe [{}] abgeschaltet: die Sitzung lief schon von Hand weiter",
+                    job.id
+                ));
+                return self.write_job(&job).map(|()| true);
+            }
+        }
+
         // Der Start wird vermerkt, bevor der Prozess laeuft: bricht der Dienst mitten im Lauf
         // ab, greift beim naechsten Start trotzdem die Sperre gegen einen Doppellauf.
         job.last_run_at = Some(unix_timestamp()?);

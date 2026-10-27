@@ -74,6 +74,14 @@ pub struct Job {
     /// stoeren, sondern das naechste Fenster eroeffnen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_window: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_guard: Option<ContinuationGuard>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContinuationGuard {
+    pub transcript: PathBuf,
+    pub since: u64,
 }
 
 fn yes() -> bool {
@@ -101,6 +109,7 @@ impl Job {
             last_run_at: None,
             last_status: None,
             last_window: None,
+            continuation_guard: None,
         }
     }
 

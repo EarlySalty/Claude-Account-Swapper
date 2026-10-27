@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{Config, LimitCompact};
-use crate::jobs::JobKind;
+use crate::jobs::{ContinuationGuard, JobKind};
 use crate::t3::{self, ThreadSummary};
 use crate::usage::Candidate;
 use crate::{App, JobOptions, log_event, log_once, log_problem, unix_timestamp};
@@ -54,6 +54,7 @@ pub struct Parked {
     pub thread_id: Option<String>,
     pub entrypoint: Option<String>,
     pub continued_by_user: bool,
+    pub retell: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -190,7 +191,7 @@ fn continued_in_tail(tail: &str, truncated: bool, since: u64) -> bool {
     prompt_after || (truncated && tail_starts_after)
 }
 
-fn user_prompt_after(transcript: &Path, since: u64) -> bool {
+pub(crate) fn user_prompt_after(transcript: &Path, since: u64) -> bool {
     let Some(tail) = read_range(transcript, true, TRANSCRIPT_TAIL_BYTES) else {
         return false;
     };
@@ -260,10 +261,11 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
     match input.hook_event_name.as_str() {
         "PostToolUse" => {
             match state.sessions.get_mut(&input.session_id) {
-                Some(parked) if parked.stopped_at.is_some() => {
+                Some(parked) if parked.stopped_at.is_some() || parked.retell => {
                     parked.told_at = now;
                     parked.stopped_at = None;
                     parked.continued_by_user = false;
+                    parked.retell = false;
                 }
                 Some(_) => return None,
                 None => {
@@ -284,7 +286,12 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
                 parked.stopped_at.get_or_insert(now);
                 None
             }
-            None if input.stop_hook_active => None,
+            None if input.stop_hook_active => {
+                let mut parked = parked_from(input, now);
+                parked.stopped_at = Some(now);
+                state.sessions.insert(input.session_id.clone(), parked);
+                None
+            }
             None => {
                 state
                     .sessions
@@ -336,16 +343,64 @@ fn to_utc(seconds: u64) -> Option<DateTime<Utc>> {
 
 type Level = (String, Option<Candidate>);
 
-fn usable(candidate: &Candidate, config: &Config) -> bool {
-    candidate.within_stops(config.threshold)
-        && candidate.usage.is_free(config.threshold)
-        && candidate.usage.five_hour.utilization < config.limit_compact.resume_below
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Fit {
+    No,
+    Reserve,
+    Strict,
+}
+
+fn hard_blocked(candidate: &Candidate, config: &Config) -> bool {
+    candidate.stops.hard && !candidate.within_stops(config.threshold)
+}
+
+fn fit(candidate: &Candidate, config: &Config) -> Fit {
+    if !candidate.usage.is_free(config.threshold)
+        || candidate.usage.five_hour.utilization >= config.limit_compact.resume_below
+        || hard_blocked(candidate, config)
+    {
+        Fit::No
+    } else if candidate.within_stops(config.threshold) {
+        Fit::Strict
+    } else {
+        Fit::Reserve
+    }
 }
 
 fn blocked(candidate: &Candidate, config: &Config) -> bool {
     candidate.usage.five_hour.utilization >= config.limit_compact.threshold
-        || !candidate.within_stops(config.threshold)
         || !candidate.usage.is_free(config.threshold)
+        || hard_blocked(candidate, config)
+}
+
+fn active_fit(config: &Config, levels: &[Level], active_profile: Option<&str>) -> Fit {
+    levels
+        .iter()
+        .filter(|(name, _)| active_profile == Some(name.as_str()))
+        .filter_map(|(_, candidate)| candidate.as_ref())
+        .map(|candidate| fit(candidate, config))
+        .max()
+        .unwrap_or(Fit::No)
+}
+
+fn best_other(
+    config: &Config,
+    levels: &[Level],
+    active_profile: Option<&str>,
+    wanted: Fit,
+) -> Option<String> {
+    levels
+        .iter()
+        .filter(|(name, _)| active_profile != Some(name.as_str()))
+        .filter_map(|(name, candidate)| Some((name, candidate.as_ref()?)))
+        .filter(|(_, candidate)| fit(candidate, config) == wanted)
+        .min_by(|(_, left), (_, right)| {
+            left.usage
+                .five_hour
+                .utilization
+                .total_cmp(&right.usage.five_hour.utilization)
+        })
+        .map(|(name, _)| name.clone())
 }
 
 fn verdict(config: &Config, levels: &[Level], active_profile: Option<&str>) -> Verdict {
@@ -356,12 +411,11 @@ fn verdict(config: &Config, levels: &[Level], active_profile: Option<&str>) -> V
                 .as_ref()
                 .is_some_and(|candidate| blocked(candidate, config))
         });
-    let active_usable = levels.iter().any(|(name, candidate)| {
-        active_profile == Some(name.as_str())
-            && candidate
-                .as_ref()
-                .is_some_and(|candidate| usable(candidate, config))
-    });
+    let active_usable = match active_fit(config, levels, active_profile) {
+        Fit::Strict => true,
+        Fit::Reserve => best_other(config, levels, active_profile, Fit::Strict).is_none(),
+        Fit::No => false,
+    };
     Verdict {
         at_limit: limit.enabled && (limit.force || all_at_limit),
         released: !limit.enabled || (!limit.force && active_usable),
@@ -373,25 +427,24 @@ fn switch_target(
     levels: &[Level],
     active_profile: Option<&str>,
 ) -> Option<String> {
-    let usable_levels = || {
-        levels.iter().filter_map(|(name, candidate)| {
-            candidate
-                .as_ref()
-                .filter(|candidate| usable(candidate, config))
-                .map(|candidate| (name, candidate))
-        })
-    };
-    if usable_levels().any(|(name, _)| active_profile == Some(name.as_str())) {
+    let active = active_fit(config, levels, active_profile);
+    if active == Fit::Strict {
         return None;
     }
-    usable_levels()
-        .min_by(|(_, left), (_, right)| {
-            left.usage
-                .five_hour
-                .utilization
-                .total_cmp(&right.usage.five_hour.utilization)
+    best_other(config, levels, active_profile, Fit::Strict).or_else(|| match active {
+        Fit::No => best_other(config, levels, active_profile, Fit::Reserve),
+        _ => None,
+    })
+}
+
+fn may_spend(config: &Config, levels: &[Level], active_profile: Option<&str>) -> bool {
+    levels
+        .iter()
+        .filter(|(name, _)| active_profile == Some(name.as_str()))
+        .filter_map(|(_, candidate)| candidate.as_ref())
+        .any(|candidate| {
+            candidate.usage.is_free(config.threshold) && !hard_blocked(candidate, config)
         })
-        .map(|(name, _)| name.clone())
 }
 
 fn reenter(state: &mut LimitState) -> Vec<String> {
@@ -401,11 +454,16 @@ fn reenter(state: &mut LimitState) -> Vec<String> {
     let dropped: Vec<String> = state
         .sessions
         .iter()
-        .filter(|(_, parked)| parked.stopped_at.is_none() || parked.continued_by_user)
+        .filter(|(_, parked)| parked.continued_by_user)
         .map(|(session, _)| session.clone())
         .collect();
     for session in &dropped {
         state.sessions.remove(session);
+    }
+    for parked in state.sessions.values_mut() {
+        if parked.stopped_at.is_none() {
+            parked.retell = true;
+        }
     }
     dropped
 }
@@ -516,8 +574,20 @@ impl App {
     ) {
         let active = self.active_profile_name_memoized(None);
         let Some(target) = switch_target(config, levels, active.as_deref()) else {
+            spoken.remove("limit-switch-off");
             return;
         };
+        if !config.auto_switch {
+            log_once(
+                spoken,
+                "limit-switch-off",
+                &format!(
+                    "Limit-Pause wartet auf den aktiven Account; {target} waere frei, \
+                     der Auto-Wechsel ist aber aus"
+                ),
+            );
+            return;
+        }
         log_event(&format!(
             "Limit-Pause: wechsle auf {target}, damit angehaltene Sitzungen fortgesetzt werden"
         ));
@@ -551,11 +621,7 @@ impl App {
         let limit = &config.limit_compact;
         let levels = self.cached_levels()?;
         let before = self.load_limit_state()?;
-        if config.auto_switch
-            && limit.enabled
-            && !limit.force
-            && (before.active || !before.sessions.is_empty())
-        {
+        if limit.enabled && !limit.force && (before.active || !before.sessions.is_empty()) {
             self.switch_for_resume(config, &levels, spoken);
         }
         let active_profile = self.active_profile_name_memoized(None);
@@ -565,7 +631,7 @@ impl App {
 
         let state = self.load_limit_state()?;
         if state.active {
-            if verdict.at_limit {
+            if verdict.at_limit && may_spend(config, &levels, active_profile.as_deref()) {
                 let result = self.compact_pass(limit, &state);
                 report(
                     spoken,
@@ -628,7 +694,7 @@ impl App {
         }
         for session in dropped {
             log_event(&format!(
-                "Limit-Pause: Sitzung {session} aus der vorigen Pause verworfen, sie hielt nicht an oder lief von Hand weiter"
+                "Limit-Pause: Sitzung {session} aus der vorigen Pause verworfen, sie lief von Hand weiter"
             ));
         }
         Ok(())
@@ -908,18 +974,23 @@ impl App {
                 "lief nach dem Stopp schon weiter, kein Fortsetzen noetig".to_owned(),
             ));
         }
-        let text = resume_message(parked, todo_after(parked).as_deref());
         let existing = self.load_jobs()?.into_iter().find(|job| {
-            job.enabled
-                && job.title == RESUME_JOB_TITLE
+            job.title == RESUME_JOB_TITLE
+                && job.created_at >= stopped_at
                 && matches!(&job.kind, JobKind::Resume { session_id, .. } if session_id == session)
         });
         let mut job = match existing {
+            Some(job) if job.last_run_at.is_some() || !job.enabled => {
+                return Ok(Outcome::Done(format!(
+                    "wurde schon als Aufgabe [{}] fortgesetzt",
+                    job.id
+                )));
+            }
             Some(job) => job,
             None => self.add_job(
                 JobKind::Resume {
                     session_id: session.to_owned(),
-                    text: text.clone(),
+                    text: resume_message(parked, todo_after(parked).as_deref()),
                 },
                 cwd,
                 JobOptions {
@@ -929,11 +1000,14 @@ impl App {
                 },
             )?,
         };
-        job.kind = JobKind::Resume {
-            session_id: session.to_owned(),
-            text,
-        };
         job.last_window = None;
+        job.continuation_guard = parked
+            .transcript
+            .clone()
+            .map(|transcript| ContinuationGuard {
+                transcript,
+                since: stopped_at,
+            });
         self.write_job(&job)?;
         Ok(Outcome::Done(format!(
             "als Aufgabe [{}] eingeplant",
@@ -1178,6 +1252,74 @@ mod tests {
         assert!(!verdict(&low_switch, &levels, Some("a")).released);
     }
 
+    fn soft(five_hour: f64, seven_day: f64, weekly_stop: f64) -> Option<Candidate> {
+        let mut candidate = usage(five_hour, seven_day);
+        if let Some(candidate) = candidate.as_mut() {
+            candidate.stops = crate::usage::Stops {
+                five_hour: None,
+                seven_day: Some(weekly_stop),
+                hard: false,
+            };
+        }
+        candidate
+    }
+
+    #[test]
+    fn soft_stops_are_a_reserve_not_a_barrier() {
+        let levels = vec![
+            ("a".to_owned(), soft(10.0, 60.0, 50.0)),
+            ("b".to_owned(), usage(97.0, 10.0)),
+        ];
+        let result = verdict(&config(true), &levels, Some("a"));
+        assert!(!result.at_limit && result.released);
+        assert_eq!(switch_target(&config(true), &levels, Some("a")), None);
+        let levels = vec![
+            ("a".to_owned(), soft(10.0, 60.0, 50.0)),
+            ("b".to_owned(), usage(10.0, 10.0)),
+        ];
+        assert!(!verdict(&config(true), &levels, Some("a")).released);
+        assert_eq!(
+            switch_target(&config(true), &levels, Some("a")),
+            Some("b".to_owned())
+        );
+        let levels = vec![
+            ("a".to_owned(), usage(96.0, 10.0)),
+            ("b".to_owned(), soft(10.0, 60.0, 50.0)),
+        ];
+        assert_eq!(
+            switch_target(&config(true), &levels, Some("a")),
+            Some("b".to_owned())
+        );
+    }
+
+    #[test]
+    fn compaction_never_spends_past_a_hard_stop() {
+        let mut capped = usage(96.0, 60.0);
+        if let Some(candidate) = capped.as_mut() {
+            candidate.stops = crate::usage::Stops {
+                five_hour: None,
+                seven_day: Some(50.0),
+                hard: true,
+            };
+        }
+        let levels = vec![
+            ("a".to_owned(), capped),
+            ("b".to_owned(), usage(96.0, 10.0)),
+        ];
+        assert!(!may_spend(&config(true), &levels, Some("a")));
+        assert!(may_spend(&config(true), &levels, Some("b")));
+        assert!(!may_spend(&config(true), &levels, None));
+    }
+
+    #[test]
+    fn untold_stop_after_another_block_is_still_recorded() {
+        let mut state = active();
+        let mut stop = input("Stop", "s");
+        stop.stop_hook_active = true;
+        assert!(hook_reply(&stop, &mut state, 40).is_none());
+        assert_eq!(state.sessions["s"].stopped_at, Some(40));
+    }
+
     #[test]
     fn switch_target_only_when_active_is_unusable() {
         let levels = vec![
@@ -1215,10 +1357,15 @@ mod tests {
         state.compacted.insert("t".to_owned(), 1);
         state.compacting_sessions.insert("s".to_owned(), 1);
         state.inspected.insert("t".to_owned(), "x".to_owned());
-        let mut dropped = reenter(&mut state);
-        dropped.sort();
-        assert_eq!(dropped, vec!["manual".to_owned(), "running".to_owned()]);
-        assert!(state.sessions.contains_key("stopped"));
+        let dropped = reenter(&mut state);
+        assert_eq!(dropped, vec!["manual".to_owned()]);
+        assert!(!state.sessions["stopped"].retell);
+        assert!(state.sessions["running"].retell);
+        let mut active_state = state.clone();
+        active_state.active = true;
+        assert!(hook_reply(&input("PostToolUse", "running"), &mut active_state, 50).is_some());
+        assert!(!active_state.sessions["running"].retell);
+        assert_eq!(active_state.sessions["running"].told_at, 50);
         assert!(state.compacted.is_empty() && state.compacting_sessions.is_empty());
         assert!(state.inspected.is_empty());
     }
