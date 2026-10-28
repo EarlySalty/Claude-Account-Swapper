@@ -2329,7 +2329,7 @@ impl App {
 
         if let Some(guard) = &job.continuation_guard {
             let since = guard.since.max(job.last_run_at.unwrap_or(0));
-            if limit::user_prompt_after(&guard.transcript, since) {
+            if limit::user_prompt_after(&guard.transcript, since, Some(job.text())) {
                 job.enabled = false;
                 job.last_status =
                     Some("nicht gestartet: die Sitzung lief schon von Hand weiter".to_owned());

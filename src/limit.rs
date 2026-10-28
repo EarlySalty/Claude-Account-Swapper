@@ -157,46 +157,60 @@ fn assistant_text_since(tail: &str, since: u64) -> Option<String> {
     })
 }
 
-fn is_user_prompt(value: &Value) -> bool {
+fn prompt_text(value: &Value) -> Option<String> {
     let flag = |name: &str| value.get(name).and_then(Value::as_bool) == Some(true);
     if value.get("type").and_then(Value::as_str) != Some("user")
         || flag("isMeta")
         || flag("isCompactSummary")
     {
-        return false;
+        return None;
     }
-    match value.pointer("/message/content") {
-        Some(Value::String(text)) => !text.trim().is_empty(),
-        Some(Value::Array(parts)) => parts.iter().any(|part| {
-            part.get("type").and_then(Value::as_str) == Some("text")
-                && part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.trim().is_empty())
-        }),
-        _ => false,
-    }
+    let text = match value.pointer("/message/content")? {
+        Value::String(text) => text.trim().to_owned(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
 }
 
-fn continued_in_tail(tail: &str, truncated: bool, since: u64) -> bool {
-    let entries: Vec<(u64, Value)> = tail
-        .lines()
+fn timed_entries(text: &str) -> impl Iterator<Item = (u64, Value)> + '_ {
+    text.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter_map(|value| Some((entry_time(&value)?, value)))
-        .collect();
-    let prompt_after = entries
-        .iter()
-        .any(|(time, value)| *time > since && is_user_prompt(value));
-    let tail_starts_after = entries.first().is_some_and(|(time, _)| *time > since);
-    prompt_after || (truncated && tail_starts_after)
 }
 
-pub(crate) fn user_prompt_after(transcript: &Path, since: u64) -> bool {
+fn prompt_after(text: &str, since: u64, ignore: Option<&str>) -> bool {
+    timed_entries(text).any(|(time, value)| {
+        time > since
+            && prompt_text(&value)
+                .is_some_and(|prompt| Some(prompt.as_str()) != ignore.map(str::trim))
+    })
+}
+
+fn starts_after(text: &str, since: u64) -> bool {
+    timed_entries(text)
+        .next()
+        .is_some_and(|(time, _)| time > since)
+}
+
+pub(crate) fn user_prompt_after(transcript: &Path, since: u64, ignore: Option<&str>) -> bool {
     let Some(tail) = read_range(transcript, true, TRANSCRIPT_TAIL_BYTES) else {
         return false;
     };
+    if prompt_after(&tail, since, ignore) {
+        return true;
+    }
     let truncated = fs::metadata(transcript).is_ok_and(|meta| meta.len() > TRANSCRIPT_TAIL_BYTES);
-    continued_in_tail(&tail, truncated, since)
+    truncated
+        && starts_after(&tail, since)
+        && fs::read_to_string(transcript).is_ok_and(|full| prompt_after(&full, since, ignore))
 }
 
 fn foreign_message_after(detail: &t3::ThreadDetail, since: u64) -> bool {
@@ -968,7 +982,7 @@ impl App {
         if parked
             .transcript
             .as_deref()
-            .is_some_and(|transcript| user_prompt_after(transcript, stopped_at))
+            .is_some_and(|transcript| user_prompt_after(transcript, stopped_at, None))
         {
             return Ok(Outcome::Done(
                 "lief nach dem Stopp schon weiter, kein Fortsetzen noetig".to_owned(),
@@ -1408,23 +1422,32 @@ mod tests {
             json!({ "isCompactSummary": true, "message": { "content": "summary" } }),
         );
         let noise = [before.clone(), tool, meta, summary].join("\n");
-        assert!(!continued_in_tail(&noise, false, stop));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let check = |body: &str, ignore: Option<&str>| {
+            fs::write(&path, body).expect("write");
+            user_prompt_after(&path, stop, ignore)
+        };
+        assert!(!check(&noise, None));
         let prompt = line(
             "2026-10-27T10:30:00Z",
             json!({ "message": { "content": [{ "type": "text", "text": "next" }] } }),
         );
-        assert!(continued_in_tail(
-            &[noise.clone(), prompt].join("\n"),
-            false,
-            stop
-        ));
+        let with_prompt = [noise.clone(), prompt.clone()].join("\n");
+        assert!(check(&with_prompt, None));
+        assert!(!check(&with_prompt, Some(" next\n")));
+        assert!(check(&with_prompt, Some("other")));
         let late = line(
             "2026-10-27T10:40:00Z",
             json!({ "message": { "content": [{ "type": "tool_result", "content": "x" }] } }),
         );
-        assert!(continued_in_tail(&late, true, stop));
-        assert!(!continued_in_tail(&late, false, stop));
-        assert!(!continued_in_tail(&before, true, stop));
+        let filler = vec![late; 4_000].join("\n");
+        assert!(!check(&[before.clone(), filler.clone()].join("\n"), None));
+        assert!(check(
+            &[before.clone(), prompt, filler.clone()].join("\n"),
+            None
+        ));
+        assert!(!check(&before, None));
     }
 
     #[test]
