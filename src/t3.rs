@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket};
@@ -289,13 +289,21 @@ pub fn parse_shell(value: &Value) -> Result<Vec<ThreadSummary>> {
         .get("threads")
         .and_then(Value::as_array)
         .context("T3-Uebersicht ohne Thread-Liste")?;
-    threads
-        .iter()
-        .filter(|thread| {
-            thread.get("providerInstanceId").and_then(Value::as_str) == Some("claudeAgent")
-                && thread.get("archivedAt").is_none_or(Value::is_null)
-                && thread.get("deletedAt").is_none_or(Value::is_null)
-        })
+    let mut claude_threads = Vec::new();
+    for thread in threads {
+        let provider = thread
+            .get("providerInstanceId")
+            .and_then(Value::as_str)
+            .context("T3-Thread ohne providerInstanceId")?;
+        if provider == "claudeAgent"
+            && thread.get("archivedAt").is_none_or(Value::is_null)
+            && thread.get("deletedAt").is_none_or(Value::is_null)
+        {
+            claude_threads.push(thread);
+        }
+    }
+    claude_threads
+        .into_iter()
         .map(|thread| {
             let id = thread
                 .get("id")
@@ -325,12 +333,25 @@ fn required_array<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>> {
         .with_context(|| format!("T3-Thread-Projektion ohne {field}"))
 }
 
+fn native_session_id(thread: &Value) -> Option<Result<String>> {
+    match thread.get("nativeThreadRef") {
+        None => Some(Err(anyhow!("T3-Provider-Thread ohne nativeThreadRef"))),
+        Some(Value::Null) => None,
+        Some(reference) => Some(
+            reference
+                .get("nativeId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .context("T3-Provider-Thread ohne nativeId"),
+        ),
+    }
+}
+
 pub fn parse_projection(value: &Value) -> Result<ThreadDetail> {
     let native_session_ids = required_array(value, "providerThreads")?
         .iter()
-        .filter_map(|thread| thread.pointer("/nativeThreadRef/nativeId")?.as_str())
-        .map(str::to_owned)
-        .collect();
+        .filter_map(native_session_id)
+        .collect::<Result<_>>()?;
     let used_tokens = by_ordinal(required_array(value, "providerTurns")?)
         .into_iter()
         .rev()
@@ -395,6 +416,14 @@ mod tests {
         );
         assert!(parse_projection(&json!(null)).is_err());
         assert!(parse_projection(&json!({ "providerThreads": [] })).is_err());
+        let with_threads = |threads: Value| json!({ "providerThreads": threads, "providerTurns": [], "turnItems": [] });
+        let Ok(unloaded) = parse_projection(&with_threads(json!([{ "nativeThreadRef": null }])))
+        else {
+            panic!("unloaded provider thread must parse");
+        };
+        assert!(unloaded.native_session_ids.is_empty());
+        assert!(parse_projection(&with_threads(json!([{}]))).is_err());
+        assert!(parse_projection(&with_threads(json!([{ "nativeThreadRef": {} }]))).is_err());
     }
 
     #[test]
@@ -414,6 +443,7 @@ mod tests {
         assert!(
             parse_shell(&json!({ "threads": [{ "providerInstanceId": "claudeAgent" }] })).is_err()
         );
+        assert!(parse_shell(&json!({ "threads": [{ "id": "e" }] })).is_err());
         assert!(threads[0].busy);
         assert!(!threads[1].busy);
         assert!(threads[1].last_run_completed_at.is_some());
