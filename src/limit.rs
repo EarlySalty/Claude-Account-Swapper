@@ -55,7 +55,6 @@ pub struct Parked {
     pub entrypoint: Option<String>,
     pub continued_by_user: bool,
     pub retell: bool,
-    pub resume_message_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -281,7 +280,6 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
                     parked.stopped_at_ms = None;
                     parked.continued_by_user = false;
                     parked.retell = false;
-                    parked.resume_message_id = None;
                 }
                 Some(_) => return None,
                 None => {
@@ -673,7 +671,7 @@ impl App {
         if !limit.enabled {
             self.drop_parked("nicht fortgesetzt: Limit-Pause wurde abgeschaltet")?;
         } else if verdict.released {
-            let result = self.resume_pass(limit, spoken, now);
+            let result = self.resume_pass(spoken, now);
             report(spoken, "limit-resume", "Fortsetzen fehlgeschlagen", result);
         }
         Ok(())
@@ -874,44 +872,17 @@ impl App {
         })
     }
 
-    fn resume_pass(
-        &self,
-        limit: &LimitCompact,
-        spoken: &mut HashMap<String, String>,
-        now: u64,
-    ) -> Result<()> {
-        let client = self.t3_client(limit);
-        let mut t3 = match client.claude_threads() {
-            Ok(threads) => client.connect().map(|rpc| (threads, rpc)),
-            Err(error) => Err(error),
-        };
-        let problem = match t3.as_mut() {
-            Ok((threads, rpc)) => {
-                let state = self.load_limit_state()?;
-                self.map_sessions(rpc, threads, &state)
-                    .err()
-                    .map(|error| format!("Zuordnung zu T3-Threads fehlgeschlagen: {error:#}"))
-            }
-            Err(error) => Some(format!("T3 nicht erreichbar: {error:#}")),
-        };
-        let mapped = problem.is_none();
+    fn resume_pass(&self, spoken: &mut HashMap<String, String>, now: u64) -> Result<()> {
         let state = self.load_limit_state()?;
         for (session, parked) in &state.sessions {
-            let outcome = match (&parked.thread_id, t3.as_mut()) {
-                _ if parked.continued_by_user => {
-                    Ok(Outcome::Done("wurde schon von Hand fortgesetzt".to_owned()))
-                }
-                (Some(thread_id), Ok((threads, rpc))) => {
-                    self.resume_thread(rpc, threads, thread_id, session, parked)
-                }
-                (Some(_), Err(_)) => Ok(Outcome::Pending),
-                (None, _) if runs_in_t3(parked) => Ok(match mapped && grace_over(&state, now) {
-                    true => Outcome::Done(
-                        "nicht fortgesetzt: kein passender T3-Thread gefunden".to_owned(),
-                    ),
-                    false => Outcome::Pending,
-                }),
-                (None, _) => self.resume_without_thread(session, parked, &state, now),
+            let outcome = if parked.continued_by_user {
+                Ok(Outcome::Done("wurde schon von Hand fortgesetzt".to_owned()))
+            } else if parked.thread_id.is_some() || runs_in_t3(parked) {
+                Ok(Outcome::Done(
+                    "laeuft in T3, T3 setzt selbst fort".to_owned(),
+                ))
+            } else {
+                self.resume_without_thread(session, parked, &state, now)
             };
             let key = format!("limit-resume-{session}");
             match outcome {
@@ -939,67 +910,7 @@ impl App {
         if finished {
             log_event("Limit-Pause beendet: alle angehaltenen Sitzungen sind versorgt");
         }
-        match problem {
-            Some(problem) => anyhow::bail!("{problem}"),
-            None => Ok(()),
-        }
-    }
-
-    fn resume_thread(
-        &self,
-        rpc: &mut t3::Rpc,
-        threads: &[ThreadSummary],
-        thread_id: &str,
-        session: &str,
-        parked: &Parked,
-    ) -> Result<Outcome> {
-        let Some(thread) = threads.iter().find(|thread| thread.id == thread_id) else {
-            return Ok(Outcome::Done(format!(
-                "nicht fortgesetzt: Thread {thread_id} ist archiviert oder geloescht"
-            )));
-        };
-        let detail = rpc.thread_detail(thread_id)?;
-        if let Some(id) = &parked.resume_message_id
-            && detail.message_ids.contains(id)
-        {
-            return Ok(Outcome::Done(format!("in Thread {thread_id} fortgesetzt")));
-        }
-        if foreign_message_after(&detail, parked.told_at_ms) {
-            return Ok(Outcome::Done(format!(
-                "wurde in Thread {thread_id} schon von Hand fortgesetzt"
-            )));
-        }
-        if thread.busy {
-            return Ok(Outcome::Pending);
-        }
-        let message_id = match &parked.resume_message_id {
-            Some(id) => id.clone(),
-            None => {
-                let id = uuid::Uuid::new_v4().to_string();
-                self.update_limit_state(|state| {
-                    if let Some(parked) = state.sessions.get_mut(session) {
-                        parked.resume_message_id = Some(id.clone());
-                    }
-                })?;
-                id
-            }
-        };
-        let sent = rpc.send_message(
-            thread_id,
-            &resume_message(parked, todo_after(parked).as_deref()),
-            &message_id,
-        );
-        if let Err(error) = sent {
-            if t3::is_rejection(&error) {
-                self.update_limit_state(|state| {
-                    if let Some(parked) = state.sessions.get_mut(session) {
-                        parked.resume_message_id = None;
-                    }
-                })?;
-            }
-            return Err(error);
-        }
-        Ok(Outcome::Done(format!("in Thread {thread_id} fortgesetzt")))
+        Ok(())
     }
 
     fn resume_without_thread(
