@@ -54,10 +54,10 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Eine unbeaufsichtigte Aufgabe kann keine Rueckfrage beantworten; ohne das Kennzeichen
-    /// bliebe sie an der ersten Berechtigungsfrage stehen, bis das Zeitlimit sie abraeumt.
+    /// bliebe sie an der ersten Berechtigungsfrage stehen.
     #[serde(default = "yes")]
     pub skip_permissions: bool,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_timeout", skip_serializing)]
     pub timeout_minutes: u64,
     /// Wiederkehrend: laeuft in jedem neuen Fenster erneut. Sonst nur einmal.
     #[serde(default)]

@@ -53,7 +53,7 @@ Caddy passes the client's `Host` header through unchanged, so the site addresses
 - Configure automatic switching and the reset ping, run an automatic-switch preview, or execute the selected action immediately.
 - Synchronize active credentials, refresh inactive profiles and send a window ping manually.
 - Start, stop, restart and enable or disable autostart for the background service.
-- Queue a new prompt or resume a recent Claude session, with working directory, title, settings file, model, timeout, permission behavior and repeat options.
+- Queue a new prompt or resume a recent Claude session, with working directory, title, settings file, model, permission behavior and repeat options. The job waits for a free five-hour window.
 - Enable, pause, run, inspect logs for and remove queued jobs.
 - Read the automation service journal and background action status.
 
