@@ -2231,6 +2231,27 @@ impl App {
     /// bekommt sein Kontingent nicht von der eigenen Warteschlange weggenommen. Laeuft gerade
     /// kein Fenster, ist sie sofort faellig; genau dafuer ist sie ja da.
     pub fn add_job(&self, kind: JobKind, cwd: PathBuf, options: JobOptions) -> Result<Job> {
+        let last_window = self.current_window();
+        self.create_job(kind, cwd, options, |job| job.last_window = last_window)
+    }
+
+    pub(crate) fn add_guarded_job(
+        &self,
+        kind: JobKind,
+        cwd: PathBuf,
+        options: JobOptions,
+        guard: Option<jobs::ContinuationGuard>,
+    ) -> Result<Job> {
+        self.create_job(kind, cwd, options, |job| job.continuation_guard = guard)
+    }
+
+    fn create_job(
+        &self,
+        kind: JobKind,
+        cwd: PathBuf,
+        options: JobOptions,
+        setup: impl FnOnce(&mut Job),
+    ) -> Result<Job> {
         if let JobKind::Resume { session_id, .. } = &kind {
             jobs::validate_session_id(session_id)?;
         }
@@ -2240,7 +2261,6 @@ impl App {
         if !cwd.is_dir() {
             bail!("Arbeitsverzeichnis gibt es nicht: {}", cwd.display());
         }
-        let last_window = self.current_window();
         create_private_dir(&self.jobs_dir())?;
         let _lock = self.lock_named("jobs-add")?;
         let existing = self.load_jobs()?;
@@ -2252,7 +2272,7 @@ impl App {
         if let Some(title) = options.title.filter(|title| !title.trim().is_empty()) {
             job.title = title;
         }
-        job.last_window = last_window;
+        setup(&mut job);
         self.write_job(&job)?;
         Ok(job)
     }
@@ -2323,18 +2343,17 @@ impl App {
             return self.write_job(&job).map(|()| false);
         }
 
-        if let Some(guard) = &job.continuation_guard {
-            let since = guard.since.max(job.last_run_at.unwrap_or(0));
-            if limit::user_prompt_after(&guard.transcript, since, Some(job.text())) {
-                job.enabled = false;
-                job.last_status =
-                    Some("nicht gestartet: die Sitzung lief schon von Hand weiter".to_owned());
-                log_event(&format!(
-                    "Aufgabe [{}] abgeschaltet: die Sitzung lief schon von Hand weiter",
-                    job.id
-                ));
-                return self.write_job(&job).map(|()| true);
-            }
+        if let Some(guard) = &job.continuation_guard
+            && limit::user_prompt_after(&guard.transcript, guard.since_ms, Some(job.text()))
+        {
+            job.enabled = false;
+            job.last_status =
+                Some("nicht gestartet: die Sitzung lief schon von Hand weiter".to_owned());
+            log_event(&format!(
+                "Aufgabe [{}] abgeschaltet: die Sitzung lief schon von Hand weiter",
+                job.id
+            ));
+            return self.write_job(&job).map(|()| true);
         }
 
         // Der Start wird vermerkt, bevor der Prozess laeuft: bricht der Dienst mitten im Lauf
@@ -2650,6 +2669,15 @@ impl App {
             log_problem(&format!("Limit-Pause fehlgeschlagen: {error:#}"));
         }
         switched?;
+        if self.limit_pause_holds() {
+            log_once(
+                spoken,
+                "limit-hold",
+                "Fenster-Ping und Aufgaben warten: die Limit-Pause laeuft",
+            );
+            return Ok(());
+        }
+        spoken.remove("limit-hold");
         let jobs = match self.load_jobs() {
             Ok(jobs) => jobs,
             Err(error) => {
@@ -3887,4 +3915,12 @@ fn unix_timestamp() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("Systemzeit liegt vor 1970")?
         .as_secs())
+}
+
+fn unix_millis() -> Result<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("Systemzeit liegt vor 1970")?
+        .as_millis();
+    u64::try_from(millis).context("Systemzeit ausserhalb des Wertebereichs")
 }

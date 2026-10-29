@@ -37,6 +37,22 @@ pub struct ThreadDetail {
     pub last_item_is_compaction: bool,
     pub last_compaction_at: Option<DateTime<Utc>>,
     pub last_foreign_message_at: Option<DateTime<Utc>>,
+    pub message_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct Rejected(String);
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "T3 lehnte die Anfrage ab: {}", self.0)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+pub fn is_rejection(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Rejected>().is_some()
 }
 
 pub struct Rpc {
@@ -227,16 +243,16 @@ impl Rpc {
         parse_projection(&value)
     }
 
-    pub fn send_message(&mut self, thread_id: &str, text: &str) -> Result<()> {
+    pub fn send_message(&mut self, thread_id: &str, text: &str, message_id: &str) -> Result<()> {
         self.call(
             "orchestration.dispatchCommand",
             json!({
                 "type": "message.dispatch",
                 "createdBy": "system",
                 "creationSource": "server",
-                "commandId": uuid::Uuid::new_v4().to_string(),
+                "commandId": format!("limit-compact:{message_id}"),
                 "threadId": thread_id,
-                "messageId": uuid::Uuid::new_v4().to_string(),
+                "messageId": message_id,
                 "text": text,
                 "attachments": [],
                 "dispatchMode": { "type": "start_immediately" },
@@ -257,7 +273,7 @@ fn exit_value(frame: &Value, id: &str) -> Result<Option<Value>> {
         Some("Success") => Ok(Some(exit.get("value").cloned().unwrap_or(Value::Null))),
         _ => {
             let cause: String = exit.to_string().chars().take(400).collect();
-            bail!("T3 lehnte die Anfrage ab: {cause}")
+            Err(Rejected(cause).into())
         }
     }
 }
@@ -373,12 +389,19 @@ pub fn parse_projection(value: &Value) -> Result<ThreadDetail> {
         .filter(|item| item.get("createdBy").and_then(Value::as_str) != Some("system"))
         .filter_map(|item| timestamp(item, "startedAt"))
         .max();
+    let message_ids = items
+        .iter()
+        .filter(|item| of_type(item, "user_message"))
+        .filter_map(|item| item.get("messageId").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
     Ok(ThreadDetail {
         native_session_ids,
         used_tokens,
         last_item_is_compaction,
         last_compaction_at,
         last_foreign_message_at,
+        message_ids,
     })
 }
 
@@ -399,7 +422,7 @@ mod tests {
                 { "ordinal": 1000001, "type": "user_message", "createdBy": "user",
                   "startedAt": "2026-10-27T21:10:00Z" },
                 { "ordinal": 2000001, "type": "user_message", "createdBy": "system",
-                  "startedAt": "2026-10-27T21:18:00Z" },
+                  "messageId": "m-1", "startedAt": "2026-10-27T21:18:00Z" },
                 { "ordinal": 2000002, "type": "compaction", "startedAt": "2026-10-27T21:18:10Z" }
             ]
         });
@@ -410,6 +433,7 @@ mod tests {
         assert_eq!(detail.used_tokens, Some(12351));
         assert!(detail.last_item_is_compaction);
         assert!(detail.last_compaction_at.is_some());
+        assert_eq!(detail.message_ids, vec!["m-1".to_owned()]);
         assert_eq!(
             detail.last_foreign_message_at.map(|time| time.to_rfc3339()),
             Some("2026-10-27T21:10:00+00:00".to_owned())

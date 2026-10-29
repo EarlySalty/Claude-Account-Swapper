@@ -81,7 +81,7 @@ pub struct Job {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContinuationGuard {
     pub transcript: PathBuf,
-    pub since: u64,
+    pub since_ms: u64,
 }
 
 fn yes() -> bool {

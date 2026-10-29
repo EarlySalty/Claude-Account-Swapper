@@ -14,7 +14,7 @@ use crate::config::{Config, LimitCompact};
 use crate::jobs::{ContinuationGuard, JobKind};
 use crate::t3::{self, ThreadSummary};
 use crate::usage::Candidate;
-use crate::{App, JobOptions, log_event, log_once, log_problem, unix_timestamp};
+use crate::{App, JobOptions, log_event, log_once, log_problem, unix_millis, unix_timestamp};
 
 const STATE_FILE: &str = "limit-compact.json";
 const LOCK_FILE: &str = ".limit-compact.lock";
@@ -47,14 +47,15 @@ pub struct LimitState {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Parked {
-    pub told_at: u64,
+    pub told_at_ms: u64,
     pub cwd: Option<PathBuf>,
     pub transcript: Option<PathBuf>,
-    pub stopped_at: Option<u64>,
+    pub stopped_at_ms: Option<u64>,
     pub thread_id: Option<String>,
     pub entrypoint: Option<String>,
     pub continued_by_user: bool,
     pub retell: bool,
+    pub resume_message_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -134,7 +135,7 @@ fn read_range(path: &Path, from_end: bool, bytes: u64) -> Option<String> {
 fn entry_time(value: &Value) -> Option<u64> {
     let stamp = value.get("timestamp").and_then(Value::as_str)?;
     let time = DateTime::parse_from_rfc3339(stamp).ok()?;
-    u64::try_from(time.timestamp()).ok()
+    u64::try_from(time.timestamp_millis()).ok()
 }
 
 fn assistant_text_since(tail: &str, since: u64) -> Option<String> {
@@ -194,10 +195,10 @@ fn prompt_after(text: &str, since: u64, ignore: Option<&str>) -> bool {
     })
 }
 
-fn starts_after(text: &str, since: u64) -> bool {
+fn reaches_back_to(text: &str, since: u64) -> bool {
     timed_entries(text)
         .next()
-        .is_some_and(|(time, _)| time > since)
+        .is_some_and(|(time, _)| time <= since)
 }
 
 pub(crate) fn user_prompt_after(transcript: &Path, since: u64, ignore: Option<&str>) -> bool {
@@ -209,12 +210,12 @@ pub(crate) fn user_prompt_after(transcript: &Path, since: u64, ignore: Option<&s
     }
     let truncated = fs::metadata(transcript).is_ok_and(|meta| meta.len() > TRANSCRIPT_TAIL_BYTES);
     truncated
-        && starts_after(&tail, since)
+        && !reaches_back_to(&tail, since)
         && fs::read_to_string(transcript).is_ok_and(|full| prompt_after(&full, since, ignore))
 }
 
 fn foreign_message_after(detail: &t3::ThreadDetail, since: u64) -> bool {
-    let Some(since) = to_utc(since) else {
+    let Some(since) = from_millis(since) else {
         return false;
     };
     detail
@@ -224,7 +225,7 @@ fn foreign_message_after(detail: &t3::ThreadDetail, since: u64) -> bool {
 
 fn todo_after(parked: &Parked) -> Option<PathBuf> {
     let tail = read_range(parked.transcript.as_deref()?, true, TRANSCRIPT_TAIL_BYTES)?;
-    find_todo_path(&assistant_text_since(&tail, parked.told_at)?)
+    find_todo_path(&assistant_text_since(&tail, parked.told_at_ms)?)
 }
 
 fn entrypoint_from_transcript(transcript: &Path) -> Option<String> {
@@ -264,7 +265,7 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
         if input.hook_event_name == "Stop"
             && let Some(parked) = state.sessions.get_mut(&input.session_id)
         {
-            parked.stopped_at.get_or_insert(now);
+            parked.stopped_at_ms.get_or_insert(now);
         }
         return None;
     }
@@ -275,11 +276,12 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
     match input.hook_event_name.as_str() {
         "PostToolUse" => {
             match state.sessions.get_mut(&input.session_id) {
-                Some(parked) if parked.stopped_at.is_some() || parked.retell => {
-                    parked.told_at = now;
-                    parked.stopped_at = None;
+                Some(parked) if parked.stopped_at_ms.is_some() || parked.retell => {
+                    parked.told_at_ms = now;
+                    parked.stopped_at_ms = None;
                     parked.continued_by_user = false;
                     parked.retell = false;
+                    parked.resume_message_id = None;
                 }
                 Some(_) => return None,
                 None => {
@@ -297,12 +299,12 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
         }
         "Stop" => match state.sessions.get_mut(&input.session_id) {
             Some(parked) => {
-                parked.stopped_at.get_or_insert(now);
+                parked.stopped_at_ms.get_or_insert(now);
                 None
             }
             None if input.stop_hook_active => {
                 let mut parked = parked_from(input, now);
-                parked.stopped_at = Some(now);
+                parked.stopped_at_ms = Some(now);
                 state.sessions.insert(input.session_id.clone(), parked);
                 None
             }
@@ -319,7 +321,7 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
 
 fn parked_from(input: &HookInput, now: u64) -> Parked {
     Parked {
-        told_at: now,
+        told_at_ms: now,
         cwd: input.cwd.clone(),
         transcript: input.transcript_path.clone(),
         entrypoint: input.entrypoint.clone(),
@@ -351,8 +353,8 @@ fn worth_compacting(detail: &t3::ThreadDetail, limit: &LimitCompact) -> bool {
             .is_some_and(|tokens| tokens >= limit.min_context_tokens)
 }
 
-fn to_utc(seconds: u64) -> Option<DateTime<Utc>> {
-    DateTime::from_timestamp(i64::try_from(seconds).ok()?, 0)
+fn from_millis(millis: u64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp_millis(i64::try_from(millis).ok()?)
 }
 
 type Level = (String, Option<Candidate>);
@@ -475,7 +477,7 @@ fn reenter(state: &mut LimitState) -> Vec<String> {
         state.sessions.remove(session);
     }
     for parked in state.sessions.values_mut() {
-        if parked.stopped_at.is_none() {
+        if parked.stopped_at_ms.is_none() {
             parked.retell = true;
         }
     }
@@ -500,6 +502,12 @@ impl App {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LimitState::default()),
             Err(error) => Err(error).context("Zustand der Limit-Pause nicht lesbar"),
         }
+    }
+
+    pub(crate) fn limit_pause_holds(&self) -> bool {
+        self.load_limit_state()
+            .ok()
+            .is_none_or(|state| state.active)
     }
 
     fn check_config_file(&self) -> Result<()> {
@@ -543,7 +551,7 @@ impl App {
         let mut input: HookInput =
             serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
         input.entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
-        let now = unix_timestamp()?;
+        let now = unix_millis()?;
         let reply = self.update_limit_state(|state| hook_reply(&input, state, now))?;
         Ok(reply.map(|value| value.to_string()))
     }
@@ -737,10 +745,10 @@ impl App {
             .iter()
             .filter(|(_, parked)| parked.thread_id.is_none() && runs_in_t3(parked))
             .collect();
-        let Some(earliest) = unmapped.iter().map(|(_, parked)| parked.told_at).min() else {
+        let Some(earliest) = unmapped.iter().map(|(_, parked)| parked.told_at_ms).min() else {
             return Ok(BTreeMap::new());
         };
-        let Some(earliest) = to_utc(earliest) else {
+        let Some(earliest) = from_millis(earliest) else {
             return Ok(BTreeMap::new());
         };
         let mut recent: Vec<&ThreadSummary> = threads
@@ -826,7 +834,11 @@ impl App {
                 }
                 state.compacted.insert(thread.id.clone(), at);
             })?;
-            if let Err(error) = rpc.send_message(&thread.id, COMPACT_COMMAND) {
+            let message_id = uuid::Uuid::new_v4().to_string();
+            if let Err(error) = rpc.send_message(&thread.id, COMPACT_COMMAND, &message_id) {
+                if !t3::is_rejection(&error) {
+                    return Err(error);
+                }
                 self.update_limit_state(|state| {
                     for session in &detail.native_session_ids {
                         state.compacting_sessions.remove(session);
@@ -854,7 +866,7 @@ impl App {
             for session in &detail.native_session_ids {
                 if let Some(parked) = state.sessions.get_mut(session) {
                     parked.thread_id.get_or_insert_with(|| thread.id.clone());
-                    if foreign_message_after(detail, parked.told_at) {
+                    if foreign_message_after(detail, parked.told_at_ms) {
                         parked.continued_by_user = true;
                     }
                 }
@@ -890,7 +902,7 @@ impl App {
                     Ok(Outcome::Done("wurde schon von Hand fortgesetzt".to_owned()))
                 }
                 (Some(thread_id), Ok((threads, rpc))) => {
-                    self.resume_thread(rpc, threads, thread_id, parked)
+                    self.resume_thread(rpc, threads, thread_id, session, parked)
                 }
                 (Some(_), Err(_)) => Ok(Outcome::Pending),
                 (None, _) if runs_in_t3(parked) => Ok(match mapped && grace_over(&state, now) {
@@ -938,6 +950,7 @@ impl App {
         rpc: &mut t3::Rpc,
         threads: &[ThreadSummary],
         thread_id: &str,
+        session: &str,
         parked: &Parked,
     ) -> Result<Outcome> {
         let Some(thread) = threads.iter().find(|thread| thread.id == thread_id) else {
@@ -946,7 +959,12 @@ impl App {
             )));
         };
         let detail = rpc.thread_detail(thread_id)?;
-        if foreign_message_after(&detail, parked.told_at) {
+        if let Some(id) = &parked.resume_message_id
+            && detail.message_ids.contains(id)
+        {
+            return Ok(Outcome::Done(format!("in Thread {thread_id} fortgesetzt")));
+        }
+        if foreign_message_after(&detail, parked.told_at_ms) {
             return Ok(Outcome::Done(format!(
                 "wurde in Thread {thread_id} schon von Hand fortgesetzt"
             )));
@@ -954,10 +972,33 @@ impl App {
         if thread.busy {
             return Ok(Outcome::Pending);
         }
-        rpc.send_message(
+        let message_id = match &parked.resume_message_id {
+            Some(id) => id.clone(),
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                self.update_limit_state(|state| {
+                    if let Some(parked) = state.sessions.get_mut(session) {
+                        parked.resume_message_id = Some(id.clone());
+                    }
+                })?;
+                id
+            }
+        };
+        let sent = rpc.send_message(
             thread_id,
             &resume_message(parked, todo_after(parked).as_deref()),
-        )?;
+            &message_id,
+        );
+        if let Err(error) = sent {
+            if t3::is_rejection(&error) {
+                self.update_limit_state(|state| {
+                    if let Some(parked) = state.sessions.get_mut(session) {
+                        parked.resume_message_id = None;
+                    }
+                })?;
+            }
+            return Err(error);
+        }
         Ok(Outcome::Done(format!("in Thread {thread_id} fortgesetzt")))
     }
 
@@ -968,7 +1009,7 @@ impl App {
         state: &LimitState,
         now: u64,
     ) -> Result<Outcome> {
-        let Some(stopped_at) = parked.stopped_at else {
+        let Some(stopped_at_ms) = parked.stopped_at_ms else {
             return Ok(match grace_over(state, now) {
                 true => Outcome::Done("nicht fortgesetzt: Turn-Ende nie gesehen".to_owned()),
                 false => Outcome::Pending,
@@ -982,7 +1023,7 @@ impl App {
         if parked
             .transcript
             .as_deref()
-            .is_some_and(|transcript| user_prompt_after(transcript, stopped_at, None))
+            .is_some_and(|transcript| user_prompt_after(transcript, stopped_at_ms, None))
         {
             return Ok(Outcome::Done(
                 "lief nach dem Stopp schon weiter, kein Fortsetzen noetig".to_owned(),
@@ -990,39 +1031,34 @@ impl App {
         }
         let existing = self.load_jobs()?.into_iter().find(|job| {
             job.title == RESUME_JOB_TITLE
-                && job.created_at >= stopped_at
+                && job.created_at >= stopped_at_ms / 1000
                 && matches!(&job.kind, JobKind::Resume { session_id, .. } if session_id == session)
         });
-        let mut job = match existing {
-            Some(job) if job.last_run_at.is_some() || !job.enabled => {
-                return Ok(Outcome::Done(format!(
-                    "wurde schon als Aufgabe [{}] fortgesetzt",
-                    job.id
-                )));
-            }
-            Some(job) => job,
-            None => self.add_job(
-                JobKind::Resume {
-                    session_id: session.to_owned(),
-                    text: resume_message(parked, todo_after(parked).as_deref()),
-                },
-                cwd,
-                JobOptions {
-                    title: Some(RESUME_JOB_TITLE.to_owned()),
-                    skip_permissions: false,
-                    ..JobOptions::default()
-                },
-            )?,
-        };
-        job.last_window = None;
-        job.continuation_guard = parked
-            .transcript
-            .clone()
-            .map(|transcript| ContinuationGuard {
-                transcript,
-                since: stopped_at,
-            });
-        self.write_job(&job)?;
+        if let Some(job) = existing {
+            return Ok(Outcome::Done(format!(
+                "ist schon als Aufgabe [{}] eingeplant",
+                job.id
+            )));
+        }
+        let job = self.add_guarded_job(
+            JobKind::Resume {
+                session_id: session.to_owned(),
+                text: resume_message(parked, todo_after(parked).as_deref()),
+            },
+            cwd,
+            JobOptions {
+                title: Some(RESUME_JOB_TITLE.to_owned()),
+                skip_permissions: false,
+                ..JobOptions::default()
+            },
+            parked
+                .transcript
+                .clone()
+                .map(|transcript| ContinuationGuard {
+                    transcript,
+                    since_ms: stopped_at_ms,
+                }),
+        )?;
         Ok(Outcome::Done(format!(
             "als Aufgabe [{}] eingeplant",
             job.id
@@ -1060,7 +1096,7 @@ impl App {
             println!(
                 "  Sitzung {session}: Thread {}, {}, TODO {}",
                 parked.thread_id.as_deref().unwrap_or("-"),
-                if parked.stopped_at.is_some() {
+                if parked.stopped_at_ms.is_some() {
                     "angehalten"
                 } else {
                     "angewiesen"
@@ -1130,7 +1166,7 @@ mod tests {
         }));
         assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 11).is_none());
         assert!(hook_reply(&input("Stop", "s"), &mut state, 12).is_none());
-        assert_eq!(state.sessions["s"].stopped_at, Some(12));
+        assert_eq!(state.sessions["s"].stopped_at_ms, Some(12));
     }
 
     #[test]
@@ -1142,7 +1178,7 @@ mod tests {
             Some(json!("block"))
         );
         assert!(hook_reply(&input("Stop", "s"), &mut state, 20).is_none());
-        assert_eq!(state.sessions["s"].stopped_at, Some(20));
+        assert_eq!(state.sessions["s"].stopped_at_ms, Some(20));
     }
 
     #[test]
@@ -1182,7 +1218,7 @@ mod tests {
         assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 15).is_none());
         assert!(hook_reply(&input("Stop", "s"), &mut state, 20).is_none());
         assert!(hook_reply(&input("Stop", "s"), &mut state, 30).is_none());
-        assert_eq!(state.sessions["s"].stopped_at, Some(20));
+        assert_eq!(state.sessions["s"].stopped_at_ms, Some(20));
         assert!(hook_reply(&input("Stop", "new"), &mut state, 30).is_none());
         assert!(!state.sessions.contains_key("new"));
     }
@@ -1331,7 +1367,7 @@ mod tests {
         let mut stop = input("Stop", "s");
         stop.stop_hook_active = true;
         assert!(hook_reply(&stop, &mut state, 40).is_none());
-        assert_eq!(state.sessions["s"].stopped_at, Some(40));
+        assert_eq!(state.sessions["s"].stopped_at_ms, Some(40));
     }
 
     #[test]
@@ -1354,8 +1390,8 @@ mod tests {
     #[test]
     fn reentry_keeps_only_stopped_sessions_and_forgets_compactions() {
         let mut state = LimitState::default();
-        let parked = |stopped_at: Option<u64>, continued_by_user: bool| Parked {
-            stopped_at,
+        let parked = |stopped_at_ms: Option<u64>, continued_by_user: bool| Parked {
+            stopped_at_ms,
             continued_by_user,
             ..Parked::default()
         };
@@ -1379,7 +1415,7 @@ mod tests {
         active_state.active = true;
         assert!(hook_reply(&input("PostToolUse", "running"), &mut active_state, 50).is_some());
         assert!(!active_state.sessions["running"].retell);
-        assert_eq!(active_state.sessions["running"].told_at, 50);
+        assert_eq!(active_state.sessions["running"].told_at_ms, 50);
         assert!(state.compacted.is_empty() && state.compacting_sessions.is_empty());
         assert!(state.inspected.is_empty());
     }
@@ -1391,8 +1427,8 @@ mod tests {
         hook_reply(&input("Stop", "s"), &mut state, 20);
         let again = hook_reply(&input("PostToolUse", "s"), &mut state, 30);
         assert!(again.is_some());
-        assert_eq!(state.sessions["s"].told_at, 30);
-        assert_eq!(state.sessions["s"].stopped_at, None);
+        assert_eq!(state.sessions["s"].told_at_ms, 30);
+        assert_eq!(state.sessions["s"].stopped_at_ms, None);
     }
 
     #[test]
@@ -1404,7 +1440,7 @@ mod tests {
             }
             value.to_string()
         };
-        let stop = 1_793_095_500;
+        let stop = 1_793_095_500_300;
         let before = line(
             "2026-10-27T10:00:00Z",
             json!({ "message": { "content": "go on" } }),
@@ -1444,10 +1480,22 @@ mod tests {
         let filler = vec![late; 4_000].join("\n");
         assert!(!check(&[before.clone(), filler.clone()].join("\n"), None));
         assert!(check(
-            &[before.clone(), prompt, filler.clone()].join("\n"),
+            &[before.clone(), prompt.clone(), filler.clone()].join("\n"),
             None
         ));
         assert!(!check(&before, None));
+        let same_second = |time: &str| line(time, json!({ "message": { "content": "typed" } }));
+        assert!(check(&same_second("2026-10-27T10:05:00.400Z"), None));
+        assert!(!check(&same_second("2026-10-27T10:05:00.200Z"), None));
+        let huge = line(
+            "2026-10-27T10:50:00Z",
+            json!({ "message": { "content": [{ "type": "tool_result", "content": "x".repeat(300_000) }] } }),
+        );
+        assert!(check(
+            &[before.clone(), prompt.clone(), huge.clone()].join("\n"),
+            None
+        ));
+        assert!(!check(&[before, huge].join("\n"), None));
     }
 
     #[test]
@@ -1463,8 +1511,9 @@ mod tests {
             last_item_is_compaction: false,
             last_compaction_at: None,
             last_foreign_message_at: foreign.and_then(at),
+            message_ids: Vec::new(),
         };
-        let told = 1_793_095_500;
+        let told = 1_793_095_500_300;
         assert!(!foreign_message_after(&detail(None), told));
         assert!(!foreign_message_after(
             &detail(Some("2026-10-27T10:00:00Z")),
@@ -1472,6 +1521,14 @@ mod tests {
         ));
         assert!(foreign_message_after(
             &detail(Some("2026-10-27T10:05:01Z")),
+            told
+        ));
+        assert!(!foreign_message_after(
+            &detail(Some("2026-10-27T10:05:00.200Z")),
+            told
+        ));
+        assert!(foreign_message_after(
+            &detail(Some("2026-10-27T10:05:00.400Z")),
             told
         ));
     }
@@ -1491,12 +1548,12 @@ mod tests {
             line("2026-10-27T10:10:00Z", "Done reading."),
         ]
         .join("\n");
-        let told = 1_793_095_500;
+        let told = 1_793_095_500_000;
         assert_eq!(
             assistant_text_since(&tail, told).and_then(|text| find_todo_path(&text)),
             None
         );
-        assert!(assistant_text_since(&tail, told - 1000).is_some());
+        assert!(assistant_text_since(&tail, told - 1_000_000).is_some());
     }
 
     #[test]
