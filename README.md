@@ -207,7 +207,7 @@ Genau daraus folgt der Notfall: waeren alle Accounts ueber ihren eigenen Grenzen
 Der Endpunkt ist ratenbegrenzt und antwortet unter Last mit `429`. Ohne Gegenmassnahme faellt dann ausgerechnet der Account als Ziel aus, der bewertet werden muesste. Deshalb zwei Vorkehrungen:
 
 - Solange der aktive Account unter seiner Grenze liegt, werden die anderen gar nicht erst abgefragt. Im Normalbetrieb ist das eine Anfrage pro Minute statt einer pro Account.
-- Jede gelesene Auslastung wird gemerkt. Ein Stand aus den letzten 45 Sekunden wird ohne neue Anfrage benutzt; scheitert eine Anfrage, traegt ein Stand bis zu 30 Minuten weiter. Sein Alter steht dann in jeder Zeile, die darauf beruht. Aeltere Zahlen werden verworfen — sie wuerden einen Wechsel auf einen laengst vollen Account begruenden.
+- Jede gelesene Auslastung wird gemerkt. Ein Stand aus den letzten 45 Sekunden wird ohne neue Anfrage benutzt; scheitert eine Anfrage, traegt ein Stand bis zu 30 Minuten weiter. Sein Alter steht dann in jeder Zeile, die darauf beruht. Aeltere Zahlen gelten nur noch fuer einen ruhenden Account, den die API drosselt, und nur wenn kein Account mit frischen Zahlen frei ist. Fenster, deren Reset vorbei ist, zaehlen dabei als leer.
 
 Gemerkt werden nur Prozentwerte und Zeitpunkte, keine Zugangsdaten.
 
