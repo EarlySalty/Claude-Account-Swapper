@@ -486,9 +486,25 @@ fn limit_reason(levels: &[Level]) -> String {
     format!("no saved Claude account has quota left ({figures})")
 }
 
-fn still_blocked(config: &Config, levels: &[Level], active_profile: Option<&str>) -> bool {
-    let verdict = verdict(config, levels, active_profile);
-    !verdict.released && (verdict.at_limit || !config.auto_switch)
+fn still_blocked(
+    config: &Config,
+    levels: &[Level],
+    active_profile: impl FnOnce() -> Option<String>,
+) -> bool {
+    let limit = &config.limit_compact;
+    if !limit.enabled {
+        return false;
+    }
+    if limit.force {
+        return true;
+    }
+    if config.auto_switch {
+        return !levels
+            .iter()
+            .filter_map(|(_, candidate)| candidate.as_ref())
+            .any(|candidate| fit(candidate, config) != Fit::No);
+    }
+    !verdict(config, levels, active_profile().as_deref()).released
 }
 
 fn reenter(state: &mut LimitState) -> Vec<String> {
@@ -588,17 +604,22 @@ impl App {
             serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
         input.entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
         let now = unix_millis()?;
-        let blocked = !state.active || self.blocked_now()?;
+        let relevant = state.active
+            && input.agent_id.is_none()
+            && (state.scope.is_empty() || state.scope.contains(&input.session_id));
+        let blocked = !relevant || self.blocked_now().unwrap_or(true);
         let reply =
             self.update_limit_state(|state| hook_reply_with(&input, state, now, blocked))?;
         Ok(reply.map(|value| value.to_string()))
     }
 
     fn blocked_now(&self) -> Result<bool> {
+        self.check_config_file()?;
         let config = self.load_config();
         let levels = self.cached_levels()?;
-        let active = self.active_profile_name_memoized(None);
-        Ok(still_blocked(&config, &levels, active.as_deref()))
+        Ok(still_blocked(&config, &levels, || {
+            self.active_profile_name_memoized(None)
+        }))
     }
 
     fn t3_client(&self, limit: &LimitCompact) -> t3::Client {
@@ -1341,16 +1362,29 @@ mod tests {
     }
 
     #[test]
-    fn freed_account_lifts_the_block_only_when_it_can_be_used() {
+    fn only_a_proven_free_account_lifts_the_block() {
+        let active = |name: &'static str| move || Some(name.to_owned());
         let levels = vec![
             ("a".to_owned(), usage(100.0, 10.0)),
             ("b".to_owned(), usage(10.0, 10.0)),
         ];
-        assert!(!still_blocked(&config(true), &levels, Some("a")));
-        assert!(still_blocked(&config(false), &levels, Some("a")));
-        assert!(!still_blocked(&config(false), &levels, Some("b")));
+        assert!(!still_blocked(&config(true), &levels, active("a")));
+        assert!(still_blocked(&config(false), &levels, active("a")));
+        assert!(!still_blocked(&config(false), &levels, active("b")));
         let full = vec![("a".to_owned(), usage(100.0, 10.0))];
-        assert!(still_blocked(&config(true), &full, Some("a")));
+        assert!(still_blocked(&config(true), &full, active("a")));
+        let unknown = vec![("a".to_owned(), usage(100.0, 10.0)), ("b".to_owned(), None)];
+        assert!(still_blocked(&config(true), &unknown, active("a")));
+        let mut forced = config(true);
+        forced.limit_compact.force = true;
+        assert!(still_blocked(&forced, &levels, active("a")));
+    }
+
+    #[test]
+    fn t3_gets_two_minutes_to_resume_first() {
+        assert!(settling(1_000, 1));
+        assert!(settling(1_000, 120));
+        assert!(!settling(1_000, 121));
     }
 
     #[test]
