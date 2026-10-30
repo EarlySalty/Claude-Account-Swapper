@@ -509,7 +509,13 @@ fn profile_url() -> String {
         .unwrap_or_else(|| DEFAULT_PROFILE_URL.to_owned())
 }
 
-pub fn fetch_account_email(access_token: &str) -> Result<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveAccount {
+    pub email: String,
+    pub org_id: Option<String>,
+}
+
+pub fn fetch_live_account(access_token: &str) -> Result<LiveAccount> {
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(REQUEST_TIMEOUT_SECONDS)))
@@ -530,13 +536,13 @@ pub fn fetch_account_email(access_token: &str) -> Result<String> {
     if status != 200 {
         bail!("Profil-API antwortete mit HTTP {status}");
     }
-    parse_account_email(&body)
+    parse_live_account(&body)
 }
 
-pub fn parse_account_email(body: &str) -> Result<String> {
+pub fn parse_live_account(body: &str) -> Result<LiveAccount> {
     let value: Value =
         serde_json::from_str(body).context("Profil-API lieferte kein gueltiges JSON")?;
-    value
+    let email = value
         .get("account")
         .and_then(|account| {
             account
@@ -547,7 +553,15 @@ pub fn parse_account_email(body: &str) -> Result<String> {
         .map(str::trim)
         .filter(|email| !email.is_empty())
         .map(str::to_owned)
-        .context("Profil-API lieferte keine E-Mail-Adresse")
+        .context("Profil-API lieferte keine E-Mail-Adresse")?;
+    let org_id = value
+        .get("organization")
+        .and_then(|organization| organization.get("uuid"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_owned);
+    Ok(LiveAccount { email, org_id })
 }
 
 /// Liest die beiden interessanten Fenster aus der Antwort.
@@ -598,6 +612,22 @@ mod tests {
 
     fn usage(five: f64, seven: f64) -> Usage {
         usage_at(five, seven, "2026-08-03T20:00:00Z", "2026-08-09T02:00:00Z")
+    }
+
+    #[test]
+    fn live_account_reads_email_and_organization() {
+        let body = r#"{"account":{"email":" work@example.test ","uuid":"a"},"organization":{"uuid":"org-1","name":"x"},"application":{}}"#;
+        assert_eq!(
+            parse_live_account(body).expect("account"),
+            LiveAccount {
+                email: "work@example.test".to_owned(),
+                org_id: Some("org-1".to_owned()),
+            }
+        );
+        let without_org = parse_live_account(r#"{"account":{"email":"a@b.c"}}"#).expect("account");
+        assert_eq!(without_org.org_id, None);
+        assert!(parse_live_account(r#"{"account":{"email":""}}"#).is_err());
+        assert!(parse_live_account(r#"{"organization":{"uuid":"org-1"}}"#).is_err());
     }
 
     fn usage_at(five: f64, seven: f64, five_reset: &str, seven_reset: &str) -> Usage {

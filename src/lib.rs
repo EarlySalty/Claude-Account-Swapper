@@ -284,6 +284,25 @@ impl AuthStatus {
 pub struct App {
     paths: Paths,
     active_memo: Arc<Mutex<Option<ActiveMemo>>>,
+    live_account_memo: Arc<Mutex<Option<LiveAccountMemo>>>,
+}
+
+struct LiveAccountMemo {
+    fingerprint: String,
+    checked_at: Instant,
+    account: Option<usage::LiveAccount>,
+}
+
+const LIVE_ACCOUNT_RETRY: Duration = Duration::from_secs(10 * 60);
+
+fn remembered_live_account(
+    memo: Option<&LiveAccountMemo>,
+    fingerprint: &str,
+    now: Instant,
+) -> Option<Option<usage::LiveAccount>> {
+    let memo = memo.filter(|memo| memo.fingerprint == fingerprint)?;
+    let fresh = now.saturating_duration_since(memo.checked_at) < LIVE_ACCOUNT_RETRY;
+    (memo.account.is_some() || fresh).then(|| memo.account.clone())
 }
 
 struct ActiveMemo {
@@ -300,6 +319,7 @@ impl App {
         Self {
             paths,
             active_memo: Arc::new(Mutex::new(None)),
+            live_account_memo: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3296,21 +3316,43 @@ impl App {
         if needs_refresh(&credentials) {
             return None;
         }
-        let token = read_access_token(&credentials).ok()?;
-        let email = match usage::fetch_account_email(&token) {
-            Ok(email) => email,
-            Err(error) => {
-                log_problem(&format!("Live-Login liess sich nicht zuordnen: {error:#}"));
-                return None;
-            }
-        };
-        let mut owners = profiles
-            .iter()
-            .filter(|profile| profile.email.eq_ignore_ascii_case(&email));
+        let account = self.live_account(&credentials)?;
+        let mut owners = profiles.iter().filter(|profile| {
+            profile.email.eq_ignore_ascii_case(&account.email)
+                && match (&account.org_id, &profile.org_id) {
+                    (Some(live), Some(saved)) => live == saved,
+                    _ => true,
+                }
+        });
         match (owners.next(), owners.next()) {
             (Some(owner), None) => Some(owner.clone()),
             _ => None,
         }
+    }
+
+    fn live_account(&self, credentials: &[u8]) -> Option<usage::LiveAccount> {
+        let fingerprint = credential_fingerprint(credentials).ok()?;
+        let mut memo = self.live_account_memo.lock().ok()?;
+        if let Some(known) = remembered_live_account(memo.as_ref(), &fingerprint, Instant::now()) {
+            return known;
+        }
+        let retried = memo
+            .as_ref()
+            .is_some_and(|memo| memo.fingerprint == fingerprint);
+        let account = read_access_token(credentials)
+            .and_then(|token| usage::fetch_live_account(&token))
+            .map_err(|error| {
+                if !retried {
+                    log_problem(&format!("Live-Login liess sich nicht zuordnen: {error:#}"));
+                }
+            })
+            .ok();
+        *memo = Some(LiveAccountMemo {
+            fingerprint,
+            checked_at: Instant::now(),
+            account: account.clone(),
+        });
+        account
     }
 
     /// Entfernt Claude Codes Identitaets-Cache aus `.claude.json`.
@@ -4105,4 +4147,44 @@ fn unix_millis() -> Result<u64> {
         .context("Systemzeit liegt vor 1970")?
         .as_millis();
     u64::try_from(millis).context("Systemzeit ausserhalb des Wertebereichs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memo(account: Option<usage::LiveAccount>, checked_at: Instant) -> LiveAccountMemo {
+        LiveAccountMemo {
+            fingerprint: "fp".to_owned(),
+            checked_at,
+            account,
+        }
+    }
+
+    #[test]
+    fn live_account_lookup_is_not_repeated_for_the_same_login() {
+        let now = Instant::now();
+        let account = usage::LiveAccount {
+            email: "work@example.test".to_owned(),
+            org_id: None,
+        };
+        let later = now + LIVE_ACCOUNT_RETRY * 3;
+        assert_eq!(
+            remembered_live_account(Some(&memo(Some(account.clone()), now)), "fp", later),
+            Some(Some(account))
+        );
+        assert_eq!(
+            remembered_live_account(Some(&memo(None, now)), "fp", now + Duration::from_secs(5)),
+            Some(None)
+        );
+        assert_eq!(
+            remembered_live_account(Some(&memo(None, now)), "fp", now + LIVE_ACCOUNT_RETRY),
+            None
+        );
+        assert_eq!(
+            remembered_live_account(Some(&memo(None, now)), "rotated", now),
+            None
+        );
+        assert_eq!(remembered_live_account(None, "fp", now), None);
+    }
 }
