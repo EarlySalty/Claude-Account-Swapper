@@ -26,6 +26,7 @@ const MAPPING_SLACK_SECONDS: i64 = 10 * 60;
 const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 const TRANSCRIPT_HEAD_BYTES: u64 = 64 * 1024;
 const RESUME_GRACE_SECONDS: u64 = 30 * 60;
+const T3_RESUME_SETTLE_MS: u64 = 2 * 60 * 1000;
 const TODO_FILE: &str = "TODO.md";
 const T3_ENTRYPOINT: &str = "sdk-ts";
 const ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
@@ -37,7 +38,6 @@ pub struct LimitState {
     pub since: Option<u64>,
     pub released_at: Option<u64>,
     pub reason: String,
-    pub free_at: Option<u64>,
     pub scope: Vec<String>,
     pub sessions: BTreeMap<String, Parked>,
     pub compacted: BTreeMap<String, u64>,
@@ -56,6 +56,7 @@ pub struct Parked {
     pub entrypoint: Option<String>,
     pub continued_by_user: bool,
     pub retell: bool,
+    pub resume_message_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -249,7 +250,12 @@ fn runs_in_t3(parked: &Parked) -> bool {
     entrypoint.as_deref() == Some(T3_ENTRYPOINT)
 }
 
-fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Value> {
+fn hook_reply_with(
+    input: &HookInput,
+    state: &mut LimitState,
+    now: u64,
+    still_blocked: bool,
+) -> Option<Value> {
     if input.session_id.is_empty() || input.agent_id.is_some() {
         return None;
     }
@@ -261,11 +267,7 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
     {
         return None;
     }
-    if !state.active
-        || state
-            .free_at
-            .is_some_and(|at| at.saturating_mul(1000) <= now)
-    {
+    if !state.active || !still_blocked {
         if input.hook_event_name == "Stop"
             && let Some(parked) = state.sessions.get_mut(&input.session_id)
         {
@@ -285,6 +287,7 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
                     parked.stopped_at_ms = None;
                     parked.continued_by_user = false;
                     parked.retell = false;
+                    parked.resume_message_id = None;
                 }
                 Some(_) => return None,
                 None => {
@@ -483,19 +486,9 @@ fn limit_reason(levels: &[Level]) -> String {
     format!("no saved Claude account has quota left ({figures})")
 }
 
-fn earliest_free(config: &Config, levels: &[Level]) -> Option<u64> {
-    let five_hour = config.limit_compact.threshold.min(config.threshold);
-    levels
-        .iter()
-        .filter_map(|(_, candidate)| candidate.as_ref())
-        .filter(|candidate| !hard_blocked(candidate, config))
-        .filter_map(|candidate| {
-            candidate
-                .usage
-                .unblocked_at_with(five_hour, config.threshold)
-        })
-        .min()
-        .and_then(|at| u64::try_from(at.timestamp()).ok())
+fn still_blocked(config: &Config, levels: &[Level], active_profile: Option<&str>) -> bool {
+    let verdict = verdict(config, levels, active_profile);
+    !verdict.released && (verdict.at_limit || !config.auto_switch)
 }
 
 fn reenter(state: &mut LimitState) -> Vec<String> {
@@ -517,6 +510,14 @@ fn reenter(state: &mut LimitState) -> Vec<String> {
         }
     }
     dropped
+}
+
+fn is_t3_session(parked: &Parked) -> bool {
+    parked.thread_id.is_some() || runs_in_t3(parked)
+}
+
+fn settling(since_ms: u64, now: u64) -> bool {
+    now.saturating_mul(1000) < since_ms.saturating_add(T3_RESUME_SETTLE_MS)
 }
 
 fn grace_over(state: &LimitState, now: u64) -> bool {
@@ -587,8 +588,17 @@ impl App {
             serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
         input.entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
         let now = unix_millis()?;
-        let reply = self.update_limit_state(|state| hook_reply(&input, state, now))?;
+        let blocked = !state.active || self.blocked_now()?;
+        let reply =
+            self.update_limit_state(|state| hook_reply_with(&input, state, now, blocked))?;
         Ok(reply.map(|value| value.to_string()))
+    }
+
+    fn blocked_now(&self) -> Result<bool> {
+        let config = self.load_config();
+        let levels = self.cached_levels()?;
+        let active = self.active_profile_name_memoized(None);
+        Ok(still_blocked(&config, &levels, active.as_deref()))
     }
 
     fn t3_client(&self, limit: &LimitCompact) -> t3::Client {
@@ -708,7 +718,7 @@ impl App {
         if !limit.enabled {
             self.drop_parked("nicht fortgesetzt: Limit-Pause wurde abgeschaltet")?;
         } else if verdict.released {
-            let result = self.resume_pass(spoken, now);
+            let result = self.resume_pass(limit, spoken, now);
             report(spoken, "limit-resume", "Fortsetzen fehlgeschlagen", result);
         }
         Ok(())
@@ -722,18 +732,12 @@ impl App {
         now: u64,
     ) -> Result<()> {
         let limit = &config.limit_compact;
-        let free_at = if limit.force {
-            None
-        } else {
-            earliest_free(config, levels)
-        };
         let reason = if limit.force {
             "forced test mode of the account switcher".to_owned()
         } else {
             limit_reason(levels)
         };
         let (change, dropped) = self.update_limit_state(|state| {
-            state.free_at = free_at.filter(|_| state.active || verdict.at_limit);
             if state.active {
                 state.reason = reason.clone();
             }
@@ -922,15 +926,29 @@ impl App {
         })
     }
 
-    fn resume_pass(&self, spoken: &mut HashMap<String, String>, now: u64) -> Result<()> {
+    fn resume_pass(
+        &self,
+        limit: &LimitCompact,
+        spoken: &mut HashMap<String, String>,
+        now: u64,
+    ) -> Result<()> {
+        let before = self.load_limit_state()?;
+        let wants_t3 = before
+            .sessions
+            .values()
+            .any(|parked| !parked.continued_by_user && is_t3_session(parked));
+        let mut t3 = wants_t3.then(|| self.open_t3(limit, &before));
         let state = self.load_limit_state()?;
         for (session, parked) in &state.sessions {
             let outcome = if parked.continued_by_user {
                 Ok(Outcome::Done("wurde schon von Hand fortgesetzt".to_owned()))
-            } else if parked.thread_id.is_some() || runs_in_t3(parked) {
-                Ok(Outcome::Done(
-                    "laeuft in T3, T3 setzt selbst fort".to_owned(),
-                ))
+            } else if is_t3_session(parked) {
+                match t3.as_mut() {
+                    Some(Ok((threads, rpc))) => {
+                        self.resume_t3_session(rpc, threads, session, parked, &state, now)
+                    }
+                    _ => Ok(Outcome::Pending),
+                }
             } else {
                 self.resume_without_thread(session, parked, &state, now)
             };
@@ -960,7 +978,93 @@ impl App {
         if finished {
             log_event("Limit-Pause beendet: alle angehaltenen Sitzungen sind versorgt");
         }
-        Ok(())
+        match t3 {
+            Some(Err(error)) => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    fn open_t3(
+        &self,
+        limit: &LimitCompact,
+        state: &LimitState,
+    ) -> Result<(Vec<ThreadSummary>, t3::Rpc)> {
+        let client = self.t3_client(limit);
+        let threads = client.claude_threads()?;
+        let mut rpc = client.connect()?;
+        self.map_sessions(&mut rpc, &threads, state)?;
+        Ok((threads, rpc))
+    }
+
+    fn resume_t3_session(
+        &self,
+        rpc: &mut t3::Rpc,
+        threads: &[ThreadSummary],
+        session: &str,
+        parked: &Parked,
+        state: &LimitState,
+        now: u64,
+    ) -> Result<Outcome> {
+        let waiting_or = |done: &str| match grace_over(state, now) {
+            true => Outcome::Done(done.to_owned()),
+            false => Outcome::Pending,
+        };
+        let Some(stopped_at_ms) = parked.stopped_at_ms else {
+            return Ok(waiting_or("nicht fortgesetzt: Turn-Ende nie gesehen"));
+        };
+        let Some(thread_id) = parked.thread_id.as_deref() else {
+            return Ok(waiting_or(
+                "nicht fortgesetzt: kein passender T3-Thread gefunden",
+            ));
+        };
+        let Some(thread) = threads.iter().find(|thread| thread.id == thread_id) else {
+            return Ok(Outcome::Done(format!(
+                "nicht fortgesetzt: Thread {thread_id} ist archiviert oder geloescht"
+            )));
+        };
+        let detail = rpc.thread_detail(thread_id)?;
+        if let Some(id) = &parked.resume_message_id
+            && detail.message_ids.contains(id)
+        {
+            return Ok(Outcome::Done(format!("in Thread {thread_id} fortgesetzt")));
+        }
+        if foreign_message_after(&detail, parked.told_at_ms) {
+            return Ok(Outcome::Done(format!(
+                "wurde in Thread {thread_id} schon fortgesetzt"
+            )));
+        }
+        let released_ms = state.released_at.unwrap_or(0).saturating_mul(1000);
+        if settling(stopped_at_ms.max(released_ms), now) || thread.busy {
+            return Ok(Outcome::Pending);
+        }
+        let message_id = match &parked.resume_message_id {
+            Some(id) => id.clone(),
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                self.update_limit_state(|state| {
+                    if let Some(parked) = state.sessions.get_mut(session) {
+                        parked.resume_message_id = Some(id.clone());
+                    }
+                })?;
+                id
+            }
+        };
+        let sent = rpc.send_message(
+            thread_id,
+            &resume_message(parked, todo_after(parked).as_deref()),
+            &message_id,
+        );
+        if let Err(error) = sent {
+            if t3::is_rejection(&error) {
+                self.update_limit_state(|state| {
+                    if let Some(parked) = state.sessions.get_mut(session) {
+                        parked.resume_message_id = None;
+                    }
+                })?;
+            }
+            return Err(error);
+        }
+        Ok(Outcome::Done(format!("in Thread {thread_id} fortgesetzt")))
     }
 
     fn resume_without_thread(
@@ -1090,6 +1194,10 @@ pub fn log_hook_failure(error: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Value> {
+        hook_reply_with(input, state, now, true)
+    }
 
     fn input(event: &str, session: &str) -> HookInput {
         HookInput {
@@ -1221,16 +1329,28 @@ mod tests {
     }
 
     #[test]
-    fn hook_stays_silent_once_the_known_reset_has_passed() {
+    fn hook_stays_silent_when_fresh_usage_is_no_longer_blocked() {
         let mut state = LimitState {
             active: true,
             reason: "r".to_owned(),
-            free_at: Some(100),
             ..LimitState::default()
         };
-        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 100_000).is_none());
+        assert!(hook_reply_with(&input("PostToolUse", "s"), &mut state, 10, false).is_none());
         assert!(state.sessions.is_empty());
-        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 99_999).is_some());
+        assert!(hook_reply_with(&input("PostToolUse", "s"), &mut state, 10, true).is_some());
+    }
+
+    #[test]
+    fn freed_account_lifts_the_block_only_when_it_can_be_used() {
+        let levels = vec![
+            ("a".to_owned(), usage(100.0, 10.0)),
+            ("b".to_owned(), usage(10.0, 10.0)),
+        ];
+        assert!(!still_blocked(&config(true), &levels, Some("a")));
+        assert!(still_blocked(&config(false), &levels, Some("a")));
+        assert!(!still_blocked(&config(false), &levels, Some("b")));
+        let full = vec![("a".to_owned(), usage(100.0, 10.0))];
+        assert!(still_blocked(&config(true), &full, Some("a")));
     }
 
     #[test]
