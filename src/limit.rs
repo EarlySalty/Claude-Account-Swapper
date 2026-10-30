@@ -261,7 +261,11 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
     {
         return None;
     }
-    if !state.active || state.free_at.is_some_and(|at| at.saturating_mul(1000) <= now) {
+    if !state.active
+        || state
+            .free_at
+            .is_some_and(|at| at.saturating_mul(1000) <= now)
+    {
         if input.hook_event_name == "Stop"
             && let Some(parked) = state.sessions.get_mut(&input.session_id)
         {
@@ -729,7 +733,10 @@ impl App {
             limit_reason(levels)
         };
         let (change, dropped) = self.update_limit_state(|state| {
-            state.free_at = free_at;
+            state.free_at = free_at.filter(|_| state.active || verdict.at_limit);
+            if state.active {
+                state.reason = reason.clone();
+            }
             if verdict.at_limit && !state.active {
                 let dropped = reenter(state);
                 state.active = true;
@@ -1213,14 +1220,6 @@ mod tests {
         }
     }
 
-    fn hook_input(event: &str) -> HookInput {
-        HookInput {
-            session_id: "s".to_owned(),
-            hook_event_name: event.to_owned(),
-            ..HookInput::default()
-        }
-    }
-
     #[test]
     fn hook_stays_silent_once_the_known_reset_has_passed() {
         let mut state = LimitState {
@@ -1229,9 +1228,9 @@ mod tests {
             free_at: Some(100),
             ..LimitState::default()
         };
-        assert!(hook_reply(&hook_input("PostToolUse"), &mut state, 100_000).is_none());
+        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 100_000).is_none());
         assert!(state.sessions.is_empty());
-        assert!(hook_reply(&hook_input("PostToolUse"), &mut state, 99_999).is_some());
+        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 99_999).is_some());
     }
 
     #[test]

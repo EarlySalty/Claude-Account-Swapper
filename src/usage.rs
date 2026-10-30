@@ -196,7 +196,11 @@ impl Usage {
     /// `None` heisst "nicht datierbar" - entweder blockiert nichts, oder ein blockierendes
     /// Fenster nennt keinen Zeitpunkt. Beides schliesst den Account als Wartekandidaten aus:
     /// ein unbekannter Zeitpunkt darf nie als der fruehere durchgehen.
-    pub(crate) fn unblocked_at_with(&self, five_hour: f64, seven_day: f64) -> Option<DateTime<Utc>> {
+    pub(crate) fn unblocked_at_with(
+        &self,
+        five_hour: f64,
+        seven_day: f64,
+    ) -> Option<DateTime<Utc>> {
         let mut blocked: Option<DateTime<Utc>> = None;
         for (bucket, threshold) in [(self.five_hour, five_hour), (self.seven_day, seven_day)] {
             if bucket.utilization >= threshold {
