@@ -29,6 +29,18 @@ pub struct Bucket {
     pub resets_at: Option<DateTime<Utc>>,
 }
 
+impl Bucket {
+    fn settled(self, now: DateTime<Utc>) -> Self {
+        match self.resets_at {
+            Some(resets_at) if resets_at <= now => Self {
+                utilization: 0.0,
+                ..self
+            },
+            _ => self,
+        }
+    }
+}
+
 /// Die beiden Fenster, die ueber die Nutzbarkeit eines Accounts entscheiden.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
@@ -161,6 +173,13 @@ impl Candidate {
 }
 
 impl Usage {
+    pub fn settled(self, now: DateTime<Utc>) -> Self {
+        Self {
+            five_hour: self.five_hour.settled(now),
+            seven_day: self.seven_day.settled(now),
+        }
+    }
+
     /// Beide Fenster liegen unter der Schwelle - der Account ist benutzbar.
     pub fn is_free(&self, threshold: f64) -> bool {
         self.is_free_with(threshold, threshold)

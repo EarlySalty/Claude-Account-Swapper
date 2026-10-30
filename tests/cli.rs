@@ -1830,7 +1830,7 @@ impl Drop for UsageServer {
 }
 
 fn usage_body(five: f64, seven: f64) -> String {
-    usage_body_with_resets(five, seven, "2026-08-03T20:00:00Z", "2026-08-09T02:00:00Z")
+    usage_body_with_resets(five, seven, "2099-08-03T20:00:00Z", "2099-08-09T02:00:00Z")
 }
 
 fn usage_body_with_resets(five: f64, seven: f64, five_reset: &str, seven_reset: &str) -> String {
@@ -2298,8 +2298,8 @@ fn write_cached_usage(harness: &Harness, name: &str, five: f64, seven: f64, age_
         .expect("clock")
         .as_secs();
     let payload = json!({
-        "five_hour": {"utilization": five, "resets_at": "2026-08-03T20:00:00Z"},
-        "seven_day": {"utilization": seven, "resets_at": "2026-08-09T02:00:00Z"},
+        "five_hour": {"utilization": five, "resets_at": "2099-08-03T20:00:00Z"},
+        "seven_day": {"utilization": seven, "resets_at": "2099-08-09T02:00:00Z"},
         "fetched_at": now - age_seconds
     });
     fs::write(
@@ -2307,6 +2307,67 @@ fn write_cached_usage(harness: &Harness, name: &str, five: f64, seven: f64, age_
         serde_json::to_vec(&payload).expect("usage json"),
     )
     .expect("write usage cache");
+}
+
+#[test]
+fn a_throttled_target_counts_with_its_old_usage_and_expired_windows_are_free() {
+    let harness = harness_with_two_accounts();
+    write_cached_usage(&harness, "work", 50.0, 100.0, 300);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let payload = json!({
+        "five_hour": {"utilization": 100.0, "resets_at": "2020-01-01T00:00:00Z"},
+        "seven_day": {"utilization": 65.0, "resets_at": "2099-08-09T02:00:00Z"},
+        "fetched_at": now - 10 * 60 * 60
+    });
+    fs::write(
+        harness
+            .store
+            .join("accounts")
+            .join("personal")
+            .join("usage.json"),
+        serde_json::to_vec(&payload).expect("usage json"),
+    )
+    .expect("write usage cache");
+    let server = UsageServer::start(vec![
+        ("access-work", 429, r#"{"error":{}}"#.to_owned()),
+        ("access-personal", 429, r#"{"error":{}}"#.to_owned()),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Wuerde wechseln zu personal"), "{stdout}");
+    assert!(stdout.contains("5h 0%"), "{stdout}");
+    assert!(stdout.contains("Stand von vor 600 min"), "{stdout}");
+}
+
+#[test]
+fn an_active_account_does_not_trust_usage_older_than_the_cache_limit() {
+    let harness = harness_with_two_accounts();
+    write_cached_usage(&harness, "work", 50.0, 50.0, 10 * 60 * 60);
+    write_cached_usage(&harness, "personal", 5.0, 5.0, 300);
+    let server = UsageServer::start(vec![
+        ("access-work", 429, r#"{"error":{}}"#.to_owned()),
+        ("access-personal", 429, r#"{"error":{}}"#.to_owned()),
+    ]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("Wuerde wechseln"), "{stdout}\n{stderr}");
 }
 
 /// Der Endpunkt ist selbst ratenbegrenzt. Faellt er mit 429 aus, darf nicht ausgerechnet der

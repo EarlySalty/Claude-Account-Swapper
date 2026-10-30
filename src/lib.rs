@@ -1779,7 +1779,7 @@ impl App {
             usages.push(candidate);
         }
         for profile in profiles.iter().filter(|profile| profile.name != active) {
-            if let Some(candidate) = self.candidate(profile, renew) {
+            if let Some(candidate) = self.candidate_within(profile, renew, u64::MAX) {
                 usages.push(candidate);
             }
         }
@@ -1844,7 +1844,16 @@ impl App {
     /// spaetere Entscheidung beruht. `None` heisst: dieser Account faellt als Ziel aus - ein
     /// Wechsel auf gut Glueck kann in einem ebenfalls vollen Limit landen.
     fn candidate(&self, profile: &Profile, renew: bool) -> Option<Candidate> {
-        let (usage, age) = match self.profile_usage_cached(profile, renew) {
+        self.candidate_within(profile, renew, USAGE_CACHE_MAX_AGE_SECONDS)
+    }
+
+    fn candidate_within(
+        &self,
+        profile: &Profile,
+        renew: bool,
+        throttled_max_age: u64,
+    ) -> Option<Candidate> {
+        let (usage, age) = match self.profile_usage_within(profile, renew, throttled_max_age) {
             Ok(value) => value,
             Err(error) => {
                 log_problem(&format!(
@@ -1878,6 +1887,15 @@ impl App {
     /// Anfrage scheitert. Beides zusammen haelt die Bewertung auch dann am Leben, wenn der
     /// Endpunkt gerade mit `429` antwortet - und der Aufrufer erfaehrt, wie alt die Zahl ist.
     fn profile_usage_cached(&self, profile: &Profile, renew: bool) -> Result<(Usage, u64)> {
+        self.profile_usage_within(profile, renew, USAGE_CACHE_MAX_AGE_SECONDS)
+    }
+
+    fn profile_usage_within(
+        &self,
+        profile: &Profile,
+        renew: bool,
+        throttled_max_age: u64,
+    ) -> Result<(Usage, u64)> {
         let now = unix_timestamp()?;
         let cached = self.read_cached_usage(&profile.name);
         let age = |cached: &CachedUsage| now.saturating_sub(cached.fetched_at);
@@ -1892,7 +1910,14 @@ impl App {
             }
             Err(error) => {
                 let throttled = error.downcast_ref::<UsageThrottled>().is_some();
-                match cached.filter(|cached| age(cached) <= USAGE_CACHE_MAX_AGE_SECONDS) {
+                let rate_limited =
+                    throttled || error.downcast_ref::<usage::RateLimited>().is_some();
+                let max_age = if rate_limited {
+                    throttled_max_age
+                } else {
+                    USAGE_CACHE_MAX_AGE_SECONDS
+                };
+                match cached.filter(|cached| age(cached) <= max_age) {
                     Some(cached) if throttled => Ok((cached.usage, age(&cached))),
                     Some(cached) => {
                         log_problem(&format!(
@@ -1916,7 +1941,11 @@ impl App {
     /// Ein unlesbarer oder veralteter Cache ist kein Fehler, sondern nur kein Cache.
     fn read_cached_usage(&self, name: &str) -> Option<CachedUsage> {
         let data = fs::read(self.usage_cache_path(name)).ok()?;
-        serde_json::from_slice(&data).ok()
+        let cached: CachedUsage = serde_json::from_slice(&data).ok()?;
+        Some(CachedUsage {
+            usage: cached.usage.settled(chrono::Utc::now()),
+            ..cached
+        })
     }
 
     /// Der Cache haelt nur Prozentwerte und Zeitpunkte, keine Zugangsdaten.
