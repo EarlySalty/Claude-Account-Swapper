@@ -44,7 +44,8 @@ const USAGE_CHECK_INTERVAL_SECONDS: u64 = 60;
 /// benutzt. Knapp unter dem Pruefintervall, damit der Dienst nicht seinen eigenen Wert
 /// wiederverwendet, ein zusaetzlicher Aufruf von Hand aber ohne Anfrage auskommt.
 const USAGE_CACHE_FRESH_SECONDS: u64 = 45;
-/// Darueber hinaus ist ein gemerkter Stand nur noch Notnagel, wenn die Anfrage scheitert.
+/// Darueber hinaus ist ein gemerkter Stand nur noch Notnagel, wenn die Anfrage scheitert; fuer
+/// ein gedrosseltes Ziel ohne frische Alternative gilt diese Grenze nicht.
 /// Ein Fuenf-Stunden-Fenster bewegt sich in 30 Minuten nicht so weit, dass die Entscheidung
 /// dadurch unbrauchbar wuerde - eine ausgefallene Bewertung dagegen schon.
 const USAGE_CACHE_MAX_AGE_SECONDS: u64 = 30 * 60;

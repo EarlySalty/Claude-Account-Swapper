@@ -2472,7 +2472,7 @@ fn auto_ignores_a_stale_remembered_usage() {
     assert_eq!(
         fs::read(harness.active_credentials()).expect("live"),
         fs::read(harness.saved_credentials("work")).expect("snapshot"),
-        "mit veralteten Zahlen darf nicht gewechselt werden"
+        "ohne bekannte Auslastung des aktiven Accounts darf nicht gewechselt werden"
     );
 }
 

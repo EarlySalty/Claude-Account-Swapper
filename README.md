@@ -176,7 +176,7 @@ Ist er eingeschaltet, prueft der Dienst jede Minute. Erreicht das Fuenf-Stunden-
 [2026-08-03 18:38:35] Wuerde wechseln zu arbeit: alle Accounts sind voll; `privat` (5h 96%, 7d 37%, Schwelle 90%) wartet laenger als `arbeit` (5h 100%, 7d 76%, Schwelle 90%, frei ab 2026-08-03 21:39)
 ```
 
-Ein Account, dessen Auslastung sich nicht abrufen laesst, wird als Ziel ausgeschlossen und mit Grund gemeldet: ein Wechsel auf gut Glueck kann im naechsten vollen Limit landen. Schwelle aendern: `claude-account config --threshold 95`. Wieder abschalten: `claude-account config --auto-switch off`. Einzeln pruefen: `claude-account usage`, `claude-account auto --dry-run`.
+Ein Account, dessen Auslastung sich nicht abrufen laesst, wird als Ziel ausgeschlossen und mit Grund gemeldet: ein Wechsel auf gut Glueck kann im naechsten vollen Limit landen. Einzige Ausnahme ist ein ruhender Account, den die API drosselt: er zaehlt mit seinem letzten Stand, wenn kein Account mit frischen Zahlen frei ist. Schwelle aendern: `claude-account config --threshold 95`. Wieder abschalten: `claude-account config --auto-switch off`. Einzeln pruefen: `claude-account usage`, `claude-account auto --dry-run`.
 
 #### Wochenkontingent gleichmaessig verbrauchen
 
