@@ -173,7 +173,11 @@ esac
             .env("CLAUDE_ACCOUNT_SWITCHER_HOME", &self.store)
             .env("CLAUDE_ACCOUNT_SWITCHER_CLAUDE_BIN", &self.fake_claude)
             .env("FAKE_CLAUDE_STATUS", &self.status)
-            .env_remove("CLAUDE_CONFIG_DIR");
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env(
+                "CLAUDE_ACCOUNT_SWITCHER_PROFILE_URL",
+                "http://127.0.0.1:9/profile",
+            );
         command
     }
 
@@ -1850,6 +1854,48 @@ fn harness_with_two_accounts() -> Harness {
     harness.write_claude_json("work@example.test");
     assert_success(&harness.run(&["save", "work"]));
     harness
+}
+
+#[test]
+fn stale_identity_cache_after_switch_is_resolved_by_the_live_token() {
+    let harness = harness_with_two_accounts();
+    harness.set_active("personal@example.test", "access-work-rotated", "refresh-w2");
+    harness.write_claude_json("personal@example.test");
+    let server = UsageServer::start(vec![(
+        "access-work-rotated",
+        200,
+        json!({"account": {"email": "work@example.test"}}).to_string(),
+    )]);
+
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_PROFILE_URL", &server.url)
+        .args(["sync"])
+        .output()
+        .expect("sync");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("work"), "{stdout}");
+
+    let saved = fs::read(harness.saved_credentials("work")).expect("work credentials");
+    assert!(String::from_utf8_lossy(&saved).contains("access-work-rotated"));
+    let personal = fs::read(harness.saved_credentials("personal")).expect("personal credentials");
+    assert!(!String::from_utf8_lossy(&personal).contains("access-work-rotated"));
+    assert!(harness.read_claude_json().get("oauthAccount").is_none());
+}
+
+#[test]
+fn identity_conflict_stays_an_error_when_the_live_token_is_unknown() {
+    let harness = harness_with_two_accounts();
+    harness.set_active("personal@example.test", "access-unknown", "refresh-u");
+    harness.write_claude_json("personal@example.test");
+
+    let output = harness.run(&["sync"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("der Switcher hat zuletzt"), "{stderr}");
+    let personal = fs::read(harness.saved_credentials("personal")).expect("personal credentials");
+    assert!(!String::from_utf8_lossy(&personal).contains("access-unknown"));
 }
 
 #[test]

@@ -3240,8 +3240,9 @@ impl App {
         }
 
         let matches: Vec<Profile> = profiles
-            .into_iter()
+            .iter()
             .filter(|profile| status.matches(profile))
+            .cloned()
             .collect();
         let profile = match matches.as_slice() {
             [profile] => profile.clone(),
@@ -3256,6 +3257,16 @@ impl App {
         if let Some(last_active) = last_active
             && last_active != profile.name
         {
+            if let Some(live) = self.profile_of_live_token(&profiles) {
+                if live.name != profile.name {
+                    self.clear_cached_identity()?;
+                    log_event(&format!(
+                        "Claudes Identitaets-Cache nannte `{}`, der Live-Login gehoert laut Anthropic zu `{}`; veralteten Cache entfernt",
+                        profile.name, live.name
+                    ));
+                }
+                return Ok(live);
+            }
             bail!(
                 "Claude meldet `{}` ({}), der Switcher hat zuletzt `{last_active}` aktiviert; \
                  beende offene Claude-Code-Sessions und starte Claude einmal neu, oder speichere \
@@ -3265,6 +3276,28 @@ impl App {
             );
         }
         Ok(profile)
+    }
+
+    fn profile_of_live_token(&self, profiles: &[Profile]) -> Option<Profile> {
+        let credentials = read_valid_credentials(&self.paths.credentials).ok()?;
+        if needs_refresh(&credentials) {
+            return None;
+        }
+        let token = read_access_token(&credentials).ok()?;
+        let email = match usage::fetch_account_email(&token) {
+            Ok(email) => email,
+            Err(error) => {
+                log_problem(&format!("Live-Login liess sich nicht zuordnen: {error:#}"));
+                return None;
+            }
+        };
+        let mut owners = profiles
+            .iter()
+            .filter(|profile| profile.email.eq_ignore_ascii_case(&email));
+        match (owners.next(), owners.next()) {
+            (Some(owner), None) => Some(owner.clone()),
+            _ => None,
+        }
     }
 
     /// Entfernt Claude Codes Identitaets-Cache aus `.claude.json`.

@@ -17,6 +17,7 @@ pub const DEFAULT_SWITCH_THRESHOLD: f64 = 98.0;
 /// Ein haengender Request wuerde sonst den Hintergrunddienst anhalten.
 const REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const DEFAULT_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 
 /// Ein Limitfenster: wie voll es ist und wann es sich zuruecksetzt.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -499,6 +500,54 @@ pub fn fetch(access_token: &str) -> Result<Usage> {
         bail!("Auslastungs-API antwortete mit HTTP {status}");
     }
     parse(&body)
+}
+
+fn profile_url() -> String {
+    std::env::var("CLAUDE_ACCOUNT_SWITCHER_PROFILE_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROFILE_URL.to_owned())
+}
+
+pub fn fetch_account_email(access_token: &str) -> Result<String> {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(REQUEST_TIMEOUT_SECONDS)))
+            .http_status_as_error(false)
+            .build(),
+    );
+    let mut response = agent
+        .get(&profile_url())
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .header("Accept", "application/json")
+        .call()
+        .map_err(|error| anyhow::anyhow!("Kontodaten konnten nicht abgefragt werden: {error}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .context("Antwort der Profil-API konnte nicht gelesen werden")?;
+    if status != 200 {
+        bail!("Profil-API antwortete mit HTTP {status}");
+    }
+    parse_account_email(&body)
+}
+
+pub fn parse_account_email(body: &str) -> Result<String> {
+    let value: Value =
+        serde_json::from_str(body).context("Profil-API lieferte kein gueltiges JSON")?;
+    value
+        .get("account")
+        .and_then(|account| {
+            account
+                .get("email")
+                .or_else(|| account.get("email_address"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .map(str::to_owned)
+        .context("Profil-API lieferte keine E-Mail-Adresse")
 }
 
 /// Liest die beiden interessanten Fenster aus der Antwort.
