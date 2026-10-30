@@ -34,7 +34,7 @@ impl Bucket {
         match self.resets_at {
             Some(resets_at) if resets_at <= now => Self {
                 utilization: 0.0,
-                ..self
+                resets_at: None,
             },
             _ => self,
         }
@@ -241,6 +241,21 @@ impl Decision {
 /// Account, der am fruehesten wieder frei ist.
 pub fn pick_target(active: &str, accounts: &[Candidate], threshold: f64) -> Decision {
     pick_target_with(active, accounts, threshold, None)
+}
+
+pub fn with_stale_targets(
+    active: &str,
+    threshold: f64,
+    mut fresh: Vec<Candidate>,
+    stale: Vec<Candidate>,
+) -> Vec<Candidate> {
+    let confirmed_target = fresh
+        .iter()
+        .any(|candidate| candidate.name != active && candidate.within_stops(threshold));
+    if !confirmed_target {
+        fresh.extend(stale);
+    }
+    fresh
 }
 
 const WEEK_HOURS: f64 = 7.0 * 24.0;
@@ -631,6 +646,49 @@ mod tests {
 
     fn usage(five: f64, seven: f64) -> Usage {
         usage_at(five, seven, "2026-08-03T20:00:00Z", "2026-08-09T02:00:00Z")
+    }
+
+    fn named(name: &str, usage: Usage) -> Candidate {
+        Candidate {
+            name: name.to_owned(),
+            usage,
+            stops: Stops::default(),
+        }
+    }
+
+    #[test]
+    fn stale_targets_only_count_without_a_confirmed_free_target() {
+        let active = named("active", usage(50.0, 100.0));
+        let free = named("fresh", usage(20.0, 20.0));
+        let full = named("fresh", usage(100.0, 100.0));
+        let stale = named("stale", usage(5.0, 5.0));
+        let names = |list: Vec<Candidate>| {
+            list.into_iter()
+                .map(|candidate| candidate.name)
+                .collect::<Vec<_>>()
+        };
+
+        let with_free = vec![active.clone(), free];
+        let kept = with_stale_targets("active", 98.0, with_free, vec![stale.clone()]);
+        assert_eq!(names(kept), ["active", "fresh"]);
+
+        let with_full = vec![active.clone(), full];
+        let kept = with_stale_targets("active", 98.0, with_full, vec![stale.clone()]);
+        assert_eq!(names(kept), ["active", "fresh", "stale"]);
+
+        let kept = with_stale_targets("active", 98.0, vec![active], vec![stale]);
+        assert_eq!(names(kept), ["active", "stale"]);
+    }
+
+    #[test]
+    fn expired_windows_are_empty_and_have_no_reset() {
+        let now = at("2026-08-05T00:00:00Z");
+        let settled =
+            usage_at(100.0, 65.0, "2026-08-04T00:00:00Z", "2026-08-09T02:00:00Z").settled(now);
+        assert_eq!(settled.five_hour.utilization, 0.0);
+        assert_eq!(settled.five_hour.resets_at, None);
+        assert_eq!(settled.seven_day.utilization, 65.0);
+        assert!(settled.seven_day.resets_at.is_some());
     }
 
     #[test]

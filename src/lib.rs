@@ -1778,11 +1778,17 @@ impl App {
             }
             usages.push(candidate);
         }
+        let mut stale = Vec::new();
         for profile in profiles.iter().filter(|profile| profile.name != active) {
-            if let Some(candidate) = self.candidate_within(profile, renew, u64::MAX) {
-                usages.push(candidate);
+            if let Some((candidate, age)) = self.candidate_within(profile, renew, u64::MAX) {
+                if age > USAGE_CACHE_MAX_AGE_SECONDS {
+                    stale.push(candidate);
+                } else {
+                    usages.push(candidate);
+                }
             }
         }
+        let usages = usage::with_stale_targets(&active, threshold, usages, stale);
 
         let decision = usage::pick_target_with(&active, &usages, threshold, pacing);
         self.apply_decision(decision, dry_run)
@@ -1845,6 +1851,7 @@ impl App {
     /// Wechsel auf gut Glueck kann in einem ebenfalls vollen Limit landen.
     fn candidate(&self, profile: &Profile, renew: bool) -> Option<Candidate> {
         self.candidate_within(profile, renew, USAGE_CACHE_MAX_AGE_SECONDS)
+            .map(|(candidate, _age)| candidate)
     }
 
     fn candidate_within(
@@ -1852,7 +1859,7 @@ impl App {
         profile: &Profile,
         renew: bool,
         throttled_max_age: u64,
-    ) -> Option<Candidate> {
+    ) -> Option<(Candidate, u64)> {
         let (usage, age) = match self.profile_usage_within(profile, renew, throttled_max_age) {
             Ok(value) => value,
             Err(error) => {
@@ -1874,11 +1881,14 @@ impl App {
                 age => format!(" (Stand von vor {} min)", age / 60),
             }
         ));
-        Some(Candidate {
-            name: profile.name.clone(),
-            usage,
-            stops: profile.limits,
-        })
+        Some((
+            Candidate {
+                name: profile.name.clone(),
+                usage,
+                stops: profile.limits,
+            },
+            age,
+        ))
     }
 
     /// Die Auslastung eines Profils samt Alter des gelieferten Standes in Sekunden.

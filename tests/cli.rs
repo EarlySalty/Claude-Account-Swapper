@@ -2365,9 +2365,11 @@ fn an_active_account_does_not_trust_usage_older_than_the_cache_limit() {
         .args(["auto", "--dry-run"])
         .output()
         .expect("auto");
+    assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stdout.contains("Wuerde wechseln"), "{stdout}\n{stderr}");
+    assert!(stderr.contains("`work` ist unbekannt"), "{stderr}");
 }
 
 /// Der Endpunkt ist selbst ratenbegrenzt. Faellt er mit 429 aus, darf nicht ausgerechnet der
@@ -2443,8 +2445,8 @@ fn a_rate_limited_account_is_not_asked_again_during_the_backoff() {
     );
 }
 
-/// Zu alte gemerkte Zahlen sind schlechter als keine: sie wuerden einen Wechsel auf einen
-/// laengst vollen Account begruenden.
+/// Ist auch der aktive Account zu alt, wird nicht gewechselt: seine Lage ist unbekannt, und ohne
+/// sie laesst sich kein Wechsel begruenden.
 #[test]
 fn auto_ignores_a_stale_remembered_usage() {
     let harness = harness_with_two_accounts();
