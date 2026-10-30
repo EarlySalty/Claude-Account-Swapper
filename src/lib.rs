@@ -1312,7 +1312,11 @@ impl App {
         status: &AuthStatus,
         credentials: &[u8],
     ) -> Result<Profile> {
-        let mut profile = self.resolve_active_profile(status)?;
+        let profile = self.resolve_active_profile(status)?;
+        self.store_live_credentials(profile, credentials)
+    }
+
+    fn store_live_credentials(&self, mut profile: Profile, credentials: &[u8]) -> Result<Profile> {
         atomic_write(&self.profile_credentials(&profile.name), credentials, 0o600)?;
         profile.credential_fingerprint = Some(credential_fingerprint(credentials)?);
         profile.credentials_synced_at = Some(unix_timestamp()?);
@@ -1348,7 +1352,7 @@ impl App {
             );
         }
         let credentials = read_valid_credentials(&self.paths.credentials)?;
-        let profile = self.resolve_active_profile(&status)?;
+        let profile = self.resolve_active_profile_with(&status, true)?;
 
         let stored = fs::read(self.profile_credentials(&profile.name)).unwrap_or_default();
         if stored == credentials {
@@ -1364,7 +1368,7 @@ impl App {
             });
         }
 
-        let synced = self.sync_known_active_with_credentials(&status, &credentials)?;
+        let synced = self.store_live_credentials(profile, &credentials)?;
         Ok(SyncOutcome::Updated {
             email: synced.email,
             profile: synced.name,
@@ -3219,9 +3223,18 @@ impl App {
     /// Es gibt zwei Quellen: Claudes Identitaets-Cache in `.claude.json` und den zuletzt vom
     /// Switcher gesetzten Account. Der Cache ist direkt nach einem Wechsel absichtlich leer und
     /// kann von einer laufenden Claude-Session mit veralteten Kontodaten neu geschrieben werden.
-    /// Widersprechen sich beide Quellen, laesst sich der aktive Login nicht sicher zuordnen; dann
-    /// wird abgebrochen statt geraten, sonst landen fremde Tokens in einem Profil.
+    /// Widersprechen sich beide Quellen, entscheidet im Sync-Pfad die Profil-API anhand des
+    /// Live-Tokens und der veraltete Cache wird entfernt. Lesende Pfade fragen die API nicht und
+    /// brechen bei einem Widerspruch ab statt zu raten, sonst landen fremde Tokens in einem Profil.
     fn resolve_active_profile(&self, status: &AuthStatus) -> Result<Profile> {
+        self.resolve_active_profile_with(status, false)
+    }
+
+    fn resolve_active_profile_with(
+        &self,
+        status: &AuthStatus,
+        check_live_token: bool,
+    ) -> Result<Profile> {
         if !status.logged_in {
             bail!("Claude Code ist nicht eingeloggt; nutze `claude-account login <name>`");
         }
@@ -3257,7 +3270,7 @@ impl App {
         if let Some(last_active) = last_active
             && last_active != profile.name
         {
-            if let Some(live) = self.profile_of_live_token(&profiles) {
+            if check_live_token && let Some(live) = self.profile_of_live_token(&profiles) {
                 if live.name != profile.name {
                     self.clear_cached_identity()?;
                     log_event(&format!(
