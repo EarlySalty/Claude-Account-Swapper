@@ -2618,9 +2618,10 @@ impl App {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .context("HOME ist nicht gesetzt")?;
-        let mut state = self.load_ping_state();
-        state.last_run_at = Some(unix_timestamp()?);
-        self.write_ping_state(&state)?;
+        self.update_ping_state(|state| {
+            state.last_run_at = Some(unix_timestamp()?);
+            Ok(())
+        })?;
 
         let outcome = self.run_claude_task(
             &self.paths.store.join("ping.log"),
@@ -2643,7 +2644,16 @@ impl App {
         // Der Beweis, dass der Ping wirklich ein Fenster eroeffnet hat, gehoert ins Log; die
         // Sperre zaehlt danach ab dem Ende des Laufs, nicht ab seinem Beginn.
         self.confirm_window("Fenster-Ping");
-        state.last_run_at = Some(unix_timestamp()?);
+        self.update_ping_state(|state| {
+            state.last_run_at = Some(unix_timestamp()?);
+            Ok(())
+        })
+    }
+
+    fn update_ping_state(&self, change: impl FnOnce(&mut PingState) -> Result<()>) -> Result<()> {
+        let _lock = self.lock_file("ping")?;
+        let mut state = self.load_ping_state();
+        change(&mut state)?;
         self.write_ping_state(&state)
     }
 
@@ -2652,9 +2662,24 @@ impl App {
         config: &Config,
         spoken: &mut HashMap<String, String>,
     ) -> Result<()> {
-        let active = self.active_profile_name().ok();
+        let active = match self.active_profile_name() {
+            Ok(active) => {
+                spoken.remove("ping-idle");
+                active
+            }
+            Err(error) => {
+                log_once(
+                    spoken,
+                    "ping-idle",
+                    &format!(
+                        "Fenster-Ping fuer ruhende Accounts wartet: aktiver Account unklar ({error:#})"
+                    ),
+                );
+                return Ok(());
+            }
+        };
         for profile in self.load_profiles()? {
-            if active.as_deref() == Some(profile.name.as_str()) {
+            if profile.name == active || self.carries_live_login(&profile) {
                 continue;
             }
             let Ok((usage, _age)) = self.profile_usage_cached(&profile, false) else {
@@ -2666,8 +2691,11 @@ impl App {
                 .idle_profiles
                 .get(&profile.name)
                 .copied();
-            let now = unix_timestamp()?;
-            match jobs::ping_readiness(&usage, config.threshold, last_run_at, now) {
+            let stops = [
+                profile.limits.five_hour.unwrap_or(config.threshold),
+                profile.limits.seven_day.unwrap_or(config.threshold),
+            ];
+            match jobs::ping_readiness_within(&usage, stops, last_run_at, unix_timestamp()?) {
                 Readiness::Due(reason) => {
                     log_event(&format!(
                         "Fenster-Ping fuer `{}` faellig: {reason}",
@@ -2680,6 +2708,7 @@ impl App {
                             profile.name
                         ));
                     }
+                    return Ok(());
                 }
                 Readiness::Waiting(reason) => log_once(
                     spoken,
@@ -2691,13 +2720,20 @@ impl App {
         Ok(())
     }
 
+    fn carries_live_login(&self, profile: &Profile) -> bool {
+        let live = fs::read(&self.paths.credentials).ok();
+        let snapshot = fs::read(self.profile_credentials(&profile.name)).ok();
+        snapshot.is_some() && snapshot == live
+    }
+
     fn ping_idle_profile(&self, profile: &Profile) -> Result<()> {
         let outcome = self.renew_profile(profile);
-        let mut state = self.load_ping_state();
-        state
-            .idle_profiles
-            .insert(profile.name.clone(), unix_timestamp()?);
-        self.write_ping_state(&state)?;
+        self.update_ping_state(|state| {
+            state
+                .idle_profiles
+                .insert(profile.name.clone(), unix_timestamp()?);
+            Ok(())
+        })?;
         match outcome? {
             RenewOutcome::Renewed | RenewOutcome::StillValid => {}
             RenewOutcome::Expired => {
@@ -2705,7 +2741,17 @@ impl App {
             }
             RenewOutcome::RequestFailed(reason) => bail!(reason),
         }
-        let usage = self.profile_usage(profile, false)?;
+        log_event(&format!("Fenster-Ping fuer `{}` gesendet", profile.name));
+        let usage = match self.profile_usage(profile, false) {
+            Ok(usage) => usage,
+            Err(error) => {
+                log_problem(&format!(
+                    "Fenster-Ping fuer `{}`: Fensterstand nicht bestaetigt ({error:#})",
+                    profile.name
+                ));
+                return Ok(());
+            }
+        };
         self.write_cached_usage(&profile.name, usage, unix_timestamp()?);
         match usage.five_hour.resets_at {
             Some(resets_at) => log_event(&format!(
@@ -2755,7 +2801,7 @@ impl App {
             log_once(
                 spoken,
                 "limit-hold",
-                "Fenster-Ping und Aufgaben warten: die Limit-Pause laeuft",
+                "Fenster-Ping des aktiven Accounts und Aufgaben warten: die Limit-Pause laeuft",
             );
             return Ok(());
         }
@@ -3341,6 +3387,12 @@ impl App {
     }
 
     /// Eigenes, benanntes Lock fuer Ablaeufe, die sich nur untereinander ausschliessen.
+    fn lock_file(&self, name: &str) -> Result<File> {
+        let lock = self.open_lock_file(&format!(".{name}.lock"))?;
+        FileExt::lock_exclusive(&lock).context("Lock konnte nicht gesetzt werden")?;
+        Ok(lock)
+    }
+
     fn try_lock_file(&self, name: &str) -> Result<Option<File>> {
         self.try_lock_path(&format!(".{name}.lock"))
     }

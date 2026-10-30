@@ -184,14 +184,18 @@ impl Readiness {
 /// Beide Fenster muessen unter der Schwelle liegen, sonst laeuft der Auftrag in ein Limit.
 /// `None` heisst: dagegen spricht nichts.
 fn blocking_limit(usage: &Usage, threshold: f64) -> Option<Readiness> {
-    if usage.five_hour.utilization >= threshold {
+    blocking_limits(usage, threshold, threshold)
+}
+
+fn blocking_limits(usage: &Usage, five_hour: f64, seven_day: f64) -> Option<Readiness> {
+    if usage.five_hour.utilization >= five_hour {
         return Some(Readiness::Waiting(format!(
             "Fuenf-Stunden-Fenster ist voll ({:.0}%, {})",
             usage.five_hour.utilization,
             crate::describe_reset(usage.five_hour.resets_at)
         )));
     }
-    if usage.seven_day.utilization >= threshold {
+    if usage.seven_day.utilization >= seven_day {
         return Some(Readiness::Waiting(format!(
             "Wochenfenster ist voll ({:.0}%, {})",
             usage.seven_day.utilization,
@@ -268,7 +272,16 @@ pub fn ping_readiness(
     last_run_at: Option<u64>,
     now: u64,
 ) -> Readiness {
-    if let Some(blocked) = blocking_limit(usage, threshold) {
+    ping_readiness_within(usage, [threshold, threshold], last_run_at, now)
+}
+
+pub fn ping_readiness_within(
+    usage: &Usage,
+    [five_hour, seven_day]: [f64; 2],
+    last_run_at: Option<u64>,
+    now: u64,
+) -> Readiness {
+    if let Some(blocked) = blocking_limits(usage, five_hour, seven_day) {
         return blocked;
     }
     if let Some(resets_at) = usage.five_hour.resets_at {
