@@ -37,6 +37,7 @@ pub struct LimitState {
     pub since: Option<u64>,
     pub released_at: Option<u64>,
     pub reason: String,
+    pub free_at: Option<u64>,
     pub scope: Vec<String>,
     pub sessions: BTreeMap<String, Parked>,
     pub compacted: BTreeMap<String, u64>,
@@ -88,7 +89,7 @@ pub fn wrap_up_message(reason: &str) -> String {
          current state and the next steps into the task's TODO.md (.tasks/<date>-<slug>/TODO.md \
          in the domain repo), then end your turn. End your final reply with the line \
          `TODO: <absolute path to that TODO.md>`. This session is resumed automatically once \
-         the 5-hour window has reset."
+         an account has quota again."
     )
 }
 
@@ -102,8 +103,8 @@ pub fn resume_message(parked: &Parked, todo: Option<&Path>) -> String {
         (None, None) => "Read the TODO.md you wrote under .tasks/ first".to_owned(),
     };
     format!(
-        "[claude-account] The 5-hour usage limit has reset. You stopped earlier because every \
-         account was at its limit. {pointer} and continue the task from there. If nothing is \
+        "[claude-account] An account has quota again. You stopped earlier because no account \
+         had quota left. {pointer} and continue the task from there. If nothing is \
          left to do, say so in one line and stop."
     )
 }
@@ -260,7 +261,7 @@ fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Val
     {
         return None;
     }
-    if !state.active {
+    if !state.active || state.free_at.is_some_and(|at| at.saturating_mul(1000) <= now) {
         if input.hook_event_name == "Stop"
             && let Some(parked) = state.sessions.get_mut(&input.session_id)
         {
@@ -461,6 +462,38 @@ fn may_spend(config: &Config, levels: &[Level], active_profile: Option<&str>) ->
         })
 }
 
+fn limit_reason(levels: &[Level]) -> String {
+    let figures = levels
+        .iter()
+        .filter_map(|(_, candidate)| candidate.as_ref())
+        .map(|candidate| {
+            format!(
+                "{}: 5h {:.0}%, 7d {:.0}%",
+                candidate.name,
+                candidate.usage.five_hour.utilization,
+                candidate.usage.seven_day.utilization
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("no saved Claude account has quota left ({figures})")
+}
+
+fn earliest_free(config: &Config, levels: &[Level]) -> Option<u64> {
+    let five_hour = config.limit_compact.threshold.min(config.threshold);
+    levels
+        .iter()
+        .filter_map(|(_, candidate)| candidate.as_ref())
+        .filter(|candidate| !hard_blocked(candidate, config))
+        .filter_map(|candidate| {
+            candidate
+                .usage
+                .unblocked_at_with(five_hour, config.threshold)
+        })
+        .min()
+        .and_then(|at| u64::try_from(at.timestamp()).ok())
+}
+
 fn reenter(state: &mut LimitState) -> Vec<String> {
     state.compacted.clear();
     state.compacting_sessions.clear();
@@ -647,7 +680,7 @@ impl App {
         let active_profile = self.active_profile_name_memoized(None);
         let verdict = verdict(config, &levels, active_profile.as_deref());
         let now = unix_timestamp()?;
-        self.enter_or_release(limit, &verdict, now)?;
+        self.enter_or_release(config, &levels, &verdict, now)?;
 
         let state = self.load_limit_state()?;
         if state.active {
@@ -677,16 +710,26 @@ impl App {
         Ok(())
     }
 
-    fn enter_or_release(&self, limit: &LimitCompact, verdict: &Verdict, now: u64) -> Result<()> {
+    fn enter_or_release(
+        &self,
+        config: &Config,
+        levels: &[Level],
+        verdict: &Verdict,
+        now: u64,
+    ) -> Result<()> {
+        let limit = &config.limit_compact;
+        let free_at = if limit.force {
+            None
+        } else {
+            earliest_free(config, levels)
+        };
         let reason = if limit.force {
             "forced test mode of the account switcher".to_owned()
         } else {
-            format!(
-                "every saved Claude account is at or above {:.0}% of its 5-hour window",
-                limit.threshold
-            )
+            limit_reason(levels)
         };
         let (change, dropped) = self.update_limit_state(|state| {
+            state.free_at = free_at;
             if verdict.at_limit && !state.active {
                 let dropped = reenter(state);
                 state.active = true;
@@ -1168,6 +1211,43 @@ mod tests {
             },
             ..Config::default()
         }
+    }
+
+    fn hook_input(event: &str) -> HookInput {
+        HookInput {
+            session_id: "s".to_owned(),
+            hook_event_name: event.to_owned(),
+            ..HookInput::default()
+        }
+    }
+
+    #[test]
+    fn hook_stays_silent_once_the_known_reset_has_passed() {
+        let mut state = LimitState {
+            active: true,
+            reason: "r".to_owned(),
+            free_at: Some(100),
+            ..LimitState::default()
+        };
+        assert!(hook_reply(&hook_input("PostToolUse"), &mut state, 100_000).is_none());
+        assert!(state.sessions.is_empty());
+        assert!(hook_reply(&hook_input("PostToolUse"), &mut state, 99_999).is_some());
+    }
+
+    #[test]
+    fn reason_names_the_window_that_really_blocks() {
+        let weekly_full = |name: &str, five: f64, seven: f64| {
+            let mut candidate = usage(five, seven);
+            if let Some(candidate) = candidate.as_mut() {
+                candidate.name = name.to_owned();
+            }
+            (name.to_owned(), candidate)
+        };
+        let reason = limit_reason(&[weekly_full("a", 100.0, 71.0), weekly_full("b", 72.0, 100.0)]);
+        assert_eq!(
+            reason,
+            "no saved Claude account has quota left (a: 5h 100%, 7d 71%; b: 5h 72%, 7d 100%)"
+        );
     }
 
     #[test]
