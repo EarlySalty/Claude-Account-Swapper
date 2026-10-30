@@ -2859,6 +2859,43 @@ fn the_service_opens_a_fresh_window_with_a_ping() {
 }
 
 #[test]
+fn the_service_opens_the_window_of_an_idle_account_too() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["config", "--ping", "on"]));
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(20.0, 30.0)),
+        ("access-personal", 200, unused_window_body()),
+    ]);
+
+    let mut child = harness
+        .command_recording()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch starten");
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    child.kill().expect("watch beenden");
+    let output = child.wait_with_output().expect("watch output");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        log.contains("Fenster-Ping fuer `personal` faellig"),
+        "{log}"
+    );
+    assert!(!log.contains("Fenster-Ping fuer `work`"), "{log}");
+    let calls = harness.recorded_calls();
+    assert_eq!(calls.matches("ARG=-p").count(), 1, "{calls}");
+    assert!(calls.contains(".renew-personal-"), "{calls}");
+    assert!(calls.contains("ARG=haiku"), "{calls}");
+}
+
+#[test]
 fn the_service_starts_a_due_job_and_marks_it_done() {
     let harness = harness_with_two_accounts();
     assert_success(&harness.run(&[

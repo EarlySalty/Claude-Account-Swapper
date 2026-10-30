@@ -2647,6 +2647,81 @@ impl App {
         self.write_ping_state(&state)
     }
 
+    fn ping_idle_profiles(
+        &self,
+        config: &Config,
+        spoken: &mut HashMap<String, String>,
+    ) -> Result<()> {
+        let active = self.active_profile_name().ok();
+        for profile in self.load_profiles()? {
+            if active.as_deref() == Some(profile.name.as_str()) {
+                continue;
+            }
+            let Ok((usage, _age)) = self.profile_usage_cached(&profile, false) else {
+                continue;
+            };
+            let key = format!("ping-{}", profile.name);
+            let last_run_at = self
+                .load_ping_state()
+                .idle_profiles
+                .get(&profile.name)
+                .copied();
+            let now = unix_timestamp()?;
+            match jobs::ping_readiness(&usage, config.threshold, last_run_at, now) {
+                Readiness::Due(reason) => {
+                    log_event(&format!(
+                        "Fenster-Ping fuer `{}` faellig: {reason}",
+                        profile.name
+                    ));
+                    spoken.remove(&key);
+                    if let Err(error) = self.ping_idle_profile(&profile) {
+                        log_problem(&format!(
+                            "Fenster-Ping fuer `{}` fehlgeschlagen: {error:#}",
+                            profile.name
+                        ));
+                    }
+                }
+                Readiness::Waiting(reason) => log_once(
+                    spoken,
+                    &key,
+                    &format!("Fenster-Ping fuer `{}` wartet: {reason}", profile.name),
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    fn ping_idle_profile(&self, profile: &Profile) -> Result<()> {
+        let outcome = self.renew_profile(profile);
+        let mut state = self.load_ping_state();
+        state
+            .idle_profiles
+            .insert(profile.name.clone(), unix_timestamp()?);
+        self.write_ping_state(&state)?;
+        match outcome? {
+            RenewOutcome::Renewed | RenewOutcome::StillValid => {}
+            RenewOutcome::Expired => {
+                bail!("der Login ist abgelaufen und braucht einen Browser-Login")
+            }
+            RenewOutcome::RequestFailed(reason) => bail!(reason),
+        }
+        let usage = self.profile_usage(profile, false)?;
+        self.write_cached_usage(&profile.name, usage, unix_timestamp()?);
+        match usage.five_hour.resets_at {
+            Some(resets_at) => log_event(&format!(
+                "Fenster-Ping fuer `{}`: Fenster laeuft jetzt bis {} ({:.0}% verbraucht)",
+                profile.name,
+                format_timestamp(resets_at.timestamp()),
+                usage.five_hour.utilization
+            )),
+            None => log_problem(&format!(
+                "Fenster-Ping fuer `{}`: die API meldet weiterhin kein laufendes Fenster",
+                profile.name
+            )),
+        }
+        Ok(())
+    }
+
     // ---- Durchlauf im Hintergrunddienst ----
 
     /// Ein Durchlauf der Automatik: Wechsel, Ping, faellige Aufgaben - in dieser Reihenfolge.
@@ -2669,6 +2744,13 @@ impl App {
             log_problem(&format!("Limit-Pause fehlgeschlagen: {error:#}"));
         }
         switched?;
+        if config.ping.enabled
+            && let Err(error) = self.ping_idle_profiles(config, spoken)
+        {
+            log_problem(&format!(
+                "Fenster-Ping fuer ruhende Accounts fehlgeschlagen: {error:#}"
+            ));
+        }
         if self.limit_pause_holds() {
             log_once(
                 spoken,
@@ -3410,6 +3492,8 @@ struct TaskRun {
 struct PingState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_run_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    idle_profiles: HashMap<String, u64>,
 }
 
 /// Eine Claude-Sitzung, wie sie in der Auswahl erscheint.
