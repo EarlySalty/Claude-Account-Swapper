@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
@@ -58,7 +58,7 @@ pub struct Parked {
     pub continued_by_user: bool,
     pub retell: bool,
     pub resume_message_id: Option<String>,
-    pub subagent: bool,
+    pub told_actors: BTreeSet<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -499,6 +499,14 @@ fn hook_should_forget(input: &HookInput, catalog: &ClaudeModels) -> bool {
         && !session_uses_claude_model(input, catalog)
 }
 
+fn quota_hook_owns(input: &HookInput, catalog: &ClaudeModels) -> bool {
+    !input.session_id.is_empty() && session_uses_claude_model(input, catalog)
+}
+
+fn actor_key(input: &HookInput) -> &str {
+    input.agent_id.as_deref().unwrap_or("")
+}
+
 fn runs_in_t3(parked: &Parked) -> bool {
     let entrypoint = parked.entrypoint.clone().or_else(|| {
         parked
@@ -514,11 +522,22 @@ fn hook_reply_with(
     state: &mut LimitState,
     now: u64,
     still_blocked: bool,
+    catalog: &ClaudeModels,
 ) -> Option<Value> {
     if input.session_id.is_empty() {
         return None;
     }
-    if input.hook_event_name == "Stop"
+    if input.agent_id.is_some()
+        && input
+            .model
+            .as_ref()
+            .is_some_and(|model| !is_claude_model(model, catalog))
+    {
+        return None;
+    }
+    let parent = input.agent_id.is_none();
+    if parent
+        && input.hook_event_name == "Stop"
         && state
             .compacting_sessions
             .remove(&input.session_id)
@@ -527,7 +546,8 @@ fn hook_reply_with(
         return None;
     }
     if !state.active || !still_blocked {
-        if input.hook_event_name == "Stop"
+        if parent
+            && input.hook_event_name == "Stop"
             && let Some(parked) = state.sessions.get_mut(&input.session_id)
         {
             parked.stopped_at_ms.get_or_insert(now);
@@ -538,23 +558,36 @@ fn hook_reply_with(
         return None;
     }
     let message = wrap_up_message(&state.reason);
+    let actor = actor_key(input).to_owned();
     match input.hook_event_name.as_str() {
         "PostToolUse" => {
-            match state.sessions.get_mut(&input.session_id) {
-                Some(parked) if parked.stopped_at_ms.is_some() || parked.retell => {
-                    parked.told_at_ms = now;
-                    parked.stopped_at_ms = None;
-                    parked.continued_by_user = false;
-                    parked.retell = false;
-                    parked.resume_message_id = None;
+            let parked = state
+                .sessions
+                .entry(input.session_id.clone())
+                .or_insert_with(|| parked_from(input, now));
+            if parent && (parked.stopped_at_ms.is_some() || parked.retell) {
+                parked.told_at_ms = now;
+                parked.stopped_at_ms = None;
+                parked.continued_by_user = false;
+                parked.retell = false;
+                parked.resume_message_id = None;
+                parked.told_actors.clear();
+            }
+            if parent {
+                if input.cwd.is_some() {
+                    parked.cwd.clone_from(&input.cwd);
                 }
-                Some(_) => return None,
-                None => {
-                    state
-                        .sessions
-                        .insert(input.session_id.clone(), parked_from(input, now));
+                if input.transcript_path.is_some() {
+                    parked.transcript.clone_from(&input.transcript_path);
+                }
+                if input.entrypoint.is_some() {
+                    parked.entrypoint.clone_from(&input.entrypoint);
                 }
             }
+            if !parked.told_actors.insert(actor) {
+                return None;
+            }
+            parked.told_at_ms = now;
             Some(json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
@@ -564,19 +597,23 @@ fn hook_reply_with(
         }
         "Stop" => match state.sessions.get_mut(&input.session_id) {
             Some(parked) => {
-                parked.stopped_at_ms.get_or_insert(now);
-                None
+                let first = parked.told_actors.insert(actor);
+                if parent && !first {
+                    parked.stopped_at_ms.get_or_insert(now);
+                }
+                first.then(|| json!({ "decision": "block", "reason": message }))
             }
-            None if input.stop_hook_active => {
+            None if parent && input.stop_hook_active => {
                 let mut parked = parked_from(input, now);
                 parked.stopped_at_ms = Some(now);
+                parked.told_actors.insert(actor);
                 state.sessions.insert(input.session_id.clone(), parked);
                 None
             }
             None => {
-                state
-                    .sessions
-                    .insert(input.session_id.clone(), parked_from(input, now));
+                let mut parked = parked_from(input, now);
+                parked.told_actors.insert(actor);
+                state.sessions.insert(input.session_id.clone(), parked);
                 Some(json!({ "decision": "block", "reason": message }))
             }
         },
@@ -590,25 +627,59 @@ fn parked_from(input: &HookInput, now: u64) -> Parked {
         cwd: input.cwd.clone(),
         transcript: input.transcript_path.clone(),
         entrypoint: input.entrypoint.clone(),
-        subagent: input.agent_id.is_some(),
         ..Parked::default()
     }
 }
 
-fn reset_within_an_hour(levels: &[Level], now: DateTime<Utc>) -> bool {
+fn reset_is_soon(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    resets_at.is_some_and(|resets_at| {
+        let seconds = resets_at.signed_duration_since(now).num_seconds();
+        seconds > 0 && seconds <= RESET_NEAR_SECONDS
+    })
+}
+
+fn window_blocks(utilization: f64, limits: &[f64]) -> bool {
+    limits.iter().any(|limit| utilization >= *limit)
+}
+
+fn account_frees_within_an_hour(
+    candidate: &Candidate,
+    config: &Config,
+    now: DateTime<Utc>,
+) -> bool {
+    if !blocked(candidate, config) {
+        return false;
+    }
+    let five_hard = candidate
+        .stops
+        .hard
+        .then_some(candidate.stops.five_hour.unwrap_or(config.threshold));
+    let seven_hard = candidate
+        .stops
+        .hard
+        .then_some(candidate.stops.seven_day.unwrap_or(config.threshold));
+    let five_blocks = window_blocks(
+        candidate.usage.five_hour.utilization,
+        &[
+            config.limit_compact.threshold,
+            config.threshold,
+            five_hard.unwrap_or(f64::MAX),
+        ],
+    );
+    let seven_blocks = window_blocks(
+        candidate.usage.seven_day.utilization,
+        &[config.threshold, seven_hard.unwrap_or(f64::MAX)],
+    );
+    (five_blocks || seven_blocks)
+        && (!five_blocks || reset_is_soon(candidate.usage.five_hour.resets_at, now))
+        && (!seven_blocks || reset_is_soon(candidate.usage.seven_day.resets_at, now))
+}
+
+fn any_account_frees_within_an_hour(config: &Config, levels: &[Level], now: DateTime<Utc>) -> bool {
     levels
         .iter()
         .filter_map(|(_, candidate)| candidate.as_ref())
-        .any(|candidate| {
-            candidate
-                .usage
-                .five_hour
-                .resets_at
-                .is_some_and(|resets_at| {
-                    let seconds = resets_at.signed_duration_since(now).num_seconds();
-                    seconds > 0 && seconds <= RESET_NEAR_SECONDS
-                })
-        })
+        .any(|candidate| account_frees_within_an_hour(candidate, config, now))
 }
 
 fn cheap_to_resume(detail: &t3::ThreadDetail, min_context_tokens: u64) -> bool {
@@ -616,6 +687,19 @@ fn cheap_to_resume(detail: &t3::ThreadDetail, min_context_tokens: u64) -> bool {
         || detail
             .used_tokens
             .is_some_and(|tokens| tokens < min_context_tokens)
+}
+
+enum ResumeWhenReady {
+    Send,
+    KeepUntilCompact,
+}
+
+fn resume_when_ready(detail: &t3::ThreadDetail, min_context_tokens: u64) -> ResumeWhenReady {
+    if cheap_to_resume(detail, min_context_tokens) {
+        ResumeWhenReady::Send
+    } else {
+        ResumeWhenReady::KeepUntilCompact
+    }
 }
 
 fn warm_candidate(thread: &ThreadSummary, limit: &LimitCompact, now: DateTime<Utc>) -> bool {
@@ -723,7 +807,8 @@ fn verdict(config: &Config, levels: &[Level], active_profile: Option<&str>) -> V
     };
     Verdict {
         at_limit: limit.enabled
-            && (limit.force || (all_at_limit && !reset_within_an_hour(levels, Utc::now()))),
+            && (limit.force
+                || (all_at_limit && !any_account_frees_within_an_hour(config, levels, Utc::now()))),
         released: !limit.enabled || (!limit.force && active_usable),
     }
 }
@@ -899,12 +984,15 @@ impl App {
             }
             return Ok(None);
         }
+        if !quota_hook_owns(&input, &catalog) {
+            return Ok(None);
+        }
         let now = unix_millis()?;
         let relevant =
             state.active && (state.scope.is_empty() || state.scope.contains(&input.session_id));
         let blocked = !relevant || self.blocked_now().unwrap_or(true);
-        let reply =
-            self.update_limit_state(|state| hook_reply_with(&input, state, now, blocked))?;
+        let reply = self
+            .update_limit_state(|state| hook_reply_with(&input, state, now, blocked, &catalog))?;
         Ok(reply.map(|value| value.to_string()))
     }
 
@@ -1252,16 +1340,11 @@ impl App {
         let wants_t3 = before
             .sessions
             .values()
-            .any(|parked| !parked.continued_by_user && !parked.subagent && is_t3_session(parked));
+            .any(|parked| !parked.continued_by_user && is_t3_session(parked));
         let mut t3 = wants_t3.then(|| self.open_t3(limit, &before));
         let state = self.load_limit_state()?;
         for (session, parked) in &state.sessions {
-            let outcome = if parked.subagent {
-                Ok(Outcome::Done(
-                    "Subagent nicht einzeln fortgesetzt, der Eltern-Thread setzt kompakte Subagents fort"
-                        .to_owned(),
-                ))
-            } else if parked.continued_by_user {
+            let outcome = if parked.continued_by_user {
                 Ok(Outcome::Done("wurde schon von Hand fortgesetzt".to_owned()))
             } else if is_t3_session(parked) {
                 match t3.as_mut() {
@@ -1317,6 +1400,44 @@ impl App {
         Ok((threads, rpc))
     }
 
+    fn request_compact_if_needed(
+        &self,
+        rpc: &mut t3::Rpc,
+        thread_id: &str,
+        detail: &t3::ThreadDetail,
+    ) -> Result<()> {
+        let limit = self.load_config().limit_compact;
+        let state = self.load_limit_state()?;
+        if state.compacted.contains_key(thread_id)
+            || state.compacted.len() >= limit.max_compactions
+            || !worth_compacting(detail, &limit)
+        {
+            return Ok(());
+        }
+        let at = unix_timestamp()?;
+        let message_id = uuid::Uuid::new_v4().to_string();
+        self.update_limit_state(|state| {
+            for session in &detail.native_session_ids {
+                state.compacting_sessions.insert(session.clone(), at);
+            }
+            state.compacted.insert(thread_id.to_owned(), at);
+        })?;
+        if let Err(error) = rpc.send_message(thread_id, COMPACT_COMMAND, &message_id) {
+            self.update_limit_state(|state| {
+                for session in &detail.native_session_ids {
+                    state.compacting_sessions.remove(session);
+                }
+                state.compacted.remove(thread_id);
+            })?;
+            return Err(error);
+        }
+        log_event(&format!(
+            "Limit-Pause: Thread {thread_id} wird nach der Freigabe kompaktiert ({} Tokens)",
+            detail.used_tokens.unwrap_or(0)
+        ));
+        Ok(())
+    }
+
     fn resume_t3_session(
         &self,
         rpc: &mut t3::Rpc,
@@ -1358,10 +1479,13 @@ impl App {
         if settling(stopped_at_ms.max(released_ms), now) || thread.busy {
             return Ok(Outcome::Pending);
         }
-        if !cheap_to_resume(&detail, self.load_config().limit_compact.min_context_tokens) {
-            return Ok(Outcome::Done(format!(
-                "nicht fortgesetzt: Thread {thread_id} ist nicht kompakt"
-            )));
+        let min_context_tokens = self.load_config().limit_compact.min_context_tokens;
+        if matches!(
+            resume_when_ready(&detail, min_context_tokens),
+            ResumeWhenReady::KeepUntilCompact
+        ) {
+            self.request_compact_if_needed(rpc, thread_id, &detail)?;
+            return Ok(Outcome::Pending);
         }
         let message_id = match &parked.resume_message_id {
             Some(id) => id.clone(),
@@ -1522,7 +1646,7 @@ mod tests {
     use super::*;
 
     fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Value> {
-        hook_reply_with(input, state, now, true)
+        hook_reply_with(input, state, now, true, &ClaudeModels::default())
     }
 
     fn input(event: &str, session: &str) -> HookInput {
@@ -1723,6 +1847,15 @@ mod tests {
         subagent.model = Some("grok-4.7".to_owned());
         subagent.agent_id = Some("agent-1".to_owned());
         assert!(!hook_should_forget(&subagent, &catalog));
+        assert!(!quota_hook_owns(&subagent, &catalog));
+        subagent.hook_event_name = "Stop".to_owned();
+        assert!(!quota_hook_owns(&subagent, &catalog));
+        subagent.hook_event_name = "PostToolUse".to_owned();
+        subagent.model = Some("haiku".to_owned());
+        assert!(quota_hook_owns(&subagent, &catalog));
+        subagent.model = Some("fable".to_owned());
+        assert!(quota_hook_owns(&subagent, &catalog));
+        assert!(!quota_hook_owns(&subagent, &ClaudeModels::default()));
         let mut nameless = input("PostToolUse", "");
         nameless.model = Some("grok-4.7".to_owned());
         assert!(!hook_should_forget(&nameless, &catalog));
@@ -1860,15 +1993,47 @@ mod tests {
     fn compaction_turns_are_left_alone_and_subagents_stop_with_the_parent() {
         let mut state = active();
         state.compacting_sessions.insert("s".to_owned(), 1);
-        assert!(hook_reply(&input("Stop", "s"), &mut state, 10).is_none());
-        let mut sub = input("PostToolUse", "t");
-        sub.agent_id = Some("a".to_owned());
-        assert!(hook_reply(&sub, &mut state, 10).is_some());
-        assert!(state.sessions["t"].subagent);
+        let mut child_stop = input("Stop", "s");
+        child_stop.agent_id = Some("a".to_owned());
+        child_stop.model = Some("haiku".to_owned());
+        assert!(hook_reply(&child_stop, &mut state, 10).is_some());
+        assert!(state.compacting_sessions.contains_key("s"));
+        assert!(state.sessions["s"].stopped_at_ms.is_none());
+        assert!(hook_reply(&input("Stop", "s"), &mut state, 11).is_none());
+        assert!(state.compacting_sessions.is_empty());
+
+        let mut state = active();
+        let mut first_child = input("PostToolUse", "t");
+        first_child.agent_id = Some("a".to_owned());
+        first_child.model = Some("opus".to_owned());
+        assert!(hook_reply(&first_child, &mut state, 10).is_some());
+        assert!(hook_reply(&input("PostToolUse", "t"), &mut state, 11).is_some());
+        let mut second_child = input("PostToolUse", "t");
+        second_child.agent_id = Some("b".to_owned());
+        second_child.model = Some("sonnet".to_owned());
+        assert!(hook_reply(&second_child, &mut state, 12).is_some());
+        assert!(hook_reply(&first_child, &mut state, 13).is_none());
+        assert_eq!(state.sessions.len(), 1);
+        assert!(state.sessions["t"].stopped_at_ms.is_none());
+        assert_eq!(
+            state.sessions["t"].told_actors,
+            ["", "a", "b"].into_iter().map(str::to_owned).collect()
+        );
         let mut stop = input("Stop", "t");
         stop.agent_id = Some("a".to_owned());
+        stop.model = Some("opus".to_owned());
         assert!(hook_reply(&stop, &mut state, 20).is_none());
-        assert_eq!(state.sessions["t"].stopped_at_ms, Some(20));
+        assert!(state.sessions["t"].stopped_at_ms.is_none());
+        assert!(hook_reply(&input("Stop", "t"), &mut state, 21).is_none());
+        assert_eq!(state.sessions["t"].stopped_at_ms, Some(21));
+
+        let mut grok = input("PostToolUse", "g");
+        grok.agent_id = Some("agent-1".to_owned());
+        grok.model = Some("grok-4.7".to_owned());
+        assert!(hook_reply(&grok, &mut state, 30).is_none());
+        grok.hook_event_name = "Stop".to_owned();
+        assert!(hook_reply(&grok, &mut state, 31).is_none());
+        assert!(!state.sessions.contains_key("g"));
     }
 
     #[test]
@@ -1881,6 +2046,26 @@ mod tests {
         let mut forced = config(true);
         forced.limit_compact.force = true;
         assert!(verdict(&forced, &levels(soon), Some("a")).at_limit);
+        let mut weekly = usage_at(100.0, 100.0, Some(soon)).unwrap();
+        weekly.usage.seven_day.resets_at = Some(Utc::now() + chrono::Duration::days(5));
+        let weekly_levels = vec![("a".to_owned(), Some(weekly))];
+        assert!(verdict(&config(true), &weekly_levels, Some("a")).at_limit);
+        let mut hard_week = usage_at(10.0, 80.0, Some(soon)).unwrap();
+        hard_week.usage.seven_day.resets_at = Some(Utc::now() + chrono::Duration::days(4));
+        hard_week.stops = crate::usage::Stops {
+            five_hour: None,
+            seven_day: Some(50.0),
+            hard: true,
+        };
+        let hard_levels = vec![("a".to_owned(), Some(hard_week))];
+        assert!(verdict(&config(true), &hard_levels, Some("a")).at_limit);
+        let mut both_soon = usage_at(100.0, 100.0, Some(soon)).unwrap();
+        both_soon.usage.seven_day.resets_at = Some(soon);
+        let both_levels = vec![("a".to_owned(), Some(both_soon))];
+        assert!(!verdict(&config(true), &both_levels, Some("a")).at_limit);
+        let undated = usage_at(10.0, 100.0, Some(soon)).unwrap();
+        let undated_levels = vec![("a".to_owned(), Some(undated))];
+        assert!(verdict(&config(true), &undated_levels, Some("a")).at_limit);
     }
 
     #[test]
@@ -1897,6 +2082,22 @@ mod tests {
         assert!(cheap_to_resume(&detail(false, Some(10_000)), 60_000));
         assert!(!cheap_to_resume(&detail(false, Some(200_000)), 60_000));
         assert!(!cheap_to_resume(&detail(false, None), 60_000));
+        assert!(matches!(
+            resume_when_ready(&detail(true, Some(200_000)), 60_000),
+            ResumeWhenReady::Send
+        ));
+        assert!(matches!(
+            resume_when_ready(&detail(false, Some(10_000)), 60_000),
+            ResumeWhenReady::Send
+        ));
+        assert!(matches!(
+            resume_when_ready(&detail(false, Some(200_000)), 60_000),
+            ResumeWhenReady::KeepUntilCompact
+        ));
+        assert!(matches!(
+            resume_when_ready(&detail(false, None), 60_000),
+            ResumeWhenReady::KeepUntilCompact
+        ));
     }
 
     #[test]
@@ -1980,9 +2181,27 @@ mod tests {
             reason: "r".to_owned(),
             ..LimitState::default()
         };
-        assert!(hook_reply_with(&input("PostToolUse", "s"), &mut state, 10, false).is_none());
+        assert!(
+            hook_reply_with(
+                &input("PostToolUse", "s"),
+                &mut state,
+                10,
+                false,
+                &ClaudeModels::default()
+            )
+            .is_none()
+        );
         assert!(state.sessions.is_empty());
-        assert!(hook_reply_with(&input("PostToolUse", "s"), &mut state, 10, true).is_some());
+        assert!(
+            hook_reply_with(
+                &input("PostToolUse", "s"),
+                &mut state,
+                10,
+                true,
+                &ClaudeModels::default()
+            )
+            .is_some()
+        );
     }
 
     #[test]
