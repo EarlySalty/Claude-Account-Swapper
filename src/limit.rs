@@ -68,6 +68,7 @@ struct HookInput {
     transcript_path: Option<PathBuf>,
     stop_hook_active: bool,
     agent_id: Option<String>,
+    model: Option<String>,
     #[serde(skip)]
     entrypoint: Option<String>,
 }
@@ -238,6 +239,88 @@ fn entrypoint_from_transcript(transcript: &Path) -> Option<String> {
             .and_then(Value::as_str)
             .map(str::to_owned)
     })
+}
+
+fn is_claude_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("claude")
+}
+
+fn model_flag(args: &[String]) -> Option<String> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--model" || arg == "-m" {
+            return args.next().cloned();
+        }
+        if let Some(value) = arg.strip_prefix("--model=") {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn model_verdict(args: &[String]) -> Option<bool> {
+    let exe = args
+        .first()
+        .map(|path| path.rsplit('/').next().unwrap_or(path))
+        .unwrap_or("");
+    if exe == "grok" || exe.starts_with("grok-") {
+        return Some(false);
+    }
+    if let Some(model) = model_flag(args) {
+        return Some(is_claude_model(&model));
+    }
+    if exe == "claude" || exe == "claude-code" {
+        return Some(true);
+    }
+    None
+}
+
+fn process_args(pid: u32) -> Option<Vec<String>> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args: Vec<String> = raw
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    if args.is_empty() { None } else { Some(args) }
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("PPid:") else {
+            continue;
+        };
+        return rest.trim().parse().ok().filter(|parent| *parent > 1);
+    }
+    None
+}
+
+fn ancestry_uses_claude_model() -> bool {
+    let mut pid = std::process::id();
+    for _ in 0..12 {
+        let Some(parent) = parent_pid(pid) else {
+            return false;
+        };
+        if let Some(args) = process_args(parent)
+            && let Some(verdict) = model_verdict(&args)
+        {
+            return verdict;
+        }
+        pid = parent;
+    }
+    false
+}
+
+fn session_uses_claude_model(input: &HookInput) -> bool {
+    if let Some(model) = input
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+    {
+        return is_claude_model(model);
+    }
+    ancestry_uses_claude_model()
 }
 
 fn runs_in_t3(parked: &Parked) -> bool {
@@ -603,6 +686,18 @@ impl App {
         let mut input: HookInput =
             serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
         input.entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
+        if !session_uses_claude_model(&input) {
+            if !input.session_id.is_empty()
+                && (state.sessions.contains_key(&input.session_id)
+                    || state.compacting_sessions.contains_key(&input.session_id))
+            {
+                self.update_limit_state(|state| {
+                    state.sessions.remove(&input.session_id);
+                    state.compacting_sessions.remove(&input.session_id);
+                })?;
+            }
+            return Ok(None);
+        }
         let now = unix_millis()?;
         let relevant = state.active
             && input.agent_id.is_none()
@@ -1095,6 +1190,11 @@ impl App {
         state: &LimitState,
         now: u64,
     ) -> Result<Outcome> {
+        if parked.entrypoint.is_none() {
+            return Ok(Outcome::Done(
+                "kein Claude-Modell, nicht fortgesetzt".to_owned(),
+            ));
+        }
         let Some(stopped_at_ms) = parked.stopped_at_ms else {
             return Ok(match grace_over(state, now) {
                 true => Outcome::Done("nicht fortgesetzt: Turn-Ende nie gesehen".to_owned()),
@@ -1227,6 +1327,50 @@ mod tests {
             cwd: Some(PathBuf::from("/repo")),
             ..HookInput::default()
         }
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn only_a_claude_model_name_counts() {
+        assert!(is_claude_model("claude-opus-5-5"));
+        assert!(is_claude_model(" Claude-Haiku-5-5 "));
+        assert!(!is_claude_model("grok-4.7"));
+        assert!(!is_claude_model("gpt-6.1-sol"));
+        assert!(!is_claude_model("glm-5.3"));
+    }
+
+    #[test]
+    fn process_cmdline_decides_claude_model() {
+        assert_eq!(
+            model_verdict(&args(&["/usr/bin/grok", "agent"])),
+            Some(false)
+        );
+        assert_eq!(
+            model_verdict(&args(&[
+                "/home/nathanael/.local/bin/claude",
+                "--model",
+                "claude-haiku-5-5"
+            ])),
+            Some(true)
+        );
+        assert_eq!(
+            model_verdict(&args(&["claude", "--model=gpt-6.1-sol"])),
+            Some(false)
+        );
+        assert_eq!(model_verdict(&args(&["claude"])), Some(true));
+        assert_eq!(model_verdict(&args(&["/usr/bin/t3", "serve"])), None);
+    }
+
+    #[test]
+    fn explicit_hook_model_overrides_process_ancestry() {
+        let mut hook_input = input("PostToolUse", "s");
+        hook_input.model = Some("grok-4.7".to_owned());
+        assert!(!session_uses_claude_model(&hook_input));
+        hook_input.model = Some("claude-fable-5-1".to_owned());
+        assert!(session_uses_claude_model(&hook_input));
     }
 
     fn active() -> LimitState {
