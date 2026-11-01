@@ -242,7 +242,17 @@ fn entrypoint_from_transcript(transcript: &Path) -> Option<String> {
 }
 
 fn is_claude_model(model: &str) -> bool {
-    model.trim().to_ascii_lowercase().starts_with("claude")
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("claude") {
+        return true;
+    }
+    matches!(
+        model
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .unwrap_or(""),
+        "haiku" | "sonnet" | "opus"
+    )
 }
 
 fn model_flag(args: &[String]) -> Option<String> {
@@ -328,6 +338,10 @@ fn session_uses_claude_model(input: &HookInput) -> bool {
         return is_claude_model(model);
     }
     ancestry_uses_claude_model()
+}
+
+fn hook_should_forget(input: &HookInput) -> bool {
+    input.agent_id.is_none() && !input.session_id.is_empty() && !session_uses_claude_model(input)
 }
 
 fn runs_in_t3(parked: &Parked) -> bool {
@@ -693,10 +707,12 @@ impl App {
         let mut input: HookInput =
             serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
         input.entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
+        if input.agent_id.is_some() || input.session_id.is_empty() {
+            return Ok(None);
+        }
         if !session_uses_claude_model(&input) {
-            if !input.session_id.is_empty()
-                && (state.sessions.contains_key(&input.session_id)
-                    || state.compacting_sessions.contains_key(&input.session_id))
+            if state.sessions.contains_key(&input.session_id)
+                || state.compacting_sessions.contains_key(&input.session_id)
             {
                 self.update_limit_state(|state| {
                     state.sessions.remove(&input.session_id);
@@ -1197,11 +1213,6 @@ impl App {
         state: &LimitState,
         now: u64,
     ) -> Result<Outcome> {
-        if parked.entrypoint.is_none() {
-            return Ok(Outcome::Done(
-                "kein Claude-Modell, nicht fortgesetzt".to_owned(),
-            ));
-        }
         let Some(stopped_at_ms) = parked.stopped_at_ms else {
             return Ok(match grace_over(state, now) {
                 true => Outcome::Done("nicht fortgesetzt: Turn-Ende nie gesehen".to_owned()),
@@ -1344,9 +1355,31 @@ mod tests {
     fn only_a_claude_model_name_counts() {
         assert!(is_claude_model("claude-opus-5-5"));
         assert!(is_claude_model(" Claude-Haiku-5-5 "));
+        assert!(is_claude_model("haiku"));
+        assert!(is_claude_model("Sonnet"));
+        assert!(is_claude_model("opus"));
+        assert!(is_claude_model("sonnet-4.6"));
         assert!(!is_claude_model("grok-4.7"));
         assert!(!is_claude_model("gpt-6.1-sol"));
         assert!(!is_claude_model("glm-5.3"));
+        assert!(!is_claude_model(""));
+        assert!(!is_claude_model("sonnetextra"));
+    }
+
+    #[test]
+    fn subagent_hooks_do_not_forget_the_parent_session() {
+        let mut parent = input("PostToolUse", "parent");
+        parent.model = Some("grok-4.7".to_owned());
+        assert!(hook_should_forget(&parent));
+        parent.model = Some("haiku".to_owned());
+        assert!(!hook_should_forget(&parent));
+        let mut subagent = input("PostToolUse", "parent");
+        subagent.model = Some("grok-4.7".to_owned());
+        subagent.agent_id = Some("agent-1".to_owned());
+        assert!(!hook_should_forget(&subagent));
+        let mut nameless = input("PostToolUse", "");
+        nameless.model = Some("grok-4.7".to_owned());
+        assert!(!hook_should_forget(&nameless));
     }
 
     #[test]
@@ -1366,6 +1399,10 @@ mod tests {
         assert_eq!(
             model_verdict(&args(&["claude", "--model=gpt-6.1-sol"])),
             Some(false)
+        );
+        assert_eq!(
+            model_verdict(&args(&["claude", "--model", "haiku"])),
+            Some(true)
         );
         assert_eq!(model_verdict(&args(&["claude"])), Some(true));
         assert_eq!(model_verdict(&args(&["/usr/bin/claude-code"])), Some(true));
