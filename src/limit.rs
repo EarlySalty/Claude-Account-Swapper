@@ -28,7 +28,6 @@ const TRANSCRIPT_HEAD_BYTES: u64 = 64 * 1024;
 const RESUME_GRACE_SECONDS: u64 = 30 * 60;
 const T3_RESUME_SETTLE_MS: u64 = 2 * 60 * 1000;
 const RESET_NEAR_SECONDS: i64 = 60 * 60;
-const PARENT_NOT_TOLD: u64 = u64::MAX;
 const TODO_FILE: &str = "TODO.md";
 const T3_ENTRYPOINT: &str = "sdk-ts";
 const ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
@@ -551,6 +550,7 @@ fn hook_reply_with(
             && input.hook_event_name == "Stop"
             && let Some(parked) = state.sessions.get_mut(&input.session_id)
         {
+            write_parent_baseline(parked, input, now, parked.told_at_ms == 0);
             parked.stopped_at_ms.get_or_insert(now);
         }
         return None;
@@ -570,7 +570,7 @@ fn hook_reply_with(
                         parked_from(input, now)
                     } else {
                         Parked {
-                            told_at_ms: PARENT_NOT_TOLD,
+                            told_at_ms: now,
                             ..Parked::default()
                         }
                     }
@@ -583,8 +583,7 @@ fn hook_reply_with(
                 parked.told_actors.clear();
                 write_parent_baseline(parked, input, now, true);
             } else if parent {
-                let first = !parked.told_actors.contains("");
-                write_parent_baseline(parked, input, now, first);
+                write_parent_baseline(parked, input, now, parked.told_at_ms == 0);
             }
             if !parked.told_actors.insert(actor) {
                 return None;
@@ -600,7 +599,7 @@ fn hook_reply_with(
             Some(parked) => {
                 let first = parked.told_actors.insert(actor);
                 if parent {
-                    write_parent_baseline(parked, input, now, first);
+                    write_parent_baseline(parked, input, now, parked.told_at_ms == 0);
                     if !first {
                         parked.stopped_at_ms.get_or_insert(now);
                     }
@@ -619,7 +618,7 @@ fn hook_reply_with(
                     parked_from(input, now)
                 } else {
                     Parked {
-                        told_at_ms: PARENT_NOT_TOLD,
+                        told_at_ms: now,
                         ..Parked::default()
                     }
                 };
@@ -2106,7 +2105,7 @@ mod tests {
         child_first.cwd = Some(PathBuf::from("/child"));
         child_first.transcript_path = Some(PathBuf::from("/child/session.jsonl"));
         assert!(hook_reply(&child_first, &mut state, 5).is_some());
-        assert_eq!(state.sessions["c"].told_at_ms, PARENT_NOT_TOLD);
+        assert_eq!(state.sessions["c"].told_at_ms, 5);
         assert!(state.sessions["c"].cwd.is_none());
         assert!(state.sessions["c"].transcript.is_none());
         let mut parent_stop = input("Stop", "c");
@@ -2114,7 +2113,7 @@ mod tests {
         parent_stop.transcript_path = Some(PathBuf::from("/parent/session.jsonl"));
         parent_stop.entrypoint = Some("sdk-ts".to_owned());
         assert!(hook_reply(&parent_stop, &mut state, 6).is_some());
-        assert_eq!(state.sessions["c"].told_at_ms, 6);
+        assert_eq!(state.sessions["c"].told_at_ms, 5);
         assert_eq!(state.sessions["c"].cwd, Some(PathBuf::from("/parent")));
         assert_eq!(
             state.sessions["c"].transcript,
@@ -2124,7 +2123,32 @@ mod tests {
         assert!(state.sessions["c"].stopped_at_ms.is_none());
         assert!(hook_reply(&parent_stop, &mut state, 7).is_none());
         assert_eq!(state.sessions["c"].stopped_at_ms, Some(7));
-        assert_eq!(state.sessions["c"].told_at_ms, 6);
+        assert_eq!(state.sessions["c"].told_at_ms, 5);
+    }
+
+    #[test]
+    fn released_parent_stop_keeps_the_child_clock_and_takes_parent_paths() {
+        let mut state = active();
+        let mut child = input("PostToolUse", "c");
+        child.agent_id = Some("a".to_owned());
+        child.model = Some("haiku".to_owned());
+        child.cwd = Some(PathBuf::from("/child"));
+        child.transcript_path = Some(PathBuf::from("/child/session.jsonl"));
+        assert!(hook_reply(&child, &mut state, 5).is_some());
+        state.active = false;
+        let mut parent_stop = input("Stop", "c");
+        parent_stop.cwd = Some(PathBuf::from("/parent"));
+        parent_stop.transcript_path = Some(PathBuf::from("/parent/session.jsonl"));
+        parent_stop.entrypoint = Some("sdk-ts".to_owned());
+        assert!(hook_reply(&parent_stop, &mut state, 20).is_none());
+        assert_eq!(state.sessions["c"].told_at_ms, 5);
+        assert_eq!(state.sessions["c"].stopped_at_ms, Some(20));
+        assert_eq!(state.sessions["c"].cwd, Some(PathBuf::from("/parent")));
+        assert_eq!(
+            state.sessions["c"].transcript,
+            Some(PathBuf::from("/parent/session.jsonl"))
+        );
+        assert_eq!(state.sessions["c"].entrypoint.as_deref(), Some("sdk-ts"));
     }
 
     #[test]
