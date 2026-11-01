@@ -247,6 +247,7 @@ struct ClaudeModels {
     aliases: HashSet<String>,
     injected: HashSet<String>,
     loaded: bool,
+    exclusions_loaded: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -330,6 +331,7 @@ fn load_claude_models_from(catalog_dir: &Path, injected_path: &Path) -> ClaudeMo
     if let Ok(bytes) = fs::read(injected_path)
         && let Ok(config) = serde_json::from_slice::<InjectedModels>(&bytes)
     {
+        models.exclusions_loaded = true;
         for name in &config.available_models {
             remember_value(&mut models.injected, name);
         }
@@ -385,15 +387,21 @@ fn absorb_catalog(models: &mut ClaudeModels, bytes: &[u8]) -> bool {
     found
 }
 
+fn kept_claude_name(model: &str) -> bool {
+    model.starts_with("claude") || matches!(model_family(model), "haiku" | "sonnet" | "opus")
+}
+
 fn is_claude_model(model: &str, catalog: &ClaudeModels) -> bool {
     let model = normalized_model(model);
     if model.is_empty() || catalog.injected.contains(&model) {
         return false;
     }
-    if catalog.loaded {
-        return catalog.ids.contains(&model) || catalog.aliases.contains(model_family(&model));
+    if kept_claude_name(&model) {
+        return true;
     }
-    model.starts_with("claude")
+    catalog.loaded
+        && catalog.exclusions_loaded
+        && (catalog.ids.contains(&model) || catalog.aliases.contains(model_family(&model)))
 }
 
 fn model_flag(args: &[String]) -> Option<String> {
@@ -1495,6 +1503,7 @@ mod tests {
     fn listed_catalog() -> ClaudeModels {
         let mut catalog = ClaudeModels {
             loaded: true,
+            exclusions_loaded: true,
             ..ClaudeModels::default()
         };
         for id in [
@@ -1534,14 +1543,38 @@ mod tests {
     }
 
     #[test]
-    fn missing_catalog_accepts_only_the_claude_prefix() {
+    fn missing_catalog_keeps_the_previous_claude_names() {
         let catalog = ClaudeModels::default();
         assert!(is_claude_model("claude-fable-5-1", &catalog));
         assert!(is_claude_model(" Claude-Haiku-5-5[1m] ", &catalog));
+        assert!(is_claude_model("haiku", &catalog));
+        assert!(is_claude_model("sonnet-4.6", &catalog));
+        assert!(is_claude_model("opus", &catalog));
         assert!(!is_claude_model("fable", &catalog));
-        assert!(!is_claude_model("haiku", &catalog));
-        assert!(!is_claude_model("sonnet-4.6", &catalog));
         assert!(!is_claude_model("gpt-6.1-sol", &catalog));
+        assert!(!is_claude_model("sonnetextra", &catalog));
+    }
+
+    #[test]
+    fn partial_catalog_adds_fable_without_dropping_known_names() {
+        let mut catalog = ClaudeModels {
+            loaded: true,
+            exclusions_loaded: true,
+            ..ClaudeModels::default()
+        };
+        catalog.ids.insert("claude-fable-5-1".to_owned());
+        catalog.aliases.insert("fable".to_owned());
+        assert!(is_claude_model("fable", &catalog));
+        assert!(is_claude_model("claude-opus-5-5", &catalog));
+        assert!(is_claude_model("sonnet-4.6", &catalog));
+        assert!(is_claude_model("haiku", &catalog));
+        assert!(!is_claude_model("gpt-6.1-sol", &catalog));
+        catalog.exclusions_loaded = false;
+        catalog.ids.insert("gpt-6.1-sol".to_owned());
+        assert!(!is_claude_model("fable", &catalog));
+        assert!(!is_claude_model("gpt-6.1-sol", &catalog));
+        assert!(is_claude_model("claude-opus-5-5", &catalog));
+        assert!(is_claude_model("opus", &catalog));
     }
 
     #[test]
@@ -1588,6 +1621,7 @@ mod tests {
         .expect("injected");
         let catalog = load_claude_models_from(&dir, &injected);
         assert!(catalog.loaded);
+        assert!(catalog.exclusions_loaded);
         assert!(is_claude_model("fable", &catalog));
         assert!(is_claude_model("claude-fable-5-1", &catalog));
         assert!(is_claude_model("haiku", &catalog));
@@ -1595,11 +1629,38 @@ mod tests {
         assert!(!is_claude_model("gpt-6.1-sol", &catalog));
         assert!(!is_claude_model("gpt-6-astra", &catalog));
         assert!(!is_claude_model("gpt-6-luna", &catalog));
-        assert!(!is_claude_model("sonnet", &catalog));
+        assert!(is_claude_model("sonnet", &catalog));
+        assert!(is_claude_model("sonnet-4.6", &catalog));
+        assert!(is_claude_model("claude-opus-5-5", &catalog));
         assert!(!is_claude_model(&routed, &catalog));
+        let unseen = load_claude_models_from(&dir, &dir.join("absent.json"));
+        assert!(unseen.loaded);
+        assert!(!unseen.exclusions_loaded);
+        assert!(!is_claude_model("gpt-6.1-sol", &unseen));
+        assert!(!is_claude_model("fable", &unseen));
+        assert!(is_claude_model("claude-fable-5-1", &unseen));
+        assert!(is_claude_model("haiku", &unseen));
+        assert!(is_claude_model("sonnet-4.6", &unseen));
+        fs::write(dir.join("broken.json"), b"{").expect("broken exclusions");
+        let broken = load_claude_models_from(&dir, &dir.join("broken.json"));
+        assert!(broken.loaded);
+        assert!(!broken.exclusions_loaded);
+        assert!(!is_claude_model("gpt-6.1-sol", &broken));
+        assert!(!is_claude_model("fable", &broken));
+        assert!(is_claude_model("opus", &broken));
+        fs::write(dir.join("empty.json"), b"{}").expect("empty exclusions");
+        let empty = load_claude_models_from(&dir, &dir.join("empty.json"));
+        assert!(empty.loaded);
+        assert!(empty.exclusions_loaded);
+        assert!(is_claude_model("fable", &empty));
+        assert!(is_claude_model("haiku", &empty));
+        assert!(is_claude_model("claude-opus-5-5", &empty));
         let fallback = load_claude_models_from(&dir.join("absent"), &injected);
         assert!(!fallback.loaded);
+        assert!(fallback.exclusions_loaded);
         assert!(is_claude_model("claude-fable-5-1", &fallback));
+        assert!(is_claude_model("haiku", &fallback));
+        assert!(is_claude_model("sonnet-4.6", &fallback));
         assert!(!is_claude_model("fable", &fallback));
         assert!(!is_claude_model("gpt-6.1-sol", &fallback));
         assert!(!is_claude_model(&routed, &fallback));
@@ -1616,6 +1677,10 @@ mod tests {
         assert!(!hook_should_forget(&parent, &catalog));
         parent.model = Some("fable".to_owned());
         assert!(!hook_should_forget(&parent, &catalog));
+        parent.model = Some("sonnet-4.6".to_owned());
+        assert!(!hook_should_forget(&parent, &ClaudeModels::default()));
+        parent.model = Some("haiku".to_owned());
+        assert!(!hook_should_forget(&parent, &ClaudeModels::default()));
         let mut subagent = input("PostToolUse", "parent");
         subagent.model = Some("grok-4.7".to_owned());
         subagent.agent_id = Some("agent-1".to_owned());
@@ -1661,6 +1726,13 @@ mod tests {
                 &ClaudeModels::default()
             ),
             Some(false)
+        );
+        assert_eq!(
+            model_verdict(
+                &args(&["claude", "--model", "sonnet-4.6"]),
+                &ClaudeModels::default()
+            ),
+            Some(true)
         );
         assert_eq!(model_verdict(&args(&["claude"]), &catalog), Some(true));
         assert_eq!(
