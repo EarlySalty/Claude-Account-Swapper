@@ -28,6 +28,7 @@ const TRANSCRIPT_HEAD_BYTES: u64 = 64 * 1024;
 const RESUME_GRACE_SECONDS: u64 = 30 * 60;
 const T3_RESUME_SETTLE_MS: u64 = 2 * 60 * 1000;
 const RESET_NEAR_SECONDS: i64 = 60 * 60;
+const PARENT_NOT_TOLD: u64 = u64::MAX;
 const TODO_FILE: &str = "TODO.md";
 const T3_ENTRYPOINT: &str = "sdk-ts";
 const ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
@@ -564,30 +565,30 @@ fn hook_reply_with(
             let parked = state
                 .sessions
                 .entry(input.session_id.clone())
-                .or_insert_with(|| parked_from(input, now));
+                .or_insert_with(|| {
+                    if parent {
+                        parked_from(input, now)
+                    } else {
+                        Parked {
+                            told_at_ms: PARENT_NOT_TOLD,
+                            ..Parked::default()
+                        }
+                    }
+                });
             if parent && (parked.stopped_at_ms.is_some() || parked.retell) {
-                parked.told_at_ms = now;
                 parked.stopped_at_ms = None;
                 parked.continued_by_user = false;
                 parked.retell = false;
                 parked.resume_message_id = None;
                 parked.told_actors.clear();
-            }
-            if parent {
-                if input.cwd.is_some() {
-                    parked.cwd.clone_from(&input.cwd);
-                }
-                if input.transcript_path.is_some() {
-                    parked.transcript.clone_from(&input.transcript_path);
-                }
-                if input.entrypoint.is_some() {
-                    parked.entrypoint.clone_from(&input.entrypoint);
-                }
+                write_parent_baseline(parked, input, now, true);
+            } else if parent {
+                let first = !parked.told_actors.contains("");
+                write_parent_baseline(parked, input, now, first);
             }
             if !parked.told_actors.insert(actor) {
                 return None;
             }
-            parked.told_at_ms = now;
             Some(json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
@@ -598,8 +599,11 @@ fn hook_reply_with(
         "Stop" => match state.sessions.get_mut(&input.session_id) {
             Some(parked) => {
                 let first = parked.told_actors.insert(actor);
-                if parent && !first {
-                    parked.stopped_at_ms.get_or_insert(now);
+                if parent {
+                    write_parent_baseline(parked, input, now, first);
+                    if !first {
+                        parked.stopped_at_ms.get_or_insert(now);
+                    }
                 }
                 first.then(|| json!({ "decision": "block", "reason": message }))
             }
@@ -611,7 +615,14 @@ fn hook_reply_with(
                 None
             }
             None => {
-                let mut parked = parked_from(input, now);
+                let mut parked = if parent {
+                    parked_from(input, now)
+                } else {
+                    Parked {
+                        told_at_ms: PARENT_NOT_TOLD,
+                        ..Parked::default()
+                    }
+                };
                 parked.told_actors.insert(actor);
                 state.sessions.insert(input.session_id.clone(), parked);
                 Some(json!({ "decision": "block", "reason": message }))
@@ -622,12 +633,26 @@ fn hook_reply_with(
 }
 
 fn parked_from(input: &HookInput, now: u64) -> Parked {
-    Parked {
+    let mut parked = Parked {
         told_at_ms: now,
-        cwd: input.cwd.clone(),
-        transcript: input.transcript_path.clone(),
-        entrypoint: input.entrypoint.clone(),
         ..Parked::default()
+    };
+    write_parent_baseline(&mut parked, input, now, true);
+    parked
+}
+
+fn write_parent_baseline(parked: &mut Parked, input: &HookInput, now: u64, reset_clock: bool) {
+    if input.cwd.is_some() {
+        parked.cwd.clone_from(&input.cwd);
+    }
+    if input.transcript_path.is_some() {
+        parked.transcript.clone_from(&input.transcript_path);
+    }
+    if input.entrypoint.is_some() {
+        parked.entrypoint.clone_from(&input.entrypoint);
+    }
+    if reset_clock {
+        parked.told_at_ms = now;
     }
 }
 
@@ -699,6 +724,19 @@ fn resume_when_ready(detail: &t3::ThreadDetail, min_context_tokens: u64) -> Resu
         ResumeWhenReady::Send
     } else {
         ResumeWhenReady::KeepUntilCompact
+    }
+}
+
+enum ResumeDelivery {
+    Send,
+    Wait,
+}
+
+fn resume_delivery(ready: ResumeWhenReady, grace_elapsed: bool) -> ResumeDelivery {
+    match (ready, grace_elapsed) {
+        (ResumeWhenReady::Send, _) => ResumeDelivery::Send,
+        (ResumeWhenReady::KeepUntilCompact, false) => ResumeDelivery::Wait,
+        (ResumeWhenReady::KeepUntilCompact, true) => ResumeDelivery::Send,
     }
 }
 
@@ -1423,12 +1461,14 @@ impl App {
             state.compacted.insert(thread_id.to_owned(), at);
         })?;
         if let Err(error) = rpc.send_message(thread_id, COMPACT_COMMAND, &message_id) {
-            self.update_limit_state(|state| {
-                for session in &detail.native_session_ids {
-                    state.compacting_sessions.remove(session);
-                }
-                state.compacted.remove(thread_id);
-            })?;
+            if t3::is_rejection(&error) {
+                self.update_limit_state(|state| {
+                    for session in &detail.native_session_ids {
+                        state.compacting_sessions.remove(session);
+                    }
+                    state.compacted.remove(thread_id);
+                })?;
+            }
             return Err(error);
         }
         log_event(&format!(
@@ -1481,8 +1521,11 @@ impl App {
         }
         let min_context_tokens = self.load_config().limit_compact.min_context_tokens;
         if matches!(
-            resume_when_ready(&detail, min_context_tokens),
-            ResumeWhenReady::KeepUntilCompact
+            resume_delivery(
+                resume_when_ready(&detail, min_context_tokens),
+                grace_over(state, now)
+            ),
+            ResumeDelivery::Wait
         ) {
             self.request_compact_if_needed(rpc, thread_id, &detail)?;
             return Ok(Outcome::Pending);
@@ -2034,6 +2077,54 @@ mod tests {
         grok.hook_event_name = "Stop".to_owned();
         assert!(hook_reply(&grok, &mut state, 31).is_none());
         assert!(!state.sessions.contains_key("g"));
+
+        let mut state = active();
+        let mut parent_hook = input("PostToolUse", "p");
+        parent_hook.cwd = Some(PathBuf::from("/parent"));
+        parent_hook.transcript_path = Some(PathBuf::from("/parent/session.jsonl"));
+        parent_hook.entrypoint = Some("sdk-ts".to_owned());
+        assert!(hook_reply(&parent_hook, &mut state, 10).is_some());
+        let mut child = input("PostToolUse", "p");
+        child.agent_id = Some("a".to_owned());
+        child.model = Some("haiku".to_owned());
+        child.cwd = Some(PathBuf::from("/child"));
+        child.transcript_path = Some(PathBuf::from("/child/session.jsonl"));
+        child.entrypoint = Some("child".to_owned());
+        assert!(hook_reply(&child, &mut state, 40).is_some());
+        assert_eq!(state.sessions["p"].told_at_ms, 10);
+        assert_eq!(state.sessions["p"].cwd, Some(PathBuf::from("/parent")));
+        assert_eq!(
+            state.sessions["p"].transcript,
+            Some(PathBuf::from("/parent/session.jsonl"))
+        );
+        assert_eq!(state.sessions["p"].entrypoint.as_deref(), Some("sdk-ts"));
+
+        let mut state = active();
+        let mut child_first = input("PostToolUse", "c");
+        child_first.agent_id = Some("a".to_owned());
+        child_first.model = Some("opus".to_owned());
+        child_first.cwd = Some(PathBuf::from("/child"));
+        child_first.transcript_path = Some(PathBuf::from("/child/session.jsonl"));
+        assert!(hook_reply(&child_first, &mut state, 5).is_some());
+        assert_eq!(state.sessions["c"].told_at_ms, PARENT_NOT_TOLD);
+        assert!(state.sessions["c"].cwd.is_none());
+        assert!(state.sessions["c"].transcript.is_none());
+        let mut parent_stop = input("Stop", "c");
+        parent_stop.cwd = Some(PathBuf::from("/parent"));
+        parent_stop.transcript_path = Some(PathBuf::from("/parent/session.jsonl"));
+        parent_stop.entrypoint = Some("sdk-ts".to_owned());
+        assert!(hook_reply(&parent_stop, &mut state, 6).is_some());
+        assert_eq!(state.sessions["c"].told_at_ms, 6);
+        assert_eq!(state.sessions["c"].cwd, Some(PathBuf::from("/parent")));
+        assert_eq!(
+            state.sessions["c"].transcript,
+            Some(PathBuf::from("/parent/session.jsonl"))
+        );
+        assert_eq!(state.sessions["c"].entrypoint.as_deref(), Some("sdk-ts"));
+        assert!(state.sessions["c"].stopped_at_ms.is_none());
+        assert!(hook_reply(&parent_stop, &mut state, 7).is_none());
+        assert_eq!(state.sessions["c"].stopped_at_ms, Some(7));
+        assert_eq!(state.sessions["c"].told_at_ms, 6);
     }
 
     #[test]
@@ -2097,6 +2188,31 @@ mod tests {
         assert!(matches!(
             resume_when_ready(&detail(false, None), 60_000),
             ResumeWhenReady::KeepUntilCompact
+        ));
+        let fat = detail(false, Some(200_000));
+        let unknown = detail(false, None);
+        assert!(matches!(
+            resume_delivery(resume_when_ready(&fat, 60_000), false),
+            ResumeDelivery::Wait
+        ));
+        assert!(matches!(
+            resume_delivery(resume_when_ready(&unknown, 60_000), false),
+            ResumeDelivery::Wait
+        ));
+        assert!(matches!(
+            resume_delivery(resume_when_ready(&fat, 60_000), true),
+            ResumeDelivery::Send
+        ));
+        assert!(matches!(
+            resume_delivery(resume_when_ready(&unknown, 60_000), true),
+            ResumeDelivery::Send
+        ));
+        assert!(matches!(
+            resume_delivery(
+                resume_when_ready(&detail(true, Some(200_000)), 60_000),
+                false
+            ),
+            ResumeDelivery::Send
         ));
     }
 
