@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
@@ -241,18 +241,159 @@ fn entrypoint_from_transcript(transcript: &Path) -> Option<String> {
     })
 }
 
-fn is_claude_model(model: &str) -> bool {
+#[derive(Debug, Clone, Default)]
+struct ClaudeModels {
+    ids: HashSet<String>,
+    aliases: HashSet<String>,
+    injected: HashSet<String>,
+    loaded: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CatalogFile {
+    #[serde(default)]
+    catalog: Option<CatalogBody>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CatalogBody {
+    #[serde(default)]
+    config: Option<CatalogConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CatalogConfig {
+    #[serde(default)]
+    models: Vec<Value>,
+    #[serde(default)]
+    provider_alias_targets: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InjectedModels {
+    #[serde(default)]
+    available_models: Vec<Value>,
+    #[serde(default)]
+    model: Value,
+    #[serde(default)]
+    small_model: Value,
+}
+
+fn normalized_model(model: &str) -> String {
     let model = model.trim().to_ascii_lowercase();
-    if model.starts_with("claude") {
-        return true;
+    model
+        .strip_suffix("[1m]")
+        .unwrap_or(&model)
+        .trim()
+        .to_owned()
+}
+
+fn model_family(model: &str) -> &str {
+    model
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or("")
+}
+
+fn remember_name(names: &mut HashSet<String>, name: &str) {
+    let name = normalized_model(name);
+    if !name.is_empty() {
+        names.insert(name);
     }
-    matches!(
-        model
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .next()
-            .unwrap_or(""),
-        "haiku" | "sonnet" | "opus"
-    )
+}
+
+fn remember_value(names: &mut HashSet<String>, value: &Value) {
+    if let Some(name) = value.as_str() {
+        remember_name(names, name);
+    }
+}
+
+fn claude_model_sources(home: &Path) -> (PathBuf, PathBuf) {
+    let catalog = home.join(".claude").join("cache").join("model-catalog");
+    let injected = home
+        .join(".config")
+        .join(["claude", "gpt6"].join("-"))
+        .join("config.json");
+    (catalog, injected)
+}
+
+fn load_claude_models() -> ClaudeModels {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return ClaudeModels::default();
+    };
+    let (catalog, injected) = claude_model_sources(&home);
+    load_claude_models_from(&catalog, &injected)
+}
+
+fn load_claude_models_from(catalog_dir: &Path, injected_path: &Path) -> ClaudeModels {
+    let mut models = ClaudeModels::default();
+    if let Ok(bytes) = fs::read(injected_path)
+        && let Ok(config) = serde_json::from_slice::<InjectedModels>(&bytes)
+    {
+        for name in &config.available_models {
+            remember_value(&mut models.injected, name);
+        }
+        remember_value(&mut models.injected, &config.model);
+        remember_value(&mut models.injected, &config.small_model);
+    }
+    if let Ok(entries) = fs::read_dir(catalog_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_json = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+            if !is_json {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            if absorb_catalog(&mut models, &bytes) {
+                models.loaded = true;
+            }
+        }
+    }
+    models
+}
+
+fn absorb_catalog(models: &mut ClaudeModels, bytes: &[u8]) -> bool {
+    let Ok(file) = serde_json::from_slice::<CatalogFile>(bytes) else {
+        return false;
+    };
+    let Some(config) = file.catalog.and_then(|body| body.config) else {
+        return false;
+    };
+    let mut found = false;
+    for model in &config.models {
+        if let Some(id) = model.get("id").and_then(Value::as_str) {
+            let before = models.ids.len();
+            remember_name(&mut models.ids, id);
+            found |= models.ids.len() > before;
+        }
+        if let Some(family) = model.pointer("/runtime/family").and_then(Value::as_str) {
+            let before = models.aliases.len();
+            remember_name(&mut models.aliases, family);
+            found |= models.aliases.len() > before;
+        }
+    }
+    for alias in config.provider_alias_targets.keys() {
+        let before = models.aliases.len();
+        remember_name(&mut models.aliases, alias);
+        found |= models.aliases.len() > before;
+    }
+    found
+}
+
+fn is_claude_model(model: &str, catalog: &ClaudeModels) -> bool {
+    let model = normalized_model(model);
+    if model.is_empty() || catalog.injected.contains(&model) {
+        return false;
+    }
+    if catalog.loaded {
+        return catalog.ids.contains(&model) || catalog.aliases.contains(model_family(&model));
+    }
+    model.starts_with("claude")
 }
 
 fn model_flag(args: &[String]) -> Option<String> {
@@ -275,13 +416,13 @@ fn is_claude_cli(exe: &str) -> bool {
             .is_some_and(|rest| rest == "-code")
 }
 
-fn model_verdict(args: &[String]) -> Option<bool> {
+fn model_verdict(args: &[String], catalog: &ClaudeModels) -> Option<bool> {
     let exe = args
         .first()
         .map(|path| path.rsplit('/').next().unwrap_or(path))
         .unwrap_or("");
     if let Some(model) = model_flag(args) {
-        return Some(is_claude_model(&model));
+        return Some(is_claude_model(&model, catalog));
     }
     if exe.starts_with("grok") {
         return Some(false);
@@ -313,14 +454,14 @@ fn parent_pid(pid: u32) -> Option<u32> {
     None
 }
 
-fn ancestry_uses_claude_model() -> bool {
+fn ancestry_uses_claude_model(catalog: &ClaudeModels) -> bool {
     let mut pid = std::process::id();
     for _ in 0..12 {
         let Some(parent) = parent_pid(pid) else {
             return false;
         };
         if let Some(args) = process_args(parent)
-            && let Some(verdict) = model_verdict(&args)
+            && let Some(verdict) = model_verdict(&args, catalog)
         {
             return verdict;
         }
@@ -329,19 +470,21 @@ fn ancestry_uses_claude_model() -> bool {
     false
 }
 
-fn session_uses_claude_model(input: &HookInput) -> bool {
+fn session_uses_claude_model(input: &HookInput, catalog: &ClaudeModels) -> bool {
     if let Some(model) = input
         .model
         .as_deref()
         .filter(|model| !model.trim().is_empty())
     {
-        return is_claude_model(model);
+        return is_claude_model(model, catalog);
     }
-    ancestry_uses_claude_model()
+    ancestry_uses_claude_model(catalog)
 }
 
-fn hook_should_forget(input: &HookInput) -> bool {
-    input.agent_id.is_none() && !input.session_id.is_empty() && !session_uses_claude_model(input)
+fn hook_should_forget(input: &HookInput, catalog: &ClaudeModels) -> bool {
+    input.agent_id.is_none()
+        && !input.session_id.is_empty()
+        && !session_uses_claude_model(input, catalog)
 }
 
 fn runs_in_t3(parked: &Parked) -> bool {
@@ -707,7 +850,8 @@ impl App {
         let mut input: HookInput =
             serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
         input.entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
-        if hook_should_forget(&input) {
+        let catalog = load_claude_models();
+        if hook_should_forget(&input, &catalog) {
             if state.sessions.contains_key(&input.session_id)
                 || state.compacting_sessions.contains_key(&input.session_id)
             {
@@ -1348,73 +1492,208 @@ mod tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    fn listed_catalog() -> ClaudeModels {
+        let mut catalog = ClaudeModels {
+            loaded: true,
+            ..ClaudeModels::default()
+        };
+        for id in [
+            "claude-opus-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+            "gpt-6.1-sol",
+        ] {
+            catalog.ids.insert(id.to_owned());
+        }
+        for alias in ["fable", "haiku", "sonnet", "opus"] {
+            catalog.aliases.insert(alias.to_owned());
+        }
+        for name in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"] {
+            catalog.injected.insert(name.to_owned());
+        }
+        catalog
+    }
+
     #[test]
     fn only_a_claude_model_name_counts() {
-        assert!(is_claude_model("claude-opus-5-5"));
-        assert!(is_claude_model(" Claude-Haiku-5-5 "));
-        assert!(is_claude_model("haiku"));
-        assert!(is_claude_model("Sonnet"));
-        assert!(is_claude_model("opus"));
-        assert!(is_claude_model("sonnet-4.6"));
-        assert!(!is_claude_model("grok-4.7"));
-        assert!(!is_claude_model("gpt-6.1-sol"));
-        assert!(!is_claude_model("glm-5.3"));
-        assert!(!is_claude_model(""));
-        assert!(!is_claude_model("sonnetextra"));
+        let catalog = listed_catalog();
+        assert!(is_claude_model("claude-opus-5-5", &catalog));
+        assert!(is_claude_model(" Claude-Haiku-5-5 ", &catalog));
+        assert!(is_claude_model("haiku", &catalog));
+        assert!(is_claude_model("Sonnet", &catalog));
+        assert!(is_claude_model("opus", &catalog));
+        assert!(is_claude_model("sonnet-4.6", &catalog));
+        assert!(is_claude_model("fable", &catalog));
+        assert!(is_claude_model("Fable[1m]", &catalog));
+        assert!(is_claude_model("claude-fable-5-1", &catalog));
+        assert!(!is_claude_model("grok-4.7", &catalog));
+        assert!(!is_claude_model("gpt-6.1-sol", &catalog));
+        assert!(!is_claude_model("glm-5.3", &catalog));
+        assert!(!is_claude_model("", &catalog));
+        assert!(!is_claude_model("sonnetextra", &catalog));
+    }
+
+    #[test]
+    fn missing_catalog_accepts_only_the_claude_prefix() {
+        let catalog = ClaudeModels::default();
+        assert!(is_claude_model("claude-fable-5-1", &catalog));
+        assert!(is_claude_model(" Claude-Haiku-5-5[1m] ", &catalog));
+        assert!(!is_claude_model("fable", &catalog));
+        assert!(!is_claude_model("haiku", &catalog));
+        assert!(!is_claude_model("sonnet-4.6", &catalog));
+        assert!(!is_claude_model("gpt-6.1-sol", &catalog));
+    }
+
+    #[test]
+    fn injected_name_is_not_claude_even_when_listed() {
+        let mut catalog = listed_catalog();
+        let routed = ["claude", "routed"].join("-");
+        catalog.ids.insert(routed.clone());
+        catalog.injected.insert(routed.clone());
+        assert!(catalog.loaded);
+        assert!(!is_claude_model(&routed, &catalog));
+        assert!(!is_claude_model("gpt-6.1-sol", &catalog));
+        catalog.loaded = false;
+        assert!(!is_claude_model(&routed, &catalog));
+        assert!(is_claude_model("claude-fable-5-1", &catalog));
+    }
+
+    #[test]
+    fn catalog_files_define_claude_and_injected_names() {
+        let dir = std::env::temp_dir().join(format!("cas-hook-catalog-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp catalog");
+        fs::write(dir.join("bad.json"), b"{").expect("bad catalog");
+        fs::write(dir.join("note.txt"), b"ignore").expect("note");
+        let routed = ["claude", "routed"].join("-");
+        fs::write(
+            dir.join("models.json"),
+            format!(
+                r#"{{"catalog":{{"config":{{"models":[{{"id":"claude-fable-5-1","runtime":{{"family":"fable"}}}},{{"id":"gpt-6.1-sol"}},{{"id":"  "}},{{"id":"{routed}"}}],"provider_alias_targets":{{"Fable":{{}},"haiku":{{}}}}}}}}}}"#
+            ),
+        )
+        .expect("models");
+        fs::write(
+            dir.join("more.json"),
+            r#"{"catalog":{"config":{"models":[],"provider_alias_targets":{"opus":{}}}}}"#,
+        )
+        .expect("more");
+        let injected = dir.join("injected.json");
+        fs::write(
+            &injected,
+            format!(
+                r#"{{"available_models":["gpt-6.1-sol","gpt-6.1-sol-fast","{routed}"],"model":"gpt-6-astra","small_model":"gpt-6-luna","port":1}}"#
+            ),
+        )
+        .expect("injected");
+        let catalog = load_claude_models_from(&dir, &injected);
+        assert!(catalog.loaded);
+        assert!(is_claude_model("fable", &catalog));
+        assert!(is_claude_model("claude-fable-5-1", &catalog));
+        assert!(is_claude_model("haiku", &catalog));
+        assert!(is_claude_model("opus", &catalog));
+        assert!(!is_claude_model("gpt-6.1-sol", &catalog));
+        assert!(!is_claude_model("gpt-6-astra", &catalog));
+        assert!(!is_claude_model("gpt-6-luna", &catalog));
+        assert!(!is_claude_model("sonnet", &catalog));
+        assert!(!is_claude_model(&routed, &catalog));
+        let fallback = load_claude_models_from(&dir.join("absent"), &injected);
+        assert!(!fallback.loaded);
+        assert!(is_claude_model("claude-fable-5-1", &fallback));
+        assert!(!is_claude_model("fable", &fallback));
+        assert!(!is_claude_model("gpt-6.1-sol", &fallback));
+        assert!(!is_claude_model(&routed, &fallback));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn subagent_hooks_do_not_forget_the_parent_session() {
+        let catalog = listed_catalog();
         let mut parent = input("PostToolUse", "parent");
         parent.model = Some("grok-4.7".to_owned());
-        assert!(hook_should_forget(&parent));
+        assert!(hook_should_forget(&parent, &catalog));
         parent.model = Some("haiku".to_owned());
-        assert!(!hook_should_forget(&parent));
+        assert!(!hook_should_forget(&parent, &catalog));
+        parent.model = Some("fable".to_owned());
+        assert!(!hook_should_forget(&parent, &catalog));
         let mut subagent = input("PostToolUse", "parent");
         subagent.model = Some("grok-4.7".to_owned());
         subagent.agent_id = Some("agent-1".to_owned());
-        assert!(!hook_should_forget(&subagent));
+        assert!(!hook_should_forget(&subagent, &catalog));
         let mut nameless = input("PostToolUse", "");
         nameless.model = Some("grok-4.7".to_owned());
-        assert!(!hook_should_forget(&nameless));
+        assert!(!hook_should_forget(&nameless, &catalog));
     }
 
     #[test]
     fn process_cmdline_decides_claude_model() {
+        let catalog = listed_catalog();
         assert_eq!(
-            model_verdict(&args(&["/usr/bin/grok", "agent"])),
+            model_verdict(&args(&["/usr/bin/grok", "agent"]), &catalog),
             Some(false)
         );
         assert_eq!(
-            model_verdict(&args(&[
-                "/home/nathanael/.local/bin/claude",
-                "--model",
-                "claude-haiku-5-5"
-            ])),
+            model_verdict(
+                &args(&[
+                    "/home/nathanael/.local/bin/claude",
+                    "--model",
+                    "claude-haiku-5-5"
+                ]),
+                &catalog
+            ),
             Some(true)
         );
         assert_eq!(
-            model_verdict(&args(&["claude", "--model=gpt-6.1-sol"])),
+            model_verdict(&args(&["claude", "--model=gpt-6.1-sol"]), &catalog),
             Some(false)
         );
         assert_eq!(
-            model_verdict(&args(&["claude", "--model", "haiku"])),
+            model_verdict(&args(&["claude", "--model", "haiku"]), &catalog),
             Some(true)
         );
-        assert_eq!(model_verdict(&args(&["claude"])), Some(true));
-        assert_eq!(model_verdict(&args(&["/usr/bin/claude-code"])), Some(true));
-        assert_eq!(model_verdict(&args(&["claude-account", "hook"])), None);
-        assert_eq!(model_verdict(&args(&["grok-4"])), Some(false));
-        assert_eq!(model_verdict(&args(&["/usr/bin/t3", "serve"])), None);
+        assert_eq!(
+            model_verdict(&args(&["claude", "--model", "fable"]), &catalog),
+            Some(true)
+        );
+        assert_eq!(
+            model_verdict(
+                &args(&["claude", "--model", "fable"]),
+                &ClaudeModels::default()
+            ),
+            Some(false)
+        );
+        assert_eq!(model_verdict(&args(&["claude"]), &catalog), Some(true));
+        assert_eq!(
+            model_verdict(&args(&["/usr/bin/claude-code"]), &catalog),
+            Some(true)
+        );
+        assert_eq!(
+            model_verdict(&args(&["claude-account", "hook"]), &catalog),
+            None
+        );
+        assert_eq!(model_verdict(&args(&["grok-4"]), &catalog), Some(false));
+        assert_eq!(
+            model_verdict(&args(&["/usr/bin/t3", "serve"]), &catalog),
+            None
+        );
     }
 
     #[test]
     fn explicit_hook_model_overrides_process_ancestry() {
         let mut hook_input = input("PostToolUse", "s");
         hook_input.model = Some("grok-4.7".to_owned());
-        assert!(!session_uses_claude_model(&hook_input));
+        assert!(!session_uses_claude_model(&hook_input, &listed_catalog()));
         hook_input.model = Some("claude-fable-5-1".to_owned());
-        assert!(session_uses_claude_model(&hook_input));
+        assert!(session_uses_claude_model(
+            &hook_input,
+            &ClaudeModels::default()
+        ));
+        hook_input.model = Some("fable".to_owned());
+        assert!(session_uses_claude_model(&hook_input, &listed_catalog()));
+        assert!(!session_uses_claude_model(
+            &hook_input,
+            &ClaudeModels::default()
+        ));
     }
 
     fn active() -> LimitState {
