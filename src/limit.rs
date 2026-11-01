@@ -27,6 +27,7 @@ const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 const TRANSCRIPT_HEAD_BYTES: u64 = 64 * 1024;
 const RESUME_GRACE_SECONDS: u64 = 30 * 60;
 const T3_RESUME_SETTLE_MS: u64 = 2 * 60 * 1000;
+const RESET_NEAR_SECONDS: i64 = 60 * 60;
 const TODO_FILE: &str = "TODO.md";
 const T3_ENTRYPOINT: &str = "sdk-ts";
 const ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
@@ -57,6 +58,7 @@ pub struct Parked {
     pub continued_by_user: bool,
     pub retell: bool,
     pub resume_message_id: Option<String>,
+    pub subagent: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -106,8 +108,10 @@ pub fn resume_message(parked: &Parked, todo: Option<&Path>) -> String {
     };
     format!(
         "[claude-account] An account has quota again. You stopped earlier because no account \
-         had quota left. {pointer} and continue the task from there. If nothing is \
-         left to do, say so in one line and stop."
+         had quota left. {pointer} and continue the task from there. Compacted sub-agent \
+         threads may be resumed: their context is only the short summary, so that send is a \
+         few uncached tokens and the cold-resume gate allows it. Do not resume a sub-agent \
+         thread that was not compacted. If nothing is left to do, say so in one line and stop."
     )
 }
 
@@ -511,7 +515,7 @@ fn hook_reply_with(
     now: u64,
     still_blocked: bool,
 ) -> Option<Value> {
-    if input.session_id.is_empty() || input.agent_id.is_some() {
+    if input.session_id.is_empty() {
         return None;
     }
     if input.hook_event_name == "Stop"
@@ -586,8 +590,32 @@ fn parked_from(input: &HookInput, now: u64) -> Parked {
         cwd: input.cwd.clone(),
         transcript: input.transcript_path.clone(),
         entrypoint: input.entrypoint.clone(),
+        subagent: input.agent_id.is_some(),
         ..Parked::default()
     }
+}
+
+fn reset_within_an_hour(levels: &[Level], now: DateTime<Utc>) -> bool {
+    levels
+        .iter()
+        .filter_map(|(_, candidate)| candidate.as_ref())
+        .any(|candidate| {
+            candidate
+                .usage
+                .five_hour
+                .resets_at
+                .is_some_and(|resets_at| {
+                    let seconds = resets_at.signed_duration_since(now).num_seconds();
+                    seconds > 0 && seconds <= RESET_NEAR_SECONDS
+                })
+        })
+}
+
+fn cheap_to_resume(detail: &t3::ThreadDetail, min_context_tokens: u64) -> bool {
+    detail.last_item_is_compaction
+        || detail
+            .used_tokens
+            .is_some_and(|tokens| tokens < min_context_tokens)
 }
 
 fn warm_candidate(thread: &ThreadSummary, limit: &LimitCompact, now: DateTime<Utc>) -> bool {
@@ -694,7 +722,8 @@ fn verdict(config: &Config, levels: &[Level], active_profile: Option<&str>) -> V
         Fit::No => false,
     };
     Verdict {
-        at_limit: limit.enabled && (limit.force || all_at_limit),
+        at_limit: limit.enabled
+            && (limit.force || (all_at_limit && !reset_within_an_hour(levels, Utc::now()))),
         released: !limit.enabled || (!limit.force && active_usable),
     }
 }
@@ -871,9 +900,8 @@ impl App {
             return Ok(None);
         }
         let now = unix_millis()?;
-        let relevant = state.active
-            && input.agent_id.is_none()
-            && (state.scope.is_empty() || state.scope.contains(&input.session_id));
+        let relevant =
+            state.active && (state.scope.is_empty() || state.scope.contains(&input.session_id));
         let blocked = !relevant || self.blocked_now().unwrap_or(true);
         let reply =
             self.update_limit_state(|state| hook_reply_with(&input, state, now, blocked))?;
@@ -1224,11 +1252,16 @@ impl App {
         let wants_t3 = before
             .sessions
             .values()
-            .any(|parked| !parked.continued_by_user && is_t3_session(parked));
+            .any(|parked| !parked.continued_by_user && !parked.subagent && is_t3_session(parked));
         let mut t3 = wants_t3.then(|| self.open_t3(limit, &before));
         let state = self.load_limit_state()?;
         for (session, parked) in &state.sessions {
-            let outcome = if parked.continued_by_user {
+            let outcome = if parked.subagent {
+                Ok(Outcome::Done(
+                    "Subagent nicht einzeln fortgesetzt, der Eltern-Thread setzt kompakte Subagents fort"
+                        .to_owned(),
+                ))
+            } else if parked.continued_by_user {
                 Ok(Outcome::Done("wurde schon von Hand fortgesetzt".to_owned()))
             } else if is_t3_session(parked) {
                 match t3.as_mut() {
@@ -1324,6 +1357,11 @@ impl App {
         let released_ms = state.released_at.unwrap_or(0).saturating_mul(1000);
         if settling(stopped_at_ms.max(released_ms), now) || thread.busy {
             return Ok(Outcome::Pending);
+        }
+        if !cheap_to_resume(&detail, self.load_config().limit_compact.min_context_tokens) {
+            return Ok(Outcome::Done(format!(
+                "nicht fortgesetzt: Thread {thread_id} ist nicht kompakt"
+            )));
         }
         let message_id = match &parked.resume_message_id {
             Some(id) => id.clone(),
@@ -1819,14 +1857,53 @@ mod tests {
     }
 
     #[test]
-    fn compaction_turns_and_subagents_are_left_alone() {
+    fn compaction_turns_are_left_alone_and_subagents_stop_with_the_parent() {
         let mut state = active();
         state.compacting_sessions.insert("s".to_owned(), 1);
         assert!(hook_reply(&input("Stop", "s"), &mut state, 10).is_none());
         let mut sub = input("PostToolUse", "t");
         sub.agent_id = Some("a".to_owned());
-        assert!(hook_reply(&sub, &mut state, 10).is_none());
-        assert!(state.sessions.is_empty());
+        assert!(hook_reply(&sub, &mut state, 10).is_some());
+        assert!(state.sessions["t"].subagent);
+        let mut stop = input("Stop", "t");
+        stop.agent_id = Some("a".to_owned());
+        assert!(hook_reply(&stop, &mut state, 20).is_none());
+        assert_eq!(state.sessions["t"].stopped_at_ms, Some(20));
+    }
+
+    #[test]
+    fn near_reset_does_not_open_the_pause_and_a_far_one_does() {
+        let soon = Utc::now() + chrono::Duration::minutes(30);
+        let later = Utc::now() + chrono::Duration::minutes(90);
+        let levels = |at| vec![("a".to_owned(), usage_at(100.0, 10.0, Some(at)))];
+        assert!(!verdict(&config(true), &levels(soon), Some("a")).at_limit);
+        assert!(verdict(&config(true), &levels(later), Some("a")).at_limit);
+        let mut forced = config(true);
+        forced.limit_compact.force = true;
+        assert!(verdict(&forced, &levels(soon), Some("a")).at_limit);
+    }
+
+    #[test]
+    fn only_a_compacted_or_small_thread_is_cheap_to_resume() {
+        let detail = |compaction, tokens| t3::ThreadDetail {
+            native_session_ids: Vec::new(),
+            used_tokens: tokens,
+            last_item_is_compaction: compaction,
+            last_compaction_at: None,
+            last_foreign_message_at: None,
+            message_ids: Vec::new(),
+        };
+        assert!(cheap_to_resume(&detail(true, Some(200_000)), 60_000));
+        assert!(cheap_to_resume(&detail(false, Some(10_000)), 60_000));
+        assert!(!cheap_to_resume(&detail(false, Some(200_000)), 60_000));
+        assert!(!cheap_to_resume(&detail(false, None), 60_000));
+    }
+
+    #[test]
+    fn resume_message_allows_compacted_subagents() {
+        let text = resume_message(&Parked::default(), None);
+        assert!(text.contains("Compacted sub-agent"));
+        assert!(text.contains("was not compacted"));
     }
 
     #[test]
@@ -1862,15 +1939,23 @@ mod tests {
     }
 
     fn usage(five_hour: f64, seven_day: f64) -> Option<Candidate> {
-        let bucket = |utilization| crate::usage::Bucket {
+        usage_at(five_hour, seven_day, None)
+    }
+
+    fn usage_at(
+        five_hour: f64,
+        seven_day: f64,
+        resets_at: Option<DateTime<Utc>>,
+    ) -> Option<Candidate> {
+        let bucket = |utilization, resets_at| crate::usage::Bucket {
             utilization,
-            resets_at: None,
+            resets_at,
         };
         Some(Candidate {
             name: String::new(),
             usage: crate::usage::Usage {
-                five_hour: bucket(five_hour),
-                seven_day: bucket(seven_day),
+                five_hour: bucket(five_hour, resets_at),
+                seven_day: bucket(seven_day, None),
             },
             stops: crate::usage::Stops::default(),
         })
