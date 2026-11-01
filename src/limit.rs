@@ -707,10 +707,7 @@ impl App {
         let mut input: HookInput =
             serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
         input.entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
-        if input.agent_id.is_some() || input.session_id.is_empty() {
-            return Ok(None);
-        }
-        if !session_uses_claude_model(&input) {
+        if hook_should_forget(&input) {
             if state.sessions.contains_key(&input.session_id)
                 || state.compacting_sessions.contains_key(&input.session_id)
             {
