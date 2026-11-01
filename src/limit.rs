@@ -258,18 +258,25 @@ fn model_flag(args: &[String]) -> Option<String> {
     None
 }
 
+fn is_claude_cli(exe: &str) -> bool {
+    exe == "claude"
+        || exe
+            .strip_prefix("claude")
+            .is_some_and(|rest| rest == "-code")
+}
+
 fn model_verdict(args: &[String]) -> Option<bool> {
     let exe = args
         .first()
         .map(|path| path.rsplit('/').next().unwrap_or(path))
         .unwrap_or("");
-    if exe == "grok" || exe.starts_with("grok-") {
-        return Some(false);
-    }
     if let Some(model) = model_flag(args) {
         return Some(is_claude_model(&model));
     }
-    if exe == "claude" || exe == "claude-code" {
+    if exe.starts_with("grok") {
+        return Some(false);
+    }
+    if is_claude_cli(exe) {
         return Some(true);
     }
     None
@@ -1361,6 +1368,9 @@ mod tests {
             Some(false)
         );
         assert_eq!(model_verdict(&args(&["claude"])), Some(true));
+        assert_eq!(model_verdict(&args(&["/usr/bin/claude-code"])), Some(true));
+        assert_eq!(model_verdict(&args(&["claude-account", "hook"])), None);
+        assert_eq!(model_verdict(&args(&["grok-4"])), Some(false));
         assert_eq!(model_verdict(&args(&["/usr/bin/t3", "serve"])), None);
     }
 
