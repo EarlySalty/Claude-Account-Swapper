@@ -745,6 +745,7 @@ fn warm_candidate(thread: &ThreadSummary, limit: &LimitCompact, now: DateTime<Ut
     };
     let idle = now.signed_duration_since(completed).num_seconds();
     !thread.busy
+        && !thread.settled
         && idle >= minutes(limit.idle_minutes)
         && idle < minutes(limit.cache_ttl_minutes)
         && thread
@@ -2690,6 +2691,7 @@ mod tests {
         let thread = |minutes_ago: i64, busy: bool| ThreadSummary {
             id: "t".to_owned(),
             busy,
+            settled: false,
             last_run_completed_at: Some(now - chrono::Duration::minutes(minutes_ago)),
             last_user_message_at: Some(now - chrono::Duration::minutes(minutes_ago + 1)),
             updated_at: None,
@@ -2698,5 +2700,10 @@ mod tests {
         assert!(!warm_candidate(&thread(10, true), &limit, now));
         assert!(!warm_candidate(&thread(0, false), &limit, now));
         assert!(!warm_candidate(&thread(70, false), &limit, now));
+        let settled = ThreadSummary {
+            settled: true,
+            ..thread(10, false)
+        };
+        assert!(!warm_candidate(&settled, &limit, now));
     }
 }

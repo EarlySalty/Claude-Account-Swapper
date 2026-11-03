@@ -25,6 +25,7 @@ pub struct Client {
 pub struct ThreadSummary {
     pub id: String,
     pub busy: bool,
+    pub settled: bool,
     pub last_run_completed_at: Option<DateTime<Utc>>,
     pub last_user_message_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
@@ -300,6 +301,10 @@ fn is_busy(thread: &Value) -> bool {
     active_run || pending || status
 }
 
+fn is_settled(thread: &Value) -> bool {
+    thread.get("settledOverride").and_then(Value::as_str) == Some("settled")
+}
+
 pub fn parse_shell(value: &Value) -> Result<Vec<ThreadSummary>> {
     let threads = value
         .get("threads")
@@ -328,6 +333,7 @@ pub fn parse_shell(value: &Value) -> Result<Vec<ThreadSummary>> {
             Ok(ThreadSummary {
                 id: id.to_owned(),
                 busy: is_busy(thread),
+                settled: is_settled(thread),
                 last_run_completed_at: timestamp(thread, "latestRunCompletedAt"),
                 last_user_message_at: timestamp(thread, "latestUserMessageAt"),
                 updated_at: timestamp(thread, "updatedAt"),
@@ -457,12 +463,15 @@ mod tests {
             { "id": "b", "providerInstanceId": "claudeAgent", "status": "completed", "activeRunId": null,
               "latestRunCompletedAt": "2026-10-27T21:18:18.404Z" },
             { "id": "c", "providerInstanceId": "codex", "status": "completed" },
-            { "id": "d", "providerInstanceId": "claudeAgent", "archivedAt": "2026-10-01T00:00:00Z" }
+            { "id": "d", "providerInstanceId": "claudeAgent", "archivedAt": "2026-10-01T00:00:00Z" },
+            { "id": "e", "providerInstanceId": "claudeAgent", "settledOverride": "settled" }
         ]});
         let Ok(threads) = parse_shell(&value) else {
             panic!("shell must parse");
         };
-        assert_eq!(threads.len(), 2);
+        assert_eq!(threads.len(), 3);
+        assert!(!threads[1].settled);
+        assert!(threads[2].settled);
         assert!(parse_shell(&json!({})).is_err());
         assert!(
             parse_shell(&json!({ "threads": [{ "providerInstanceId": "claudeAgent" }] })).is_err()
