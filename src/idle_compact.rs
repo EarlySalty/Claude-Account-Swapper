@@ -108,6 +108,9 @@ impl App {
         if FileExt::try_lock_exclusive(&tick_lock).is_err() {
             return Ok(());
         }
+        if self.load_config().limit_compact.idle_compact_minutes == 0 {
+            return Ok(());
+        }
         self.check_config_file()?;
         let limit = self.load_config().limit_compact;
         if limit.idle_compact_minutes == 0 || self.limit_pause_holds() {
@@ -124,10 +127,15 @@ impl App {
         let pending = unchecked(&candidates, &checked);
         let mut rpc: Option<t3::Rpc> = None;
         let mut failed = Vec::new();
+        let mut sent = 0;
         for thread in pending {
+            if sent >= limit.max_compactions {
+                break;
+            }
             let key = format!("{SPOKEN_KEY}:{}", thread.id);
             match self.compact_idle_thread(&client, &mut rpc, thread, &limit) {
-                Ok(()) => {
+                Ok(compacted) => {
+                    sent += usize::from(compacted);
                     spoken.remove(&key);
                 }
                 Err(error) => {
@@ -163,7 +171,7 @@ impl App {
         rpc: &mut Option<t3::Rpc>,
         thread: &ThreadSummary,
         limit: &LimitCompact,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let rpc = connected(client, rpc)?;
         let detail = rpc.thread_detail(&thread.id)?;
         let skip = !in_scope(&detail.native_session_ids, limit)
@@ -172,9 +180,10 @@ impl App {
         if skip {
             let id = thread.id.clone();
             let done = completed_ms(thread);
-            return self.update_checked(|checked| {
+            self.update_checked(|checked| {
                 checked.threads.insert(id, done);
-            });
+            })?;
+            return Ok(false);
         }
         self.note_compacting(&detail.native_session_ids)?;
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -194,7 +203,7 @@ impl App {
             thread.id,
             detail.used_tokens.unwrap_or(0)
         ));
-        Ok(())
+        Ok(true)
     }
 }
 

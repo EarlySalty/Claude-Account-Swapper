@@ -226,7 +226,7 @@ Mit `claude-account limit-compact --after-subagent on` merkt sich der Hook, wenn
 
 #### Nach langer Ruhe kompaktieren
 
-Mit `claude-account limit-compact --idle-compact-minutes 30` kompaktiert der Hintergrunddienst jeden offenen T3-Thread mit Claude-Modell, der seit mindestens 30 Minuten ruht, solange er noch im Cache-Fenster liegt (Standard 55 Minuten) und mindestens `--min-context-tokens` im Kontext hat. Erledigte (settled), laufende und Threads mit wartender Nachricht bleiben unberuehrt. Ein geprueft zu kleiner Thread wird erst wieder angesehen, wenn er erneut gelaufen ist. `0` schaltet es ab (Standard), der Wert muss unter dem Cache-Fenster liegen; `--scope-session` grenzt es ein, waehrend einer Limit-Pause ruht es.
+Mit `claude-account limit-compact --idle-compact-minutes 30` kompaktiert der Hintergrunddienst jeden offenen T3-Thread mit Claude-Modell, der seit mindestens 30 Minuten ruht, solange er noch im Cache-Fenster liegt (Standard 55 Minuten) und mindestens `--min-context-tokens` im Kontext hat. Erledigte (settled), laufende und Threads mit wartender Nachricht bleiben unberuehrt. Je Minute sind es hoechstens `max_compactions` Threads. Ein geprueft zu kleiner Thread wird erst wieder angesehen, wenn er erneut gelaufen ist. `0` schaltet es ab (Standard), der Wert muss unter dem Cache-Fenster liegen; `--scope-session` grenzt es ein, waehrend einer Limit-Pause ruht es.
 
 ### Das Fenster von selbst eroeffnen
 
