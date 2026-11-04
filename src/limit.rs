@@ -1130,7 +1130,7 @@ impl App {
         let limit = &config.limit_compact;
         let levels = self.cached_levels()?;
         let before = self.load_limit_state()?;
-        if limit.enabled && !limit.force && (before.active || !before.sessions.is_empty()) {
+        if limit.enabled && !limit.force && before.active {
             self.switch_for_resume(config, &levels, spoken);
         }
         let active_profile = self.active_profile_name_memoized(None);
@@ -1578,6 +1578,12 @@ impl App {
                 "nicht fortgesetzt: Arbeitsverzeichnis unbekannt".to_owned(),
             ));
         };
+        if !cwd.is_dir() {
+            return Ok(Outcome::Done(format!(
+                "nicht fortgesetzt: Arbeitsverzeichnis gibt es nicht mehr: {}",
+                cwd.display()
+            )));
+        }
         if parked
             .transcript
             .as_deref()
