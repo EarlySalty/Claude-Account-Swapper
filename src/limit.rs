@@ -929,6 +929,8 @@ fn still_blocked(
 }
 
 fn reenter(state: &mut LimitState, now: u64) -> Vec<String> {
+    state.compacted.clear();
+    state.inspected.clear();
     state
         .compacting_sessions
         .retain(|_, at| now.saturating_sub(*at) < COMPACTING_MARKER_SECONDS);
@@ -2582,14 +2584,14 @@ mod tests {
         state.compacting_sessions.insert("old".to_owned(), 1);
         reenter(&mut state, 5000);
         assert!(!state.compacting_sessions.contains_key("old"));
-        assert!(state.compacted.contains_key("t"));
+        assert!(state.compacted.is_empty());
         state.active = true;
         assert!(hook_reply(&input("Stop", "s"), &mut state, 50).is_none());
         assert!(state.sessions.is_empty());
     }
 
     #[test]
-    fn reentry_keeps_only_stopped_sessions_and_fresh_compaction_markers() {
+    fn reentry_keeps_only_stopped_sessions_and_fresh_compaction_markers_and_resets_the_budget() {
         let mut state = LimitState::default();
         let parked = |stopped_at_ms: Option<u64>, continued_by_user: bool| Parked {
             stopped_at_ms,
@@ -2617,8 +2619,8 @@ mod tests {
         assert!(hook_reply(&input("PostToolUse", "running"), &mut active_state, 50).is_some());
         assert!(!active_state.sessions["running"].retell);
         assert_eq!(active_state.sessions["running"].told_at_ms, 50);
-        assert!(state.compacted.contains_key("t") && state.compacting_sessions.contains_key("s"));
-        assert!(state.inspected.contains_key("t"));
+        assert!(state.compacted.is_empty() && state.compacting_sessions.contains_key("s"));
+        assert!(state.inspected.is_empty());
     }
 
     #[test]
