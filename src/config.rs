@@ -124,8 +124,8 @@ impl Config {
             "Fortsetzen-Schwelle muss über 0 und höchstens bei der Limit-Schwelle liegen"
         );
         anyhow::ensure!(
-            limit.compact_from > 0.0 && limit.compact_from <= limit.threshold,
-            "Kompaktieren-Schwelle muss über 0 und höchstens bei der Limit-Schwelle liegen"
+            limit.compact_from > 0.0 && limit.compact_from <= 100.0,
+            "Kompaktieren-Schwelle muss über 0 und höchstens bei 100 liegen"
         );
         anyhow::ensure!(
             limit.t3_url.starts_with("http://"),
@@ -152,8 +152,10 @@ impl Config {
         match (limit.enabled, limit.force) {
             (false, _) => String::new(),
             (true, false) => format!(
-                ", Limit-Pause ab {:.0}% (Kompaktieren ab {} Tokens)",
-                limit.threshold, limit.min_context_tokens
+                ", Limit-Pause ab {:.0}% (Kompaktieren ab {:.0}% und {} Tokens)",
+                limit.threshold,
+                limit.compact_from.min(limit.threshold),
+                limit.min_context_tokens
             ),
             (true, true) => ", Limit-Pause erzwungen".to_owned(),
         }

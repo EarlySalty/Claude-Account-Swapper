@@ -882,7 +882,7 @@ fn nearing_limit(config: &Config, levels: &[Level]) -> bool {
         && !levels.is_empty()
         && levels.iter().all(|(_, candidate)| {
             candidate.as_ref().is_some_and(|candidate| {
-                candidate.usage.five_hour.utilization >= limit.compact_from
+                candidate.usage.five_hour.utilization >= limit.compact_from.min(limit.threshold)
                     || blocked(candidate, config)
             })
         })
@@ -928,9 +928,10 @@ fn still_blocked(
 }
 
 fn reenter(state: &mut LimitState) -> Vec<String> {
-    state.compacted.clear();
-    state.compacting_sessions.clear();
-    state.inspected.clear();
+    if state.released_at.is_some() {
+        state.compacted.clear();
+        state.inspected.clear();
+    }
     let dropped: Vec<String> = state
         .sessions
         .iter()
@@ -1665,7 +1666,7 @@ impl App {
              Cache-Fenster {} min, Ruhezeit {} min, hoechstens {} Threads",
             limit.threshold,
             limit.resume_below,
-            limit.compact_from,
+            limit.compact_from.min(limit.threshold),
             limit.min_context_tokens,
             limit.cache_ttl_minutes,
             limit.idle_minutes,
@@ -1675,10 +1676,7 @@ impl App {
         match (state.active, state.sessions.is_empty()) {
             (true, _) => println!("Zustand: Pause aktiv ({})", state.reason),
             (false, false) => println!("Zustand: Pause aufgehoben, Fortsetzen laeuft"),
-            (false, true) => {
-                println!("Zustand: keine Pause aktiv");
-                return Ok(());
-            }
+            (false, true) => println!("Zustand: keine Pause aktiv"),
         }
         for (session, parked) in &state.sessions {
             println!(
@@ -2228,6 +2226,10 @@ mod tests {
             Some("a")
         ));
         assert!(!nearing_limit(&config, &[at(70.0, later), full.clone()]));
+        let mut above = config.clone();
+        above.limit_compact.compact_from = 99.0;
+        assert!(nearing_limit(&above, &[at(96.0, later), full.clone()]));
+        assert!(above.validate().is_ok());
         let freeing = ("b".to_owned(), usage_at(100.0, 10.0, Some(soon)));
         assert!(!nearing_limit(&config, &[at(86.0, later), freeing]));
         assert!(!nearing_limit(
@@ -2571,8 +2573,23 @@ mod tests {
     }
 
     #[test]
-    fn reentry_keeps_only_stopped_sessions_and_forgets_compactions() {
+    fn entry_after_pre_pause_compaction_keeps_its_markers() {
         let mut state = LimitState::default();
+        state.compacted.insert("t".to_owned(), 1);
+        state.compacting_sessions.insert("s".to_owned(), 1);
+        reenter(&mut state);
+        assert!(state.compacted.contains_key("t"));
+        state.active = true;
+        assert!(hook_reply(&input("Stop", "s"), &mut state, 50).is_none());
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn reentry_keeps_only_stopped_sessions_and_forgets_compactions() {
+        let mut state = LimitState {
+            released_at: Some(1),
+            ..LimitState::default()
+        };
         let parked = |stopped_at_ms: Option<u64>, continued_by_user: bool| Parked {
             stopped_at_ms,
             continued_by_user,
@@ -2599,7 +2616,7 @@ mod tests {
         assert!(hook_reply(&input("PostToolUse", "running"), &mut active_state, 50).is_some());
         assert!(!active_state.sessions["running"].retell);
         assert_eq!(active_state.sessions["running"].told_at_ms, 50);
-        assert!(state.compacted.is_empty() && state.compacting_sessions.is_empty());
+        assert!(state.compacted.is_empty() && state.compacting_sessions.contains_key("s"));
         assert!(state.inspected.is_empty());
     }
 
