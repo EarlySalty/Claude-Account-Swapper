@@ -19,6 +19,7 @@ use wait_timeout::ChildExt;
 
 pub mod config;
 pub mod forecast;
+pub mod idle_compact;
 pub mod jobs;
 pub mod limit;
 pub mod subagent_compact;
@@ -2901,6 +2902,7 @@ impl App {
             log_problem(&format!("Limit-Pause fehlgeschlagen: {error:#}"));
         }
         self.subagent_compact_tick(spoken);
+        self.idle_compact_tick(spoken);
         switched?;
         if config.ping.enabled
             && let Err(error) = self.ping_idle_profiles(config, spoken)

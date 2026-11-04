@@ -1,5 +1,9 @@
 # Changelog
 
+## #13: Ruhende Threads werden nach 30 Minuten kompaktiert
+
+Jeder offene T3-Thread, der eine halbe Stunde nichts getan hat, wird jetzt kompaktiert, solange sein Cache noch warm ist und der Kontext groß genug ist. Erledigte Threads bleiben, wie sie sind. Eingeschaltet wird das mit `claude-account limit-compact --idle-compact-minutes 30`.
+
 ## #12: Wartende Threads werden nach einem Subagent kompaktiert
 
 Startet ein T3-Thread einen Subagent im Hintergrund, wartet er oft lange mit vollem Kontext. Ab jetzt kompaktiert der Hintergrunddienst so einen Thread, sobald er ruht und der Cache noch warm ist, wenn der Kontext groß genug ist. Eingeschaltet wird das mit `claude-account limit-compact --after-subagent on`; Fehler stehen einmal im Protokoll statt jede Minute.

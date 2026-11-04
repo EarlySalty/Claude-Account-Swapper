@@ -141,6 +141,8 @@ enum AccountCommand {
         scope_sessions: Option<Vec<String>>,
         #[arg(long)]
         after_subagent: Option<Switch>,
+        #[arg(long)]
+        idle_compact_minutes: Option<u64>,
     },
     /// Lokales Webmenü für den privaten Tailscale-Proxy starten
     Web {
@@ -311,6 +313,7 @@ fn run() -> Result<()> {
             min_context_tokens,
             scope_sessions,
             after_subagent,
+            idle_compact_minutes,
         }) => {
             let unchanged = enabled.is_none()
                 && force.is_none()
@@ -319,7 +322,8 @@ fn run() -> Result<()> {
                 && compact_lead_minutes.is_none()
                 && min_context_tokens.is_none()
                 && scope_sessions.is_none()
-                && after_subagent.is_none();
+                && after_subagent.is_none()
+                && idle_compact_minutes.is_none();
             if !unchanged {
                 app.update_config(|config| {
                     let limit = &mut config.limit_compact;
@@ -343,6 +347,9 @@ fn run() -> Result<()> {
                     }
                     if let Some(value) = after_subagent {
                         limit.after_subagent = value.is_on();
+                    }
+                    if let Some(value) = idle_compact_minutes {
+                        limit.idle_compact_minutes = value;
                     }
                     if let Some(value) = scope_sessions {
                         limit.scope_sessions =

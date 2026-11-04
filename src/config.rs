@@ -50,6 +50,7 @@ pub struct LimitCompact {
     pub idle_minutes: u64,
     pub max_compactions: usize,
     pub after_subagent: bool,
+    pub idle_compact_minutes: u64,
     pub scope_sessions: Vec<String>,
     pub t3_url: String,
 }
@@ -68,6 +69,7 @@ impl Default for LimitCompact {
             idle_minutes: 2,
             max_compactions: 8,
             after_subagent: false,
+            idle_compact_minutes: 0,
             scope_sessions: Vec::new(),
             t3_url: "http://127.0.0.1:3773".to_owned(),
         }
@@ -120,6 +122,10 @@ impl Config {
         );
         let limit = &self.limit_compact;
         anyhow::ensure!(
+            limit.idle_compact_minutes < limit.cache_ttl_minutes,
+            "Ruhezeit fürs Kompaktieren muss unter dem Cache-Fenster liegen"
+        );
+        anyhow::ensure!(
             (0.0..=100.0).contains(&limit.threshold),
             "Limit-Schwelle muss zwischen 0 und 100 liegen"
         );
@@ -142,7 +148,7 @@ impl Config {
     /// sonst stuende dieselbe Zeile jede Minute im Journal.
     pub fn describe(&self) -> String {
         format!(
-            "Auto-Wechsel {} (Schwelle {:.0}%, Wochen-Pacing {}), Fenster-Ping {}{}{}",
+            "Auto-Wechsel {} (Schwelle {:.0}%, Wochen-Pacing {}), Fenster-Ping {}{}{}{}",
             if self.auto_switch { "an" } else { "aus" },
             self.threshold,
             if self.weekly_pacing { "an" } else { "aus" },
@@ -152,6 +158,10 @@ impl Config {
                 ", Kompaktieren nach Subagent an"
             } else {
                 ""
+            },
+            match self.limit_compact.idle_compact_minutes {
+                0 => String::new(),
+                minutes => format!(", Kompaktieren nach {minutes} min Ruhe an"),
             }
         )
     }

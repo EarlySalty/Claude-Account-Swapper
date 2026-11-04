@@ -1786,6 +1786,14 @@ impl App {
             limit.min_context_tokens,
             limit.idle_minutes
         );
+        match limit.idle_compact_minutes {
+            0 => println!("Kompaktieren nach Ruhe: aus"),
+            minutes => println!(
+                "Kompaktieren nach Ruhe: an (jeder offene T3-Thread nach {minutes} min Ruhe, \
+                 bis {} min, ab {} Tokens)",
+                limit.cache_ttl_minutes, limit.min_context_tokens
+            ),
+        }
         if let Ok(levels) = self.cached_levels() {
             let burn = self.pool_burn(&levels, unix_timestamp()?);
             println!("Prognose: {}", describe_forecast(&config, &levels, burn));
