@@ -222,7 +222,7 @@ Sind alle Accounts voll, haelt die Limit-Pause laufende Threads an. Kurz davor k
 
 #### Nach einem Subagent kompaktieren
 
-Mit `claude-account limit-compact --after-subagent on` merkt sich der Hook, wenn eine T3-Sitzung mit Claude-Modell einen Subagent startet (`Agent`, `Task`, `delegate_task` auch mit MCP-Praefix). Sobald dieser Thread danach ruht (Ruhezeit wie oben) und noch im Cache-Fenster liegt, schickt der Hintergrunddienst ein `/compact`, falls der Kontext mindestens `--min-context-tokens` hat. Standard ist aus; `--scope-session` grenzt es wie die Limit-Pause ein, und waehrend einer Limit-Pause ruht es.
+Mit `claude-account limit-compact --after-subagent on` merkt sich der Hook, wenn eine T3-Sitzung mit Claude-Modell einen Subagent im Hintergrund startet (`Agent` oder `Task` ohne `run_in_background: false`, `spawn_subagent`, `delegate_task` auch mit MCP-Praefix, nicht im Modus `sync`). Sobald dieser Thread danach ruht (Ruhezeit wie oben) und noch im Cache-Fenster liegt, schickt der Hintergrunddienst ein `/compact`, falls der Kontext mindestens `--min-context-tokens` hat. Standard ist aus; `--scope-session` grenzt es wie die Limit-Pause ein, und waehrend einer Limit-Pause werden offene Vormerkungen verworfen.
 
 ### Das Fenster von selbst eroeffnen
 

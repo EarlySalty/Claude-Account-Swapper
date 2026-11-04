@@ -43,6 +43,7 @@ struct SpawnInput {
     tool_name: String,
     agent_id: Option<String>,
     model: Option<String>,
+    tool_input: serde_json::Value,
 }
 
 #[derive(Debug, PartialEq)]
@@ -57,11 +58,20 @@ fn is_spawn_tool(name: &str) -> bool {
     SPAWN_TOOLS.contains(&name.as_str()) || name.ends_with("__delegate_task")
 }
 
+fn leaves_parent_waiting(tool_input: &serde_json::Value) -> bool {
+    let background = tool_input
+        .get("run_in_background")
+        .and_then(serde_json::Value::as_bool);
+    let mode = tool_input.get("mode").and_then(serde_json::Value::as_str);
+    background != Some(false) && mode != Some("sync")
+}
+
 fn is_parent_spawn(input: &SpawnInput) -> bool {
     input.hook_event_name == "PostToolUse"
         && input.agent_id.is_none()
         && !input.session_id.is_empty()
         && is_spawn_tool(&input.tool_name)
+        && leaves_parent_waiting(&input.tool_input)
 }
 
 fn in_scope(session: &str, limit: &LimitCompact) -> bool {
@@ -276,7 +286,9 @@ impl App {
                 self.note_compacting(&detail.native_session_ids)?;
                 let message_id = uuid::Uuid::new_v4().to_string();
                 if let Err(error) = rpc.send_message(&thread_id, COMPACT_COMMAND, &message_id) {
-                    self.clear_compacting(&detail.native_session_ids)?;
+                    if t3::is_rejection(&error) {
+                        let _ = self.clear_compacting(&detail.native_session_ids);
+                    }
                     return Err(error);
                 }
                 self.forget_mark(session, mark)?;
@@ -362,6 +374,7 @@ mod tests {
             tool_name: tool.to_owned(),
             agent_id: agent.map(str::to_owned),
             model: None,
+            tool_input: serde_json::Value::Null,
         }
     }
 
@@ -384,6 +397,16 @@ mod tests {
         assert!(!is_parent_spawn(&spawn("PostToolUse", "Bash", None)));
         assert!(!is_parent_spawn(&spawn("PostToolUse", "Agent", Some("a"))));
         assert!(!is_parent_spawn(&spawn("Stop", "Agent", None)));
+        let mut sync = spawn("PostToolUse", "Agent", None);
+        sync.tool_input = serde_json::json!({ "run_in_background": false });
+        assert!(!is_parent_spawn(&sync));
+        sync.tool_input = serde_json::json!({ "run_in_background": true });
+        assert!(is_parent_spawn(&sync));
+        let mut delegate = spawn("PostToolUse", "mcp__t3-code__delegate_task", None);
+        delegate.tool_input = serde_json::json!({ "mode": "sync" });
+        assert!(!is_parent_spawn(&delegate));
+        delegate.tool_input = serde_json::json!({ "mode": "async" });
+        assert!(is_parent_spawn(&delegate));
         let mut empty = spawn("PostToolUse", "Agent", None);
         empty.session_id.clear();
         assert!(!is_parent_spawn(&empty));
