@@ -134,6 +134,8 @@ enum AccountCommand {
         #[arg(long)]
         compact_from: Option<f64>,
         #[arg(long)]
+        compact_lead_minutes: Option<u64>,
+        #[arg(long)]
         min_context_tokens: Option<u64>,
         #[arg(long = "scope-session")]
         scope_sessions: Option<Vec<String>>,
@@ -303,6 +305,7 @@ fn run() -> Result<()> {
             force,
             threshold,
             compact_from,
+            compact_lead_minutes,
             min_context_tokens,
             scope_sessions,
         }) => {
@@ -310,6 +313,7 @@ fn run() -> Result<()> {
                 && force.is_none()
                 && threshold.is_none()
                 && compact_from.is_none()
+                && compact_lead_minutes.is_none()
                 && min_context_tokens.is_none()
                 && scope_sessions.is_none();
             if !unchanged {
@@ -326,6 +330,9 @@ fn run() -> Result<()> {
                     }
                     if let Some(value) = compact_from {
                         limit.compact_from = value;
+                    }
+                    if let Some(value) = compact_lead_minutes {
+                        limit.compact_lead_minutes = value;
                     }
                     if let Some(value) = min_context_tokens {
                         limit.min_context_tokens = value;

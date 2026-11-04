@@ -44,6 +44,7 @@ pub struct LimitCompact {
     pub threshold: f64,
     pub resume_below: f64,
     pub compact_from: f64,
+    pub compact_lead_minutes: u64,
     pub min_context_tokens: u64,
     pub cache_ttl_minutes: u64,
     pub idle_minutes: u64,
@@ -60,6 +61,7 @@ impl Default for LimitCompact {
             threshold: 95.0,
             resume_below: 80.0,
             compact_from: 85.0,
+            compact_lead_minutes: 30,
             min_context_tokens: 60_000,
             cache_ttl_minutes: 55,
             idle_minutes: 2,
@@ -152,9 +154,11 @@ impl Config {
         match (limit.enabled, limit.force) {
             (false, _) => String::new(),
             (true, false) => format!(
-                ", Limit-Pause ab {:.0}% (Kompaktieren ab {:.0}% und {} Tokens)",
+                ", Limit-Pause ab {:.0}% (Kompaktieren ab {:.0}% oder {} min vor der Pause, \
+                 ab {} Tokens)",
                 limit.threshold,
                 limit.compact_from.min(limit.threshold),
+                limit.compact_lead_minutes,
                 limit.min_context_tokens
             ),
             (true, true) => ", Limit-Pause erzwungen".to_owned(),

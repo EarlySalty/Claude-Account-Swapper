@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{Config, LimitCompact};
+use crate::forecast;
 use crate::jobs::{ContinuationGuard, JobKind};
 use crate::t3::{self, ThreadSummary};
 use crate::usage::Candidate;
@@ -877,17 +878,65 @@ fn may_spend(config: &Config, levels: &[Level], active_profile: Option<&str>) ->
         })
 }
 
-fn nearing_limit(config: &Config, levels: &[Level]) -> bool {
+fn nearing_by_percent(config: &Config, levels: &[Level]) -> bool {
+    let limit = &config.limit_compact;
+    levels.iter().all(|(_, candidate)| {
+        candidate.as_ref().is_some_and(|candidate| {
+            candidate.usage.five_hour.utilization >= limit.compact_from.min(limit.threshold)
+                || blocked(candidate, config)
+        })
+    }) && !any_account_frees_within_an_hour(config, levels, Utc::now())
+}
+
+fn headroom(candidate: &Candidate, config: &Config) -> forecast::Headroom {
+    let limit = config.limit_compact.threshold;
+    let weekly_open = candidate.usage.seven_day.utilization < config.threshold
+        && !(candidate.stops.hard && !candidate.within_stops(config.threshold));
+    let left = match blocked(candidate, config) {
+        true => 0.0,
+        false => (limit - candidate.usage.five_hour.utilization).max(0.0),
+    };
+    forecast::Headroom {
+        left,
+        refill: if weekly_open { limit - left } else { 0.0 },
+        resets_at: candidate.usage.five_hour.resets_at,
+    }
+}
+
+fn minutes_to_pause(
+    config: &Config,
+    levels: &[Level],
+    burn: Option<f64>,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    let accounts = levels
+        .iter()
+        .map(|(_, candidate)| {
+            candidate
+                .as_ref()
+                .map(|candidate| headroom(candidate, config))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    forecast::minutes_until_exhausted(&accounts, burn?, now)
+}
+
+fn nearing_limit(config: &Config, levels: &[Level], burn: Option<f64>) -> bool {
     let limit = &config.limit_compact;
     limit.enabled
         && !levels.is_empty()
-        && levels.iter().all(|(_, candidate)| {
-            candidate.as_ref().is_some_and(|candidate| {
-                candidate.usage.five_hour.utilization >= limit.compact_from.min(limit.threshold)
-                    || blocked(candidate, config)
-            })
-        })
-        && !any_account_frees_within_an_hour(config, levels, Utc::now())
+        && (nearing_by_percent(config, levels)
+            || minutes_to_pause(config, levels, burn, Utc::now())
+                .is_some_and(|minutes| minutes <= limit.compact_lead_minutes as f64))
+}
+
+fn describe_forecast(config: &Config, levels: &[Level], burn: Option<f64>) -> String {
+    match (burn, minutes_to_pause(config, levels, burn, Utc::now())) {
+        (Some(burn), Some(minutes)) => format!(
+            "Verbrauch {burn:.2}%/min, Limit-Pause in etwa {:.0} min",
+            minutes
+        ),
+        _ => "kein messbarer Verbrauch in den letzten 45 min".to_owned(),
+    }
 }
 
 fn limit_reason(levels: &[Level]) -> String {
@@ -1070,6 +1119,14 @@ impl App {
         )
     }
 
+    fn pool_burn(&self, levels: &[Level], now: u64) -> Option<f64> {
+        let histories: Vec<Vec<forecast::Sample>> = levels
+            .iter()
+            .map(|(name, _)| self.usage_history(name))
+            .collect();
+        forecast::burn_per_minute(histories.iter().map(Vec::as_slice), now)
+    }
+
     fn cached_levels(&self) -> Result<Vec<Level>> {
         let now = unix_timestamp()?;
         Ok(self
@@ -1167,7 +1224,20 @@ impl App {
             }
             return Ok(());
         }
-        let nearing = nearing_limit(config, &levels);
+        let burn = self.pool_burn(&levels, now);
+        let nearing = nearing_limit(config, &levels, burn);
+        if nearing {
+            log_once(
+                spoken,
+                "limit-forecast",
+                &format!(
+                    "Limit-Pause naht ({}); Kompaktieren beginnt",
+                    describe_forecast(config, &levels, burn)
+                ),
+            );
+        } else {
+            spoken.remove("limit-forecast");
+        }
         if nearing && may_spend(config, &levels, active_profile.as_deref()) {
             let result = self.compact_pass(limit, &state);
             report(
@@ -1666,16 +1736,21 @@ impl App {
             if limit.force { " (erzwungen)" } else { "" }
         );
         println!(
-            "Schwelle {:.0}%, fortsetzen unter {:.0}%, kompaktieren ab {:.0}% und {} Tokens, \
-             Cache-Fenster {} min, Ruhezeit {} min, hoechstens {} Threads",
+            "Schwelle {:.0}%, fortsetzen unter {:.0}%, kompaktieren ab {:.0}% oder {} min vor \
+             der Pause und ab {} Tokens, Cache-Fenster {} min, Ruhezeit {} min, hoechstens {} Threads",
             limit.threshold,
             limit.resume_below,
             limit.compact_from.min(limit.threshold),
+            limit.compact_lead_minutes,
             limit.min_context_tokens,
             limit.cache_ttl_minutes,
             limit.idle_minutes,
             limit.max_compactions
         );
+        if let Ok(levels) = self.cached_levels() {
+            let burn = self.pool_burn(&levels, unix_timestamp()?);
+            println!("Prognose: {}", describe_forecast(&config, &levels, burn));
+        }
         let state = self.load_limit_state()?;
         match (state.active, state.sessions.is_empty()) {
             (true, _) => println!("Zustand: Pause aktiv ({})", state.reason),
@@ -2223,26 +2298,50 @@ mod tests {
         let at = |five, reset| ("a".to_owned(), usage_at(five, 10.0, Some(reset)));
         let full = ("b".to_owned(), usage_at(100.0, 10.0, Some(later)));
         let config = config(true);
-        assert!(nearing_limit(&config, &[at(86.0, later), full.clone()]));
+        assert!(nearing_limit(
+            &config,
+            &[at(86.0, later), full.clone()],
+            None
+        ));
         assert!(may_spend(
             &config,
             &[at(86.0, later), full.clone()],
             Some("a")
         ));
-        assert!(!nearing_limit(&config, &[at(70.0, later), full.clone()]));
+        assert!(!nearing_limit(
+            &config,
+            &[at(70.0, later), full.clone()],
+            None
+        ));
         let mut above = config.clone();
         above.limit_compact.compact_from = 99.0;
-        assert!(nearing_limit(&above, &[at(96.0, later), full.clone()]));
+        assert!(nearing_limit(
+            &above,
+            &[at(96.0, later), full.clone()],
+            None
+        ));
         assert!(above.validate().is_ok());
         let freeing = ("b".to_owned(), usage_at(100.0, 10.0, Some(soon)));
-        assert!(!nearing_limit(&config, &[at(86.0, later), freeing]));
+        assert!(!nearing_limit(&config, &[at(86.0, later), freeing], None));
         assert!(!nearing_limit(
             &config,
             &[
                 at(86.0, later),
                 ("b".to_owned(), usage_at(40.0, 10.0, Some(later)))
-            ]
+            ],
+            None
         ));
+        let calm = [at(70.0, later), full.clone()];
+        assert!(nearing_limit(&config, &calm, Some(1.0)));
+        assert!(!nearing_limit(&config, &calm, Some(0.5)));
+        let mut no_lead = config.clone();
+        no_lead.limit_compact.compact_lead_minutes = 0;
+        assert!(!nearing_limit(&no_lead, &calm, Some(1.0)));
+        let refilled = [
+            at(70.0, later),
+            ("b".to_owned(), usage_at(100.0, 10.0, Some(soon))),
+        ];
+        assert!(!nearing_limit(&config, &refilled, Some(0.5)));
     }
 
     #[test]

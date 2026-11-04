@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use wait_timeout::ChildExt;
 
 pub mod config;
+pub mod forecast;
 pub mod jobs;
 pub mod limit;
 pub mod t3;
@@ -40,10 +41,8 @@ const KEEPALIVE_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
 /// Abstand zwischen zwei Limitpruefungen im Dauerbetrieb. Die Abfrage kostet kein Kontingent,
 /// eine Minute reicht aber: zwischen 98% und dem harten Limit liegt mehr als ein Request.
 const USAGE_CHECK_INTERVAL_SECONDS: u64 = 60;
-/// Bis zu diesem Alter gilt eine gemerkte Auslastung als aktuell und wird ohne neue Anfrage
-/// benutzt. Knapp unter dem Pruefintervall, damit der Dienst nicht seinen eigenen Wert
-/// wiederverwendet, ein zusaetzlicher Aufruf von Hand aber ohne Anfrage auskommt.
-const USAGE_CACHE_FRESH_SECONDS: u64 = 45;
+const USAGE_REFRESH_ACTIVE_SECONDS: u64 = 120;
+const USAGE_REFRESH_IDLE_SECONDS: u64 = 300;
 /// Darueber hinaus ist ein gemerkter Stand nur noch Notnagel, wenn die Anfrage scheitert; fuer
 /// ein gedrosseltes Ziel ohne frische Alternative gilt diese Grenze nicht.
 /// Ein Fuenf-Stunden-Fenster bewegt sich in 30 Minuten nicht so weit, dass die Entscheidung
@@ -1878,7 +1877,7 @@ impl App {
             usage.seven_day.utilization,
             describe_stops(&profile.limits),
             match age {
-                0..=USAGE_CACHE_FRESH_SECONDS => String::new(),
+                0..USAGE_REFRESH_ACTIVE_SECONDS => String::new(),
                 age => format!(" (Stand von vor {} min)", age / 60),
             }
         ));
@@ -1910,7 +1909,9 @@ impl App {
         let now = unix_timestamp()?;
         let cached = self.read_cached_usage(&profile.name);
         let age = |cached: &CachedUsage| now.saturating_sub(cached.fetched_at);
-        if let Some(cached) = cached.filter(|cached| age(cached) <= USAGE_CACHE_FRESH_SECONDS) {
+        if let Some(cached) = cached.filter(|cached| {
+            !window_reset_passed(&cached.usage, now) && self.still_fresh(profile, age(cached))
+        }) {
             return Ok((cached.usage, age(&cached)));
         }
 
@@ -1959,8 +1960,47 @@ impl App {
         })
     }
 
+    fn still_fresh(&self, profile: &Profile, age: u64) -> bool {
+        age < USAGE_REFRESH_ACTIVE_SECONDS
+            || (age < USAGE_REFRESH_IDLE_SECONDS
+                && self.active_profile_name_memoized(None).as_deref()
+                    != Some(profile.name.as_str()))
+    }
+
+    fn usage_history_path(&self, name: &str) -> PathBuf {
+        self.profile_dir(name).join("usage-history.json")
+    }
+
+    pub(crate) fn usage_history(&self, name: &str) -> Vec<forecast::Sample> {
+        fs::read(self.usage_history_path(name))
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_default()
+    }
+
+    fn remember_usage_sample(&self, name: &str, usage: &Usage, fetched_at: u64) -> Result<()> {
+        let mut history = self.usage_history(name);
+        forecast::record(
+            &mut history,
+            forecast::Sample {
+                at: fetched_at,
+                five_hour: usage.five_hour.utilization,
+            },
+        );
+        atomic_write(
+            &self.usage_history_path(name),
+            &serde_json::to_vec(&history)?,
+            0o600,
+        )
+    }
+
     /// Der Cache haelt nur Prozentwerte und Zeitpunkte, keine Zugangsdaten.
     fn write_cached_usage(&self, name: &str, usage: Usage, fetched_at: u64) {
+        if let Err(error) = self.remember_usage_sample(name, &usage, fetched_at) {
+            log_problem(&format!(
+                "Verlauf der Auslastung von {name} konnte nicht gemerkt werden: {error:#}"
+            ));
+        }
         let cached = CachedUsage { usage, fetched_at };
         let written = serde_json::to_vec(&cached)
             .map_err(anyhow::Error::from)
@@ -4172,6 +4212,13 @@ fn redact_secrets(line: &str) -> String {
             }
         })
         .collect()
+}
+
+fn window_reset_passed(usage: &Usage, now: u64) -> bool {
+    usage
+        .five_hour
+        .resets_at
+        .is_some_and(|resets_at| resets_at.timestamp() <= now as i64)
 }
 
 fn unix_timestamp() -> Result<u64> {
