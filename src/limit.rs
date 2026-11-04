@@ -876,6 +876,19 @@ fn may_spend(config: &Config, levels: &[Level], active_profile: Option<&str>) ->
         })
 }
 
+fn nearing_limit(config: &Config, levels: &[Level]) -> bool {
+    let limit = &config.limit_compact;
+    limit.enabled
+        && !levels.is_empty()
+        && levels.iter().all(|(_, candidate)| {
+            candidate.as_ref().is_some_and(|candidate| {
+                candidate.usage.five_hour.utilization >= limit.compact_from
+                    || blocked(candidate, config)
+            })
+        })
+        && !any_account_frees_within_an_hour(config, levels, Utc::now())
+}
+
 fn limit_reason(levels: &[Level]) -> String {
     let figures = levels
         .iter()
@@ -1151,8 +1164,18 @@ impl App {
             }
             return Ok(());
         }
+        let nearing = nearing_limit(config, &levels);
+        if nearing && may_spend(config, &levels, active_profile.as_deref()) {
+            let result = self.compact_pass(limit, &state);
+            report(
+                spoken,
+                "limit-compact",
+                "Kompaktieren fehlgeschlagen",
+                result,
+            );
+        }
         if state.sessions.is_empty() {
-            if state != LimitState::default() {
+            if !nearing && state != LimitState::default() {
                 self.update_limit_state(|state| *state = LimitState::default())?;
             }
             return Ok(());
@@ -1638,10 +1661,11 @@ impl App {
             if limit.force { " (erzwungen)" } else { "" }
         );
         println!(
-            "Schwelle {:.0}%, fortsetzen unter {:.0}%, kompaktieren ab {} Tokens, \
+            "Schwelle {:.0}%, fortsetzen unter {:.0}%, kompaktieren ab {:.0}% und {} Tokens, \
              Cache-Fenster {} min, Ruhezeit {} min, hoechstens {} Threads",
             limit.threshold,
             limit.resume_below,
+            limit.compact_from,
             limit.min_context_tokens,
             limit.cache_ttl_minutes,
             limit.idle_minutes,
@@ -2188,6 +2212,31 @@ mod tests {
         let undated = usage_at(10.0, 100.0, Some(soon)).unwrap();
         let undated_levels = vec![("a".to_owned(), Some(undated))];
         assert!(verdict(&config(true), &undated_levels, Some("a")).at_limit);
+    }
+
+    #[test]
+    fn compaction_starts_before_the_last_account_hits_the_pause() {
+        let later = Utc::now() + chrono::Duration::minutes(90);
+        let soon = Utc::now() + chrono::Duration::minutes(30);
+        let at = |five, reset| ("a".to_owned(), usage_at(five, 10.0, Some(reset)));
+        let full = ("b".to_owned(), usage_at(100.0, 10.0, Some(later)));
+        let config = config(true);
+        assert!(nearing_limit(&config, &[at(86.0, later), full.clone()]));
+        assert!(may_spend(
+            &config,
+            &[at(86.0, later), full.clone()],
+            Some("a")
+        ));
+        assert!(!nearing_limit(&config, &[at(70.0, later), full.clone()]));
+        let freeing = ("b".to_owned(), usage_at(100.0, 10.0, Some(soon)));
+        assert!(!nearing_limit(&config, &[at(86.0, later), freeing]));
+        assert!(!nearing_limit(
+            &config,
+            &[
+                at(86.0, later),
+                ("b".to_owned(), usage_at(40.0, 10.0, Some(later)))
+            ]
+        ));
     }
 
     #[test]

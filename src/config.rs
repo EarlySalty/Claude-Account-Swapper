@@ -43,6 +43,7 @@ pub struct LimitCompact {
     pub force: bool,
     pub threshold: f64,
     pub resume_below: f64,
+    pub compact_from: f64,
     pub min_context_tokens: u64,
     pub cache_ttl_minutes: u64,
     pub idle_minutes: u64,
@@ -58,6 +59,7 @@ impl Default for LimitCompact {
             force: false,
             threshold: 95.0,
             resume_below: 80.0,
+            compact_from: 85.0,
             min_context_tokens: 60_000,
             cache_ttl_minutes: 55,
             idle_minutes: 2,
@@ -120,6 +122,10 @@ impl Config {
         anyhow::ensure!(
             limit.resume_below > 0.0 && limit.resume_below <= limit.threshold,
             "Fortsetzen-Schwelle muss über 0 und höchstens bei der Limit-Schwelle liegen"
+        );
+        anyhow::ensure!(
+            limit.compact_from > 0.0 && limit.compact_from <= limit.threshold,
+            "Kompaktieren-Schwelle muss über 0 und höchstens bei der Limit-Schwelle liegen"
         );
         anyhow::ensure!(
             limit.t3_url.starts_with("http://"),
