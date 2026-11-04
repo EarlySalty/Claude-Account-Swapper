@@ -38,10 +38,16 @@ pub const DEFAULT_WATCH_INTERVAL_SECONDS: u64 = 5;
 pub const DEFAULT_KEEPALIVE_MAX_AGE_DAYS: u64 = 7;
 /// Abstand zwischen zwei Auffrischungen im Dauerbetrieb.
 const KEEPALIVE_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
-/// Abstand zwischen zwei Limitpruefungen im Dauerbetrieb. Die Abfrage kostet kein Kontingent,
-/// eine Minute reicht aber: zwischen 98% und dem harten Limit liegt mehr als ein Request.
+/// Abstand zwischen zwei Limitpruefungen im Dauerbetrieb. Jeder Takt bewertet neu, holt aber
+/// nur die Zahlen, deren gemerkter Stand abgelaufen ist.
 const USAGE_CHECK_INTERVAL_SECONDS: u64 = 60;
+/// Die Auslastungs-API nimmt je Token nur etwa eine Anfrage alle zwei Minuten an; eine Abfrage
+/// im Minutentakt bekam bei jedem zweiten Mal `429`. Der aktive Account wird deshalb alle zwei
+/// Minuten geholt. Zwischen 98% und dem harten Limit liegen bei vollem Verbrauch mehrere
+/// Minuten, und die Verbrauchsprognose der Limit-Pause greift lange vorher.
 const USAGE_REFRESH_ACTIVE_SECONDS: u64 = 120;
+/// Ruhende Accounts verbrauchen nichts; ihre Zahl aendert sich erst mit dem Reset, und ein
+/// Stand mit vergangenem Reset wird ohnehin sofort neu geholt.
 const USAGE_REFRESH_IDLE_SECONDS: u64 = 300;
 /// Darueber hinaus ist ein gemerkter Stand nur noch Notnagel, wenn die Anfrage scheitert; fuer
 /// ein gedrosseltes Ziel ohne frische Alternative gilt diese Grenze nicht.

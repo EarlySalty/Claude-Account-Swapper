@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const HISTORY_SECONDS: u64 = 45 * 60;
+pub const BURN_WINDOW_SECONDS: u64 = 20 * 60;
 const MIN_SPAN_SECONDS: u64 = 10 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -17,14 +17,14 @@ pub fn record(history: &mut Vec<Sample>, sample: Sample) {
     {
         history.clear();
     }
-    history.retain(|kept| kept.at < sample.at && sample.at - kept.at <= HISTORY_SECONDS);
+    history.retain(|kept| kept.at < sample.at && sample.at - kept.at <= BURN_WINDOW_SECONDS);
     history.push(sample);
 }
 
 fn recent(history: &[Sample], now: u64) -> impl Iterator<Item = &Sample> {
     history
         .iter()
-        .filter(move |sample| now.saturating_sub(sample.at) <= HISTORY_SECONDS)
+        .filter(move |sample| now.saturating_sub(sample.at) <= BURN_WINDOW_SECONDS)
 }
 
 fn growth(history: &[Sample], now: u64) -> Option<(f64, u64)> {
@@ -98,16 +98,16 @@ mod tests {
         record(&mut history, sample(600, 50.0));
         record(&mut history, sample(1200, 3.0));
         assert_eq!(history, vec![sample(1200, 3.0)]);
-        record(&mut history, sample(1200 + HISTORY_SECONDS + 1, 10.0));
-        assert_eq!(history, vec![sample(1200 + HISTORY_SECONDS + 1, 10.0)]);
+        record(&mut history, sample(1200 + BURN_WINDOW_SECONDS + 1, 10.0));
+        assert_eq!(history, vec![sample(1200 + BURN_WINDOW_SECONDS + 1, 10.0)]);
     }
 
     #[test]
     fn burn_adds_growth_of_every_account_over_the_longest_span() {
         let active = vec![sample(1300, 60.0), sample(1800, 70.0)];
-        let idle = vec![sample(0, 90.0), sample(1800, 90.0)];
+        let idle = vec![sample(600, 90.0), sample(1800, 90.0)];
         let burn = burn_per_minute([active.as_slice(), idle.as_slice()], 1800).expect("burn");
-        assert!((burn - 10.0 / 30.0).abs() < 1e-9);
+        assert!((burn - 10.0 / 20.0).abs() < 1e-9);
         assert_eq!(burn_per_minute([active.as_slice()], 1800), None);
         assert_eq!(burn_per_minute([idle.as_slice()], 1800), None);
     }

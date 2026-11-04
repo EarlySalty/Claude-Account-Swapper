@@ -930,12 +930,17 @@ fn nearing_limit(config: &Config, levels: &[Level], burn: Option<f64>) -> bool {
 }
 
 fn describe_forecast(config: &Config, levels: &[Level], burn: Option<f64>) -> String {
+    let window = forecast::BURN_WINDOW_SECONDS / 60;
     match (burn, minutes_to_pause(config, levels, burn, Utc::now())) {
         (Some(burn), Some(minutes)) => format!(
             "Verbrauch {burn:.2}%/min, Limit-Pause in etwa {:.0} min",
             minutes
         ),
-        _ => "kein messbarer Verbrauch in den letzten 45 min".to_owned(),
+        (Some(burn), None) => format!(
+            "Verbrauch {burn:.2}%/min, Zeitpunkt offen: nicht fuer jeden Account liegt eine \
+             Auslastung vor"
+        ),
+        (None, _) => format!("kein messbarer Verbrauch in den letzten {window} min"),
     }
 }
 
@@ -1227,14 +1232,13 @@ impl App {
         let burn = self.pool_burn(&levels, now);
         let nearing = nearing_limit(config, &levels, burn);
         if nearing {
-            log_once(
-                spoken,
-                "limit-forecast",
-                &format!(
+            if !spoken.contains_key("limit-forecast") {
+                log_event(&format!(
                     "Limit-Pause naht ({}); Kompaktieren beginnt",
                     describe_forecast(config, &levels, burn)
-                ),
-            );
+                ));
+                spoken.insert("limit-forecast".to_owned(), String::new());
+            }
         } else {
             spoken.remove("limit-forecast");
         }
