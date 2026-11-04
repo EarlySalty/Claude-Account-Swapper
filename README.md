@@ -220,6 +220,10 @@ Sind alle Accounts voll, haelt die Limit-Pause laufende Threads an. Kurz davor k
 
 `claude-account limit-compact` zeigt Einstellungen, Prognose und Zustand.
 
+#### Nach einem Subagent kompaktieren
+
+Mit `claude-account limit-compact --after-subagent on` merkt sich der Hook, wenn eine T3-Sitzung mit Claude-Modell einen Subagent startet (`Agent`, `Task`, `delegate_task`). Sobald dieser Thread danach ruht (Ruhezeit wie oben) und noch im Cache-Fenster liegt, schickt der Hintergrunddienst ein `/compact`, falls der Kontext mindestens `--min-context-tokens` hat. Standard ist aus; `--scope-session` grenzt es wie die Limit-Pause ein, und waehrend einer Limit-Pause ruht es.
+
 ### Das Fenster von selbst eroeffnen
 
 Das Fuenf-Stunden-Fenster beginnt nicht mit dem Reset, sondern mit der ersten Anfrage danach. Wer erst Stunden spaeter wieder etwas tippt, verschiebt seine ganzen fuenf Stunden nach hinten. Der Fenster-Ping nimmt das ab:

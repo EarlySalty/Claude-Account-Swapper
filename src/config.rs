@@ -67,7 +67,7 @@ impl Default for LimitCompact {
             cache_ttl_minutes: 55,
             idle_minutes: 2,
             max_compactions: 8,
-            after_subagent: true,
+            after_subagent: false,
             scope_sessions: Vec::new(),
             t3_url: "http://127.0.0.1:3773".to_owned(),
         }
@@ -142,12 +142,17 @@ impl Config {
     /// sonst stuende dieselbe Zeile jede Minute im Journal.
     pub fn describe(&self) -> String {
         format!(
-            "Auto-Wechsel {} (Schwelle {:.0}%, Wochen-Pacing {}), Fenster-Ping {}{}",
+            "Auto-Wechsel {} (Schwelle {:.0}%, Wochen-Pacing {}), Fenster-Ping {}{}{}",
             if self.auto_switch { "an" } else { "aus" },
             self.threshold,
             if self.weekly_pacing { "an" } else { "aus" },
             if self.ping.enabled { "an" } else { "aus" },
-            self.describe_limit_compact()
+            self.describe_limit_compact(),
+            if self.limit_compact.after_subagent {
+                ", Kompaktieren nach Subagent an"
+            } else {
+                ""
+            }
         )
     }
 

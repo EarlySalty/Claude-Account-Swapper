@@ -2900,9 +2900,7 @@ impl App {
         if let Err(error) = self.limit_tick(config, spoken) {
             log_problem(&format!("Limit-Pause fehlgeschlagen: {error:#}"));
         }
-        if let Err(error) = self.subagent_compact_tick(&config.limit_compact) {
-            log_problem(&format!("Subagent-Kompaktieren fehlgeschlagen: {error:#}"));
-        }
+        self.subagent_compact_tick(spoken);
         switched?;
         if config.ping.enabled
             && let Err(error) = self.ping_idle_profiles(config, spoken)

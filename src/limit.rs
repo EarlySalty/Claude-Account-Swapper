@@ -495,6 +495,14 @@ fn session_uses_claude_model(input: &HookInput, catalog: &ClaudeModels) -> bool 
     ancestry_uses_claude_model(catalog)
 }
 
+pub(crate) fn claude_session(model: Option<&str>) -> bool {
+    let catalog = load_claude_models();
+    match model.filter(|model| !model.trim().is_empty()) {
+        Some(model) => is_claude_model(model, &catalog),
+        None => ancestry_uses_claude_model(&catalog),
+    }
+}
+
 fn hook_should_forget(input: &HookInput, catalog: &ClaudeModels) -> bool {
     input.agent_id.is_none()
         && !input.session_id.is_empty()
@@ -1033,13 +1041,22 @@ impl App {
         }
     }
 
+    pub(crate) fn note_compacting(&self, sessions: &[String]) -> Result<()> {
+        let at = unix_timestamp()?;
+        self.update_limit_state(|state| {
+            for session in sessions {
+                state.compacting_sessions.insert(session.clone(), at);
+            }
+        })
+    }
+
     pub(crate) fn limit_pause_holds(&self) -> bool {
         self.load_limit_state()
             .ok()
             .is_none_or(|state| state.active)
     }
 
-    fn check_config_file(&self) -> Result<()> {
+    pub(crate) fn check_config_file(&self) -> Result<()> {
         match fs::read_to_string(self.config_path()) {
             Ok(text) => Config::parse(&text).map(|_| ()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1750,6 +1767,12 @@ impl App {
             limit.cache_ttl_minutes,
             limit.idle_minutes,
             limit.max_compactions
+        );
+        println!(
+            "Kompaktieren nach Subagent: {} (wartender T3-Thread, ab {} Tokens, nach {} min Ruhe)",
+            if limit.after_subagent { "an" } else { "aus" },
+            limit.min_context_tokens,
+            limit.idle_minutes
         );
         if let Ok(levels) = self.cached_levels() {
             let burn = self.pool_burn(&levels, unix_timestamp()?);

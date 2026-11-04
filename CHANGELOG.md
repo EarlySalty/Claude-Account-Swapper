@@ -1,5 +1,9 @@
 # Changelog
 
+## #12 — Wartende Threads werden nach einem Subagent kompaktiert
+
+Startet ein T3-Thread einen Subagent, wartet er oft lange mit vollem Kontext. Ab jetzt kompaktiert der Hintergrunddienst so einen Thread, sobald er ruht und der Cache noch warm ist, wenn der Kontext groß genug ist. Eingeschaltet wird das mit `claude-account limit-compact --after-subagent on`; Fehler stehen einmal im Protokoll statt jede Minute.
+
 ## #11 — Das Fünf-Stunden-Fenster startet von selbst, und Aufträge warten darauf
 
 Das Fenster beginnt nicht mit dem Reset, sondern mit der ersten Anfrage danach. Wer nachts um vier nicht am Rechner sitzt, verschiebt damit seine ganzen fünf Stunden — und musste sich bisher selbst einen Wecker stellen, um irgendetwas zu tippen.
