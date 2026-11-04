@@ -17,7 +17,7 @@ const TICK_LOCK_FILE: &str = ".subagent-compact-tick.lock";
 const COMPACT_COMMAND: &str = "/compact";
 const MARK_MAX_AGE_MS: u64 = 3 * 60 * 60 * 1000;
 const MAPPING_SLACK_MS: i64 = 10 * 60 * 1000;
-const SPAWN_TOOLS: [&str; 3] = ["agent", "task", "spawn_subagent"];
+const SPAWN_TOOLS: [&str; 4] = ["agent", "task", "spawn_subagent", "delegate_task"];
 const T3_ENTRYPOINT: &str = "sdk-ts";
 const ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
 const SPOKEN_KEY: &str = "subagent-compact";
@@ -213,6 +213,10 @@ impl App {
         let threads = client.claude_threads()?;
         let mut rpc: Option<t3::Rpc> = None;
         for (session, mark) in marks.sessions {
+            if !in_scope(&session, &limit) {
+                self.forget_mark(&session, &mark)?;
+                continue;
+            }
             let key = format!("{SPOKEN_KEY}:{session}");
             match self.handle_mark(&client, &mut rpc, &threads, &limit, &session, &mark, now) {
                 Ok(()) => {
@@ -230,6 +234,12 @@ impl App {
                 }
             }
         }
+        let remaining = self.load_marks()?;
+        spoken.retain(|key, _| {
+            key.strip_prefix(SPOKEN_KEY)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .is_none_or(|session| remaining.sessions.contains_key(session))
+        });
         Ok(())
     }
 
@@ -256,15 +266,20 @@ impl App {
             Step::Wait => Ok(()),
             Step::Drop => self.forget_mark(session, mark),
             Step::Inspect => {
-                self.forget_mark(session, mark)?;
                 let rpc = connected(client, rpc)?;
                 let detail = rpc.thread_detail(&thread_id)?;
-                if !crate::limit::worth_compacting(&detail, limit) {
-                    return Ok(());
+                if !crate::limit::worth_compacting(&detail, limit)
+                    || self.limit_compacted(&thread_id)?
+                {
+                    return self.forget_mark(session, mark);
                 }
                 self.note_compacting(&detail.native_session_ids)?;
                 let message_id = uuid::Uuid::new_v4().to_string();
-                rpc.send_message(&thread_id, COMPACT_COMMAND, &message_id)?;
+                if let Err(error) = rpc.send_message(&thread_id, COMPACT_COMMAND, &message_id) {
+                    self.clear_compacting(&detail.native_session_ids)?;
+                    return Err(error);
+                }
+                self.forget_mark(session, mark)?;
                 log_event(&format!(
                     "Subagent-Kompaktieren: Thread {thread_id} kompaktiert ({} Tokens im Kontext)",
                     detail.used_tokens.unwrap_or(0)

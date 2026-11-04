@@ -1050,6 +1050,18 @@ impl App {
         })
     }
 
+    pub(crate) fn clear_compacting(&self, sessions: &[String]) -> Result<()> {
+        self.update_limit_state(|state| {
+            for session in sessions {
+                state.compacting_sessions.remove(session);
+            }
+        })
+    }
+
+    pub(crate) fn limit_compacted(&self, thread_id: &str) -> Result<bool> {
+        Ok(self.load_limit_state()?.compacted.contains_key(thread_id))
+    }
+
     pub(crate) fn limit_pause_holds(&self) -> bool {
         self.load_limit_state()
             .ok()
