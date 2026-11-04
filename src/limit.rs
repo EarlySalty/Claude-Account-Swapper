@@ -28,6 +28,7 @@ const TRANSCRIPT_HEAD_BYTES: u64 = 64 * 1024;
 const RESUME_GRACE_SECONDS: u64 = 30 * 60;
 const T3_RESUME_SETTLE_MS: u64 = 2 * 60 * 1000;
 const RESET_NEAR_SECONDS: i64 = 60 * 60;
+const COMPACTING_MARKER_SECONDS: u64 = 30 * 60;
 const TODO_FILE: &str = "TODO.md";
 const T3_ENTRYPOINT: &str = "sdk-ts";
 const ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
@@ -927,11 +928,10 @@ fn still_blocked(
     !verdict(config, levels, active_profile().as_deref()).released
 }
 
-fn reenter(state: &mut LimitState) -> Vec<String> {
-    if state.released_at.is_some() {
-        state.compacted.clear();
-        state.inspected.clear();
-    }
+fn reenter(state: &mut LimitState, now: u64) -> Vec<String> {
+    state
+        .compacting_sessions
+        .retain(|_, at| now.saturating_sub(*at) < COMPACTING_MARKER_SECONDS);
     let dropped: Vec<String> = state
         .sessions
         .iter()
@@ -1208,7 +1208,7 @@ impl App {
                 state.reason = reason.clone();
             }
             if verdict.at_limit && !state.active {
-                let dropped = reenter(state);
+                let dropped = reenter(state, now);
                 state.active = true;
                 state.since = Some(now);
                 state.released_at = None;
@@ -1218,6 +1218,8 @@ impl App {
             } else if verdict.released && state.active {
                 state.active = false;
                 state.released_at = Some(now);
+                state.compacted.clear();
+                state.inspected.clear();
                 (
                     Some(format!(
                         "Limit-Pause aufgehoben, {} angehaltene Sitzung(en) werden fortgesetzt",
@@ -1367,7 +1369,7 @@ impl App {
             }
             sent += 1;
             log_event(&format!(
-                "Limit-Pause: Thread {} kompaktiert ({} Tokens im Kontext)",
+                "Limit-Kompaktieren: Thread {} kompaktiert ({} Tokens im Kontext)",
                 thread.id,
                 detail.used_tokens.unwrap_or(0)
             ));
@@ -2576,8 +2578,10 @@ mod tests {
     fn entry_after_pre_pause_compaction_keeps_its_markers() {
         let mut state = LimitState::default();
         state.compacted.insert("t".to_owned(), 1);
-        state.compacting_sessions.insert("s".to_owned(), 1);
-        reenter(&mut state);
+        state.compacting_sessions.insert("s".to_owned(), 4000);
+        state.compacting_sessions.insert("old".to_owned(), 1);
+        reenter(&mut state, 5000);
+        assert!(!state.compacting_sessions.contains_key("old"));
         assert!(state.compacted.contains_key("t"));
         state.active = true;
         assert!(hook_reply(&input("Stop", "s"), &mut state, 50).is_none());
@@ -2585,11 +2589,8 @@ mod tests {
     }
 
     #[test]
-    fn reentry_keeps_only_stopped_sessions_and_forgets_compactions() {
-        let mut state = LimitState {
-            released_at: Some(1),
-            ..LimitState::default()
-        };
+    fn reentry_keeps_only_stopped_sessions_and_fresh_compaction_markers() {
+        let mut state = LimitState::default();
         let parked = |stopped_at_ms: Option<u64>, continued_by_user: bool| Parked {
             stopped_at_ms,
             continued_by_user,
@@ -2607,7 +2608,7 @@ mod tests {
         state.compacted.insert("t".to_owned(), 1);
         state.compacting_sessions.insert("s".to_owned(), 1);
         state.inspected.insert("t".to_owned(), "x".to_owned());
-        let dropped = reenter(&mut state);
+        let dropped = reenter(&mut state, 60);
         assert_eq!(dropped, vec!["manual".to_owned()]);
         assert!(!state.sessions["stopped"].retell);
         assert!(state.sessions["running"].retell);
@@ -2616,8 +2617,8 @@ mod tests {
         assert!(hook_reply(&input("PostToolUse", "running"), &mut active_state, 50).is_some());
         assert!(!active_state.sessions["running"].retell);
         assert_eq!(active_state.sessions["running"].told_at_ms, 50);
-        assert!(state.compacted.is_empty() && state.compacting_sessions.contains_key("s"));
-        assert!(state.inspected.is_empty());
+        assert!(state.compacted.contains_key("t") && state.compacting_sessions.contains_key("s"));
+        assert!(state.inspected.contains_key("t"));
     }
 
     #[test]
