@@ -759,7 +759,7 @@ fn minutes(value: u64) -> i64 {
     i64::try_from(value.saturating_mul(60)).unwrap_or(i64::MAX)
 }
 
-fn worth_compacting(detail: &t3::ThreadDetail, limit: &LimitCompact) -> bool {
+pub(crate) fn worth_compacting(detail: &t3::ThreadDetail, limit: &LimitCompact) -> bool {
     !detail.last_item_is_compaction
         && detail
             .used_tokens
@@ -1047,7 +1047,7 @@ impl App {
         }
     }
 
-    fn open_lock(&self, name: &str) -> Result<File> {
+    pub(crate) fn open_lock(&self, name: &str) -> Result<File> {
         self.ensure_store()?;
         OpenOptions::new()
             .read(true)
@@ -1113,7 +1113,7 @@ impl App {
         }))
     }
 
-    fn t3_client(&self, limit: &LimitCompact) -> t3::Client {
+    pub(crate) fn t3_client(&self, limit: &LimitCompact) -> t3::Client {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();

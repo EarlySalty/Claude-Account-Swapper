@@ -49,6 +49,7 @@ pub struct LimitCompact {
     pub cache_ttl_minutes: u64,
     pub idle_minutes: u64,
     pub max_compactions: usize,
+    pub after_subagent: bool,
     pub scope_sessions: Vec<String>,
     pub t3_url: String,
 }
@@ -66,6 +67,7 @@ impl Default for LimitCompact {
             cache_ttl_minutes: 55,
             idle_minutes: 2,
             max_compactions: 8,
+            after_subagent: true,
             scope_sessions: Vec::new(),
             t3_url: "http://127.0.0.1:3773".to_owned(),
         }

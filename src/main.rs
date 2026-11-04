@@ -359,6 +359,9 @@ fn run_hook(app: &App) {
         claude_account_swapper::limit::log_hook_failure(&error.into());
         return;
     }
+    if let Err(error) = app.note_subagent_spawn(&input) {
+        claude_account_swapper::limit::log_hook_failure(&error);
+    }
     match app.hook(&input) {
         Ok(Some(reply)) => println!("{reply}"),
         Ok(None) => {}

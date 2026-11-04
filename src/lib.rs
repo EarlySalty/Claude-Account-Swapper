@@ -21,6 +21,7 @@ pub mod config;
 pub mod forecast;
 pub mod jobs;
 pub mod limit;
+pub mod subagent_compact;
 pub mod t3;
 pub mod usage;
 pub mod web;
@@ -2898,6 +2899,9 @@ impl App {
         };
         if let Err(error) = self.limit_tick(config, spoken) {
             log_problem(&format!("Limit-Pause fehlgeschlagen: {error:#}"));
+        }
+        if let Err(error) = self.subagent_compact_tick(&config.limit_compact) {
+            log_problem(&format!("Subagent-Kompaktieren fehlgeschlagen: {error:#}"));
         }
         switched?;
         if config.ping.enabled
