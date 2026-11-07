@@ -115,6 +115,10 @@ impl Candidate {
 
     /// Der Account hat noch echtes Kontingent, seine eigene Reserve waere aber angebrochen.
     /// Bei einer harten Grenze gibt es diesen Fall nicht.
+    fn has_real_quota(&self) -> bool {
+        !self.stops.hard && self.usage.is_free_with(100.0, 100.0)
+    }
+
     fn within_global_limit(&self, threshold: f64) -> bool {
         !self.stops.hard && self.usage.is_free_with(threshold, threshold)
     }
@@ -336,6 +340,34 @@ pub fn pick_target_with(
 
     // Auch kein Restkontingent. Dann gewinnt der, der am fruehesten wieder frei wird - warten
     // muss man ohnehin, die Frage ist nur, wo am kuerzesten.
+    if current.has_real_quota() {
+        return Decision::Stay {
+            reason: format!(
+                "alle Accounts sind ueber der Schwelle; `{active}` ({}) hat noch echtes \
+                 Kontingent und bleibt aktiv",
+                current.describe(threshold)
+            ),
+        };
+    }
+
+    if let Some(target) = rank(
+        pacing,
+        threshold,
+        accounts
+            .iter()
+            .filter(|candidate| candidate.name != active && candidate.has_real_quota()),
+    ) {
+        return Decision::SwitchTo {
+            name: target.name.clone(),
+            reason: format!(
+                "`{active}` ist am echten Limit ({}); `{}` hat noch echtes Kontingent ({})",
+                current.describe(threshold),
+                target.name,
+                target.describe(threshold)
+            ),
+        };
+    }
+
     let mut soonest: Vec<(&Candidate, DateTime<Utc>)> = accounts
         .iter()
         .filter_map(|candidate| {
@@ -654,6 +686,34 @@ mod tests {
             usage,
             stops: Stops::default(),
         }
+    }
+
+    #[test]
+    fn account_with_real_quota_is_not_swapped_back_and_forth() {
+        let accounts = [
+            named("max", usage(99.0, 87.0)),
+            named("pro", usage(0.0, 98.0)),
+        ];
+        assert!(matches!(
+            pick_target("pro", &accounts, 98.0),
+            Decision::Stay { .. }
+        ));
+        assert!(matches!(
+            pick_target("max", &accounts, 98.0),
+            Decision::Stay { .. }
+        ));
+        let exhausted = [
+            named("max", usage(100.0, 87.0)),
+            named("pro", usage(0.0, 98.0)),
+        ];
+        match pick_target("max", &exhausted, 98.0) {
+            Decision::SwitchTo { name, .. } => assert_eq!(name, "pro"),
+            other => panic!("unerwartet: {other:?}"),
+        }
+        assert!(matches!(
+            pick_target("pro", &exhausted, 98.0),
+            Decision::Stay { .. }
+        ));
     }
 
     #[test]

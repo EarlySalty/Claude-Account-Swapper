@@ -568,6 +568,23 @@ fn hook_reply_with(
     if !state.scope.is_empty() && !state.scope.contains(&input.session_id) {
         return None;
     }
+    if state
+        .sessions
+        .get(&input.session_id)
+        .is_some_and(|parked| parked.continued_by_user)
+    {
+        return None;
+    }
+    if parent && input.hook_event_name == "PostToolUse" && continued_by_prompt(input, state) {
+        let parked = state
+            .sessions
+            .entry(input.session_id.clone())
+            .or_insert_with(|| parked_from(input, now));
+        parked.continued_by_user = true;
+        parked.stopped_at_ms = None;
+        parked.retell = false;
+        return None;
+    }
     let message = wrap_up_message(&state.reason);
     let actor = actor_key(input).to_owned();
     match input.hook_event_name.as_str() {
@@ -585,9 +602,8 @@ fn hook_reply_with(
                         }
                     }
                 });
-            if parent && (parked.stopped_at_ms.is_some() || parked.retell) {
+            if parent && parked.retell {
                 parked.stopped_at_ms = None;
-                parked.continued_by_user = false;
                 parked.retell = false;
                 parked.resume_message_id = None;
                 parked.told_actors.clear();
@@ -639,6 +655,22 @@ fn hook_reply_with(
         },
         _ => None,
     }
+}
+
+fn continued_by_prompt(input: &HookInput, state: &LimitState) -> bool {
+    let since_ms = match state.sessions.get(&input.session_id) {
+        Some(parked) if parked.retell => return false,
+        Some(parked) if parked.stopped_at_ms.is_some() => return true,
+        Some(parked) => parked.told_at_ms,
+        None => match state.since {
+            Some(since) => since.saturating_mul(1000),
+            None => return false,
+        },
+    };
+    input
+        .transcript_path
+        .as_deref()
+        .is_some_and(|transcript| user_prompt_after(transcript, since_ms, None))
 }
 
 fn parked_from(input: &HookInput, now: u64) -> Parked {
@@ -2167,6 +2199,17 @@ mod tests {
     }
 
     #[test]
+    fn tool_use_after_the_stop_means_the_user_continued() {
+        let mut state = active();
+        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 10).is_some());
+        assert!(hook_reply(&input("Stop", "s"), &mut state, 12).is_none());
+        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 20).is_none());
+        assert!(state.sessions["s"].continued_by_user);
+        assert!(hook_reply(&input("Stop", "s"), &mut state, 30).is_none());
+        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 40).is_none());
+    }
+
+    #[test]
     fn untold_stop_is_blocked_once() {
         let mut state = active();
         let reply = hook_reply(&input("Stop", "s"), &mut state, 10);
@@ -2767,17 +2810,6 @@ mod tests {
         assert_eq!(active_state.sessions["running"].told_at_ms, 50);
         assert!(state.compacted.is_empty() && state.compacting_sessions.contains_key("s"));
         assert!(state.inspected.is_empty());
-    }
-
-    #[test]
-    fn stopped_session_that_runs_again_is_told_again() {
-        let mut state = active();
-        hook_reply(&input("PostToolUse", "s"), &mut state, 10);
-        hook_reply(&input("Stop", "s"), &mut state, 20);
-        let again = hook_reply(&input("PostToolUse", "s"), &mut state, 30);
-        assert!(again.is_some());
-        assert_eq!(state.sessions["s"].told_at_ms, 30);
-        assert_eq!(state.sessions["s"].stopped_at_ms, None);
     }
 
     #[test]
