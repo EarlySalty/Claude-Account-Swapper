@@ -835,6 +835,10 @@ fn fit(candidate: &Candidate, config: &Config) -> Fit {
     }
 }
 
+fn manual_pin_blocks_resume(config: &Config, pinned: bool, candidate: Option<&Candidate>) -> bool {
+    pinned && candidate.is_some_and(|candidate| fit(candidate, config) != Fit::No)
+}
+
 fn blocked(candidate: &Candidate, config: &Config) -> bool {
     candidate.usage.five_hour.utilization >= config.limit_compact.threshold
         || !candidate.usage.is_free(config.threshold)
@@ -1225,11 +1229,16 @@ impl App {
                 .iter()
                 .find(|(level, _)| level == name)
                 .and_then(|(_, candidate)| candidate.as_ref());
-            if let Some(reason) = self.manual_pin_stay(name, candidate, config.threshold) {
+            let pinned = self
+                .read_manual_pin()
+                .is_some_and(|pin| pin.profile == name);
+            if manual_pin_blocks_resume(config, pinned, candidate) {
                 log_once(
                     spoken,
                     "limit-manual-pin",
-                    &format!("Kein Wechsel: {reason}"),
+                    &format!(
+                        "Kein Wechsel: `{name}` wurde von Hand gewaehlt und hat noch echtes Kontingent"
+                    ),
                 );
                 return;
             }
@@ -2773,6 +2782,20 @@ mod tests {
         stop.stop_hook_active = true;
         assert!(hook_reply(&stop, &mut state, 40).is_none());
         assert_eq!(state.sessions["s"].stopped_at_ms, Some(40));
+    }
+
+    #[test]
+    fn manual_pin_blocks_resume_only_for_a_pinned_account_that_fits() {
+        let config = config(true);
+        let strict = usage(30.0, 10.0).unwrap();
+        let mut reserve = usage(60.0, 10.0).unwrap();
+        reserve.stops.five_hour = Some(50.0);
+        let spent = usage(97.0, 10.0).unwrap();
+        assert!(manual_pin_blocks_resume(&config, true, Some(&strict)));
+        assert!(manual_pin_blocks_resume(&config, true, Some(&reserve)));
+        assert!(!manual_pin_blocks_resume(&config, true, Some(&spent)));
+        assert!(!manual_pin_blocks_resume(&config, true, None));
+        assert!(!manual_pin_blocks_resume(&config, false, Some(&strict)));
     }
 
     #[test]

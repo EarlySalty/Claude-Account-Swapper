@@ -247,7 +247,6 @@ struct State {
 #[derive(Debug, Serialize, Deserialize)]
 struct ManualPin {
     profile: String,
-    at: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1842,16 +1841,18 @@ impl App {
     }
 
     fn record_manual_pin(&self, name: &str) {
-        let written = unix_timestamp().and_then(|at| {
-            let payload = serde_json::to_vec(&ManualPin {
-                profile: name.to_owned(),
-                at,
-            })?;
-            atomic_write(&self.manual_pin_path(), &payload, 0o600)
-        });
+        let written = serde_json::to_vec(&ManualPin {
+            profile: name.to_owned(),
+        })
+        .map_err(anyhow::Error::from)
+        .and_then(|payload| atomic_write(&self.manual_pin_path(), &payload, 0o600));
         if let Err(error) = written {
             log_problem(&format!("Handwahl konnte nicht gemerkt werden: {error:#}"));
         }
+    }
+
+    fn read_manual_pin(&self) -> Option<ManualPin> {
+        serde_json::from_slice(&fs::read(self.manual_pin_path()).ok()?).ok()
     }
 
     fn manual_pin_stay(
@@ -1860,9 +1861,11 @@ impl App {
         candidate: Option<&Candidate>,
         threshold: f64,
     ) -> Option<String> {
-        let pin: ManualPin =
-            serde_json::from_slice(&fs::read(self.manual_pin_path()).ok()?).ok()?;
-        if usage::manual_pin_holds(&pin.profile, active, candidate, threshold) {
+        let pin = self.read_manual_pin()?;
+        if pin.profile != active {
+            return None;
+        }
+        if usage::manual_pin_holds(candidate, threshold) {
             return Some(match candidate {
                 Some(_) => {
                     format!("`{active}` wurde von Hand gewaehlt und hat noch echtes Kontingent")

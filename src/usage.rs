@@ -251,15 +251,7 @@ pub fn pick_target(active: &str, accounts: &[Candidate], threshold: f64) -> Deci
     pick_target_with(active, accounts, threshold, None)
 }
 
-pub fn manual_pin_holds(
-    pinned: &str,
-    active: &str,
-    current: Option<&Candidate>,
-    threshold: f64,
-) -> bool {
-    if pinned != active {
-        return false;
-    }
+pub fn manual_pin_holds(current: Option<&Candidate>, threshold: f64) -> bool {
     current.is_none_or(|candidate| candidate.keeps_manual_pin(threshold))
 }
 
@@ -705,13 +697,12 @@ mod tests {
     }
 
     #[test]
-    fn manual_pin_holds_only_for_pinned_active_account_with_quota_or_unknown_usage() {
+    fn manual_pin_holds_with_quota_or_unknown_usage() {
         let free = named("a", usage(10.0, 20.0));
         let spent = named("a", usage(100.0, 20.0));
-        assert!(manual_pin_holds("a", "a", Some(&free), 98.0));
-        assert!(!manual_pin_holds("a", "a", Some(&spent), 98.0));
-        assert!(!manual_pin_holds("a", "b", Some(&free), 98.0));
-        assert!(manual_pin_holds("a", "a", None, 98.0));
+        assert!(manual_pin_holds(Some(&free), 98.0));
+        assert!(!manual_pin_holds(Some(&spent), 98.0));
+        assert!(manual_pin_holds(None, 98.0));
     }
 
     #[test]
