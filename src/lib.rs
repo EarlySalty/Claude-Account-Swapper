@@ -244,6 +244,12 @@ struct State {
     current: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ManualPin {
+    profile: String,
+    at: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthStatus {
@@ -546,7 +552,13 @@ impl App {
     }
 
     pub fn switch(&self, name: &str) -> Result<()> {
-        self.switch_checked(name, true)
+        self.switch_by_hand(name, true)
+    }
+
+    pub fn switch_by_hand(&self, name: &str, check: bool) -> Result<()> {
+        self.switch_checked(name, check)?;
+        self.record_manual_pin(name);
+        Ok(())
     }
 
     /// Wechselt zum gespeicherten Account.
@@ -1767,7 +1779,11 @@ impl App {
         };
         let pacing = self.load_config().weekly_pacing.then(chrono::Utc::now);
         let mut usages = Vec::new();
-        if let Some(candidate) = self.candidate(active_profile, renew) {
+        let candidate = self.candidate(active_profile, renew);
+        if let Some(reason) = self.manual_pin_stay(&active, candidate.as_ref(), threshold) {
+            return self.apply_decision(Decision::Stay { reason }, dry_run);
+        }
+        if let Some(candidate) = candidate {
             // Solange der aktive Account unter seiner Grenze liegt, aendert keine weitere Zahl
             // das Ergebnis. Die Abfrage ist selbst ratenbegrenzt; jede vermeidbare Anfrage
             // erhoeht die Wahrscheinlichkeit, im entscheidenden Moment keine Antwort zu haben.
@@ -1819,6 +1835,49 @@ impl App {
 
     fn last_switch_path(&self) -> PathBuf {
         self.paths.store.join("last-switch")
+    }
+
+    fn manual_pin_path(&self) -> PathBuf {
+        self.paths.store.join("manual-pin.json")
+    }
+
+    fn record_manual_pin(&self, name: &str) {
+        let written = unix_timestamp().and_then(|at| {
+            let payload = serde_json::to_vec(&ManualPin {
+                profile: name.to_owned(),
+                at,
+            })?;
+            atomic_write(&self.manual_pin_path(), &payload, 0o600)
+        });
+        if let Err(error) = written {
+            log_problem(&format!("Handwahl konnte nicht gemerkt werden: {error:#}"));
+        }
+    }
+
+    fn manual_pin_stay(
+        &self,
+        active: &str,
+        candidate: Option<&Candidate>,
+        threshold: f64,
+    ) -> Option<String> {
+        let pin: ManualPin =
+            serde_json::from_slice(&fs::read(self.manual_pin_path()).ok()?).ok()?;
+        if usage::manual_pin_holds(&pin.profile, active, candidate, threshold) {
+            return Some(match candidate {
+                Some(_) => {
+                    format!("`{active}` wurde von Hand gewaehlt und hat noch echtes Kontingent")
+                }
+                None => {
+                    format!("`{active}` wurde von Hand gewaehlt, seine Auslastung ist unbekannt")
+                }
+            });
+        }
+        if let Err(error) = fs::remove_file(self.manual_pin_path())
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            log_problem(&format!("Handwahl konnte nicht aufgehoben werden: {error}"));
+        }
+        None
     }
 
     fn record_switch(&self) {

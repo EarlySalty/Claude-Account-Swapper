@@ -394,7 +394,7 @@ fn dispatch_post(
             let name = input.name;
             let check = !input.skip_check;
             let task = start_task(tasks, "Account wechseln", move |app| {
-                app.switch_checked(&name, check)?;
+                app.switch_by_hand(&name, check)?;
                 Ok(format!("Aktiver Account ist jetzt {name}."))
             });
             Ok(task_response(task))

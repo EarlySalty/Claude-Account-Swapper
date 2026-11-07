@@ -228,7 +228,7 @@ fn run() -> Result<()> {
     match cli.command {
         Some(AccountCommand::Save { name }) => app.save(&name),
         Some(AccountCommand::Login { name }) => app.login(&name),
-        Some(AccountCommand::Switch { name, no_check }) => app.switch_checked(&name, !no_check),
+        Some(AccountCommand::Switch { name, no_check }) => app.switch_by_hand(&name, !no_check),
         Some(AccountCommand::List) => app.list(),
         Some(AccountCommand::Status) => app.status(),
         Some(AccountCommand::Usage) => app.usage(),

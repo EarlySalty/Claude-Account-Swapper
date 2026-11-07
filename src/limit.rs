@@ -1220,6 +1220,21 @@ impl App {
         spoken: &mut HashMap<String, String>,
     ) {
         let active = self.active_profile_name_memoized(None);
+        if let Some(name) = active.as_deref() {
+            let candidate = levels
+                .iter()
+                .find(|(level, _)| level == name)
+                .and_then(|(_, candidate)| candidate.as_ref());
+            if let Some(reason) = self.manual_pin_stay(name, candidate, config.threshold) {
+                log_once(
+                    spoken,
+                    "limit-manual-pin",
+                    &format!("Kein Wechsel: {reason}"),
+                );
+                return;
+            }
+        }
+        spoken.remove("limit-manual-pin");
         let Some(target) = switch_target(config, levels, active.as_deref()) else {
             spoken.remove("limit-switch-off");
             return;

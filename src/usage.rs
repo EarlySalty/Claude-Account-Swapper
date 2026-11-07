@@ -117,6 +117,10 @@ impl Candidate {
         !self.stops.hard && self.usage.is_free_with(100.0, 100.0)
     }
 
+    fn keeps_manual_pin(&self, threshold: f64) -> bool {
+        self.has_real_quota() || (self.stops.hard && self.within_stops(threshold))
+    }
+
     /// Der Account hat noch echtes Kontingent, seine eigene Reserve waere aber angebrochen.
     /// Bei einer harten Grenze gibt es diesen Fall nicht.
     fn within_global_limit(&self, threshold: f64) -> bool {
@@ -245,6 +249,18 @@ impl Decision {
 /// Account, der am fruehesten wieder frei ist.
 pub fn pick_target(active: &str, accounts: &[Candidate], threshold: f64) -> Decision {
     pick_target_with(active, accounts, threshold, None)
+}
+
+pub fn manual_pin_holds(
+    pinned: &str,
+    active: &str,
+    current: Option<&Candidate>,
+    threshold: f64,
+) -> bool {
+    if pinned != active {
+        return false;
+    }
+    current.is_none_or(|candidate| candidate.keeps_manual_pin(threshold))
 }
 
 pub fn with_stale_targets(
@@ -686,6 +702,16 @@ mod tests {
             usage,
             stops: Stops::default(),
         }
+    }
+
+    #[test]
+    fn manual_pin_holds_only_for_pinned_active_account_with_quota_or_unknown_usage() {
+        let free = named("a", usage(10.0, 20.0));
+        let spent = named("a", usage(100.0, 20.0));
+        assert!(manual_pin_holds("a", "a", Some(&free), 98.0));
+        assert!(!manual_pin_holds("a", "a", Some(&spent), 98.0));
+        assert!(!manual_pin_holds("a", "b", Some(&free), 98.0));
+        assert!(manual_pin_holds("a", "a", None, 98.0));
     }
 
     #[test]
