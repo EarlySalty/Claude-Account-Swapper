@@ -660,8 +660,7 @@ fn hook_reply_with(
 fn continued_by_prompt(input: &HookInput, state: &LimitState) -> bool {
     let since_ms = match state.sessions.get(&input.session_id) {
         Some(parked) if parked.retell => return false,
-        Some(parked) if parked.stopped_at_ms.is_some() => return true,
-        Some(parked) => parked.told_at_ms,
+        Some(parked) => parked.stopped_at_ms.unwrap_or(parked.told_at_ms),
         None => match state.since {
             Some(since) => since.saturating_mul(1000),
             None => return false,
@@ -2199,14 +2198,27 @@ mod tests {
     }
 
     #[test]
-    fn tool_use_after_the_stop_means_the_user_continued() {
+    fn prompt_after_the_stop_means_the_user_continued() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let stop = 1_793_095_500_000;
+        let mut tool = input("PostToolUse", "s");
+        tool.transcript_path = Some(path.clone());
         let mut state = active();
-        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 10).is_some());
-        assert!(hook_reply(&input("Stop", "s"), &mut state, 12).is_none());
-        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 20).is_none());
+        assert!(hook_reply(&tool, &mut state, stop - 100).is_some());
+        assert!(hook_reply(&input("Stop", "s"), &mut state, stop).is_none());
+        assert!(hook_reply(&tool, &mut state, stop + 100).is_none());
+        assert!(!state.sessions["s"].continued_by_user);
+        let prompt = json!({
+            "type": "user",
+            "timestamp": "2026-10-27T10:30:00Z",
+            "message": { "content": "weiter" },
+        });
+        fs::write(&path, prompt.to_string()).expect("write");
+        assert!(hook_reply(&tool, &mut state, stop + 200).is_none());
         assert!(state.sessions["s"].continued_by_user);
-        assert!(hook_reply(&input("Stop", "s"), &mut state, 30).is_none());
-        assert!(hook_reply(&input("PostToolUse", "s"), &mut state, 40).is_none());
+        assert!(hook_reply(&input("Stop", "s"), &mut state, stop + 300).is_none());
+        assert!(hook_reply(&tool, &mut state, stop + 400).is_none());
     }
 
     #[test]

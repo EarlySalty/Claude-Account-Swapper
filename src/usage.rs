@@ -113,12 +113,12 @@ impl Candidate {
         )
     }
 
-    /// Der Account hat noch echtes Kontingent, seine eigene Reserve waere aber angebrochen.
-    /// Bei einer harten Grenze gibt es diesen Fall nicht.
     fn has_real_quota(&self) -> bool {
         !self.stops.hard && self.usage.is_free_with(100.0, 100.0)
     }
 
+    /// Der Account hat noch echtes Kontingent, seine eigene Reserve waere aber angebrochen.
+    /// Bei einer harten Grenze gibt es diesen Fall nicht.
     fn within_global_limit(&self, threshold: f64) -> bool {
         !self.stops.hard && self.usage.is_free_with(threshold, threshold)
     }
@@ -338,8 +338,6 @@ pub fn pick_target_with(
         };
     }
 
-    // Auch kein Restkontingent. Dann gewinnt der, der am fruehesten wieder frei wird - warten
-    // muss man ohnehin, die Frage ist nur, wo am kuerzesten.
     if current.has_real_quota() {
         return Decision::Stay {
             reason: format!(
@@ -368,6 +366,8 @@ pub fn pick_target_with(
         };
     }
 
+    // Auch kein Restkontingent. Dann gewinnt der, der am fruehesten wieder frei wird - warten
+    // muss man ohnehin, die Frage ist nur, wo am kuerzesten.
     let mut soonest: Vec<(&Candidate, DateTime<Utc>)> = accounts
         .iter()
         .filter_map(|candidate| {
