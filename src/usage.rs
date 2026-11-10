@@ -563,7 +563,17 @@ pub fn fetch(access_token: &str) -> Result<Usage> {
             .headers()
             .get("retry-after")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse().ok());
+            .and_then(|value| {
+                value.trim().parse::<u64>().ok().or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(value)
+                        .ok()
+                        .map(|date| {
+                            date.timestamp()
+                                .saturating_sub(Utc::now().timestamp())
+                                .max(0) as u64
+                        })
+                })
+            });
         return Err(RateLimited { retry_after }.into());
     }
     let body = response
@@ -659,6 +669,9 @@ fn bucket(value: &Value, field: &str) -> Result<Bucket> {
         .get("utilization")
         .and_then(Value::as_f64)
         .with_context(|| format!("`{field}` enthaelt keine Auslastung"))?;
+    if !utilization.is_finite() || !(0.0..=100.0).contains(&utilization) {
+        bail!("Auslastung von `{field}` liegt außerhalb von 0 bis 100 Prozent");
+    }
     // `resets_at` fehlt bei einem ungenutzten Fenster; nur ein *unlesbarer* Wert ist ein Fehler.
     let resets_at = match bucket.get("resets_at").and_then(Value::as_str) {
         Some(text) => Some(

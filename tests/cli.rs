@@ -175,6 +175,10 @@ esac
             .env("FAKE_CLAUDE_STATUS", &self.status)
             .env_remove("CLAUDE_CONFIG_DIR")
             .env(
+                "CLAUDE_ACCOUNT_SWITCHER_USAGE_URL",
+                "http://127.0.0.1:9/usage",
+            )
+            .env(
                 "CLAUDE_ACCOUNT_SWITCHER_PROFILE_URL",
                 "http://127.0.0.1:9/profile",
             );
@@ -1738,6 +1742,7 @@ struct UsageServer {
     url: String,
     server: std::sync::Arc<tiny_http::Server>,
     worker: Option<std::thread::JoinHandle<()>>,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl UsageServer {
@@ -1750,9 +1755,12 @@ impl UsageServer {
             .into_iter()
             .map(|(token, status, body)| (token.to_owned(), status, body))
             .collect();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
         let listener = std::sync::Arc::clone(&server);
         let worker = std::thread::spawn(move || {
             for request in listener.incoming_requests() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let token = request
                     .headers()
                     .iter()
@@ -1778,6 +1786,7 @@ impl UsageServer {
             url,
             server,
             worker: Some(worker),
+            requests,
         }
     }
 }
@@ -1793,10 +1802,13 @@ impl UsageServer {
         );
         let url = format!("http://{}/usage", server.server_addr());
         let token = token.to_owned();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
         let listener = std::sync::Arc::clone(&server);
         let worker = std::thread::spawn(move || {
             let mut served = 0usize;
             for request in listener.incoming_requests() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let matches = request.headers().iter().any(|header| {
                     header.field.equiv("Authorization")
                         && header.value.as_str().trim_start_matches("Bearer ") == token
@@ -1816,6 +1828,7 @@ impl UsageServer {
             url,
             server,
             worker: Some(worker),
+            requests,
         }
     }
 }
@@ -2344,9 +2357,10 @@ fn a_throttled_target_counts_with_its_old_usage_and_expired_windows_are_free() {
         .expect("auto");
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Wuerde wechseln zu personal"), "{stdout}");
-    assert!(stdout.contains("5h 0%"), "{stdout}");
-    assert!(stdout.contains("Stand von vor 600 min"), "{stdout}");
+    assert!(
+        !stdout.contains("Wuerde wechseln"),
+        "stale target must not be selected: {stdout}"
+    );
 }
 
 #[test]
@@ -2959,8 +2973,8 @@ fn the_service_opens_a_fresh_window_with_a_ping() {
 
     assert!(log.contains("Fenster-Ping faellig"), "{log}");
     assert!(
-        log.contains("Fenster laeuft jetzt bis"),
-        "der Beweis fehlt: {log}"
+        log.contains("Bestätigung wartet auf die nächste zulässige Messung"),
+        "cached data must not confirm a new window: {log}"
     );
     let calls = harness.recorded_calls();
     assert!(calls.contains("ARG=Bist du da?"), "{calls}");
@@ -3012,8 +3026,21 @@ fn the_service_starts_a_due_job_and_marks_it_done() {
         "add",
         "starte von selbst",
         "--cwd",
-        harness.home.to_str().expect("Pfad"),
+        harness.home.to_str().expect("path"),
     ]));
+    for entry in fs::read_dir(&harness.store).expect("store").flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("usage-gate-")
+        {
+            let mut state: serde_json::Value =
+                serde_json::from_slice(&fs::read(entry.path()).expect("gate")).expect("json");
+            state["until"] = json!(0);
+            fs::write(entry.path(), serde_json::to_vec(&state).expect("json"))
+                .expect("expire attempt");
+        }
+    }
     let server = UsageServer::start_sequence("access-work", vec![usage_body(10.0, 30.0)]);
 
     let mut child = harness
@@ -3251,4 +3278,125 @@ fn the_ping_stays_quiet_while_a_window_is_running() {
         harness.recorded_calls().is_empty(),
         "in ein laufendes Fenster darf nicht gepingt werden: {log}"
     );
+}
+
+#[test]
+fn concurrent_cli_consumers_share_measurements_and_preserve_age() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(20.0, 30.0)),
+        ("access-personal", 200, usage_body(10.0, 20.0)),
+    ]);
+    let mut children: Vec<_> = (0..4)
+        .map(|_| {
+            harness
+                .command()
+                .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+                .args(["usage"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("consumer")
+        })
+        .collect();
+    for child in &mut children {
+        assert!(child.wait().expect("consumer exit").success());
+    }
+    assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let files: Vec<_> = fs::read_dir(&harness.store)
+        .expect("store")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("usage-gate-"))
+        .map(|e| (e.path(), fs::read(e.path()).expect("gate")))
+        .collect();
+    assert_success(
+        &harness
+            .command()
+            .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+            .args(["usage"])
+            .output()
+            .expect("restart"),
+    );
+    for (path, before) in files {
+        assert_eq!(fs::read(path).expect("gate"), before);
+    }
+    assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
+fn cooldown_is_shared_across_accounts_and_survives_restart() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 429, "{}".to_owned()),
+        ("access-personal", 429, "{}".to_owned()),
+    ]);
+    for _ in 0..3 {
+        assert_success(
+            &harness
+                .command()
+                .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+                .args(["usage"])
+                .output()
+                .expect("consumer"),
+        );
+    }
+    assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(harness.store.join("usage-budget.json")).expect("budget"))
+            .expect("json");
+    assert_eq!(state["failures"], 1);
+}
+
+#[test]
+fn prediction_switches_early_only_with_a_safe_target() {
+    use sha2::{Digest, Sha256};
+    let harness = harness_with_two_accounts();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let measured = |five, at| json!({"five_hour":{"utilization":five,"resets_at":"2099-08-03T20:00:00Z"},"seven_day":{"utilization":20.0,"resets_at":"2099-08-09T02:00:00Z"},"fetched_at":at});
+    let path = harness.store.join(format!(
+        "usage-gate-{:x}.json",
+        Sha256::digest(b"work@example.test")
+    ));
+    fs::write(path, serde_json::to_vec(&json!({"previous":measured(65.0, now-180),"cached":measured(84.0,now),"until":0,"failures":0})).expect("gate json")).expect("gate");
+    write_cached_usage(&harness, "personal", 10.0, 20.0, 5);
+    let output = harness.run(&["auto", "--dry-run"]);
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Wuerde wechseln zu personal"));
+    write_cached_usage(&harness, "personal", 99.0, 99.0, 5);
+    let output = harness.run(&["auto", "--dry-run"]);
+    assert_success(&output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Wuerde wechseln"));
+}
+
+#[test]
+fn aliases_and_rotated_tokens_do_not_clear_the_shared_cooldown() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["save", "alias"]));
+    let server = UsageServer::start(vec![
+        ("access-work", 429, "{}".to_owned()),
+        ("access-personal", 429, "{}".to_owned()),
+    ]);
+    assert_success(
+        &harness
+            .command()
+            .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+            .args(["usage"])
+            .output()
+            .expect("usage"),
+    );
+    fs::remove_dir_all(harness.store.join("accounts/alias")).expect("remove test alias");
+    harness.set_active("work@example.test", "access-rotated", "refresh-rotated");
+    assert_success(&harness.run(&["save", "work"]));
+    assert_success(
+        &harness
+            .command()
+            .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+            .args(["usage"])
+            .output()
+            .expect("usage"),
+    );
+    assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
