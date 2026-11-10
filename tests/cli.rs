@@ -3411,7 +3411,6 @@ fn cold_measurement_reserve_switches_without_a_previous_sample() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_secs();
-    // Weekly pacing's three-hour dwell must not suppress quota protection.
     fs::write(harness.store.join("last-switch"), now.to_string()).expect("switch time");
     let server = UsageServer::start(vec![
         ("access-work", 200, usage_body(96.0, 40.0)),
