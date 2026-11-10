@@ -449,7 +449,7 @@ fn pacing_switch(
     })
 }
 
-fn reactive_target<'a>(
+pub fn reactive_target<'a>(
     active: &str,
     accounts: &'a [Candidate],
     threshold: f64,
@@ -669,8 +669,8 @@ fn bucket(value: &Value, field: &str) -> Result<Bucket> {
         .get("utilization")
         .and_then(Value::as_f64)
         .with_context(|| format!("`{field}` enthaelt keine Auslastung"))?;
-    if !utilization.is_finite() || !(0.0..=100.0).contains(&utilization) {
-        bail!("Auslastung von `{field}` liegt außerhalb von 0 bis 100 Prozent");
+    if !utilization.is_finite() || utilization < 0.0 {
+        bail!("Auslastung von `{field}` muss endlich und nicht negativ sein");
     }
     // `resets_at` fehlt bei einem ungenutzten Fenster; nur ein *unlesbarer* Wert ist ein Fehler.
     let resets_at = match bucket.get("resets_at").and_then(Value::as_str) {

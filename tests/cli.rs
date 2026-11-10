@@ -1959,6 +1959,7 @@ fn auto_keeps_the_active_account_below_the_threshold() {
     let output = harness
         .command()
         .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_RESERVE", "0")
         .args(["auto"])
         .output()
         .expect("auto");
@@ -2358,8 +2359,8 @@ fn a_throttled_target_counts_with_its_old_usage_and_expired_windows_are_free() {
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains("Wuerde wechseln"),
-        "stale target must not be selected: {stdout}"
+        stdout.contains("Wuerde wechseln zu personal"),
+        "stale reset target must remain available: {stdout}"
     );
 }
 
@@ -3358,7 +3359,7 @@ fn prediction_switches_early_only_with_a_safe_target() {
     let measured = |five, at| json!({"five_hour":{"utilization":five,"resets_at":"2099-08-03T20:00:00Z"},"seven_day":{"utilization":20.0,"resets_at":"2099-08-09T02:00:00Z"},"fetched_at":at});
     let path = harness.store.join(format!(
         "usage-gate-{:x}.json",
-        Sha256::digest(b"work@example.test")
+        Sha256::digest(b"v2:[\"work@example.test\",null]")
     ));
     fs::write(path, serde_json::to_vec(&json!({"previous":measured(65.0, now-180),"cached":measured(84.0,now),"until":0,"failures":0})).expect("gate json")).expect("gate");
     write_cached_usage(&harness, "personal", 10.0, 20.0, 5);
@@ -3399,4 +3400,122 @@ fn aliases_and_rotated_tokens_do_not_clear_the_shared_cooldown() {
             .expect("usage"),
     );
     assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cold_measurement_reserve_switches_without_a_previous_sample() {
+    let harness = harness_with_two_accounts();
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(96.0, 40.0)),
+        ("access-personal", 200, usage_body(10.0, 10.0)),
+    ]);
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Wuerde wechseln zu personal") && stdout.contains("Prognose:"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn future_legacy_measurement_is_not_fresh() {
+    let harness = harness_with_two_accounts();
+    write_cached_usage(&harness, "work", 10.0, 10.0, 0);
+    let path = harness.store.join("profiles/work/usage.json");
+    let path = if path.exists() {
+        path
+    } else {
+        harness
+            .saved_credentials("work")
+            .parent()
+            .expect("profile")
+            .join("usage.json")
+    };
+    let mut cached: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("cache")).expect("json");
+    cached["fetched_at"] = json!(u64::MAX);
+    fs::write(path, serde_json::to_vec(&cached).expect("json")).expect("write");
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(100.0, 100.0)),
+        ("access-personal", 200, usage_body(10.0, 10.0)),
+    ]);
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Wuerde wechseln zu personal"));
+}
+
+#[test]
+fn quota_identity_separates_orgs_and_deduplicates_aliases_without_429() {
+    for same_org in [true, false] {
+        let harness = harness_with_two_accounts();
+        for (name, org) in [
+            ("work", "org-a"),
+            ("personal", if same_org { "org-a" } else { "org-b" }),
+        ] {
+            let path = harness.store.join(format!("accounts/{name}/profile.json"));
+            let mut profile: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).expect("profile")).expect("json");
+            profile["email"] = json!("SHARED@example.test");
+            profile["org_id"] = json!(org);
+            fs::write(path, serde_json::to_vec(&profile).expect("json")).expect("write");
+        }
+        let server = UsageServer::start(vec![
+            ("access-work", 200, usage_body(15.0, 20.0)),
+            ("access-personal", 200, usage_body(35.0, 40.0)),
+        ]);
+        for _ in 0..2 {
+            let output = harness
+                .command()
+                .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+                .args(["usage"])
+                .output()
+                .expect("usage");
+            assert_success(&output);
+        }
+        assert_eq!(
+            server.requests.load(std::sync::atomic::Ordering::SeqCst),
+            if same_org { 1 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn pending_job_confirmation_requires_later_same_account_measurement() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&[
+        "job",
+        "add",
+        "deferred",
+        "--cwd",
+        harness.home.to_str().expect("path"),
+    ]));
+    let path = harness.store.join("jobs/0001.json");
+    let mut job = harness.read_job("0001");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    job["pending_confirmation"] =
+        json!({"account":"v2:[\"work@example.test\",null]", "completed_at":now-60});
+    fs::write(&path, serde_json::to_vec(&job).expect("json")).expect("job");
+    write_cached_usage(&harness, "personal", 10.0, 10.0, 0);
+    write_cached_usage(&harness, "work", 10.0, 10.0, 120);
+    assert_success(&harness.run(&["jobs"]));
+    assert!(harness.read_job("0001")["pending_confirmation"].is_object());
+    write_cached_usage(&harness, "work", 10.0, 10.0, 0);
+    assert_success(&harness.run(&["jobs"]));
+    let job = harness.read_job("0001");
+    assert!(job["pending_confirmation"].is_null(), "{job}");
+    assert!(job["last_window"].is_string(), "{job}");
 }

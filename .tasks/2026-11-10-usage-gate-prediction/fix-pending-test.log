@@ -1,0 +1,10 @@
+cargo-remote: dieser Workspace lief zuletzt nur lokal sauber (test), bleibt 24 h lokal
+cargo-slot: ionos übernimmt diesen Job nicht, baue lokal
+cargo-slot: Build-Ordner /home/nathanael/.cache/rust-build/slots/b0ffc2fe8921eb06/1
+cargo-slot: Slot 2, optimiert=1, Release-Sperre=0, jobs=4
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 104 filtered out; finished in 0.03s
+
+cargo-slot: EXIT=0

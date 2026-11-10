@@ -185,7 +185,7 @@ function createUsageBucket(label, bucket, ageSeconds) {
   if (Number(bucket?.utilization) >= 90) fill.classList.add("hot");
   track.append(fill);
   wrap.append(heading, track, el("small", "muted", resetLabel(bucket?.resets_at)));
-  if (Number.isFinite(ageSeconds) && ageSeconds > 330) wrap.append(el("small", "stale", `Stand vor ${Math.max(1, Math.round(ageSeconds / 60))} Min.`));
+  if (Number.isFinite(ageSeconds) && ageSeconds > 600) wrap.append(el("small", "stale", `Stand vor ${Math.max(1, Math.round(ageSeconds / 60))} Min.`));
   return wrap;
 }
 

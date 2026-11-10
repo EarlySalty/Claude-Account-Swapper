@@ -1,0 +1,42 @@
+cargo-remote: dieser Workspace lief zuletzt nur lokal sauber (test), bleibt 24 h lokal
+cargo-slot: ionos übernimmt diesen Job nicht, baue lokal
+cargo-slot: Build-Ordner /home/nathanael/.cache/rust-build/slots/b0ffc2fe8921eb06/1
+cargo-slot: Slot 2, optimiert=1, Release-Sperre=0, jobs=4
+
+running 111 tests
+....................................................................................... 87/111
+........................
+test result: ok. 111 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 105 tests
+................................................................ 64/105
+pending_job_confirmation_requires_later_same_account_measurement --- FAILED
+........................................
+failures:
+
+---- pending_job_confirmation_requires_later_same_account_measurement stdout ----
+
+thread 'pending_job_confirmation_requires_later_same_account_measurement' (496392) panicked at tests/cli.rs:270:5:
+stdout: 
+stderr: error: unrecognized subcommand 'list'
+
+Usage: claude-account job <COMMAND>
+
+For more information, try '--help'.
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    pending_job_confirmation_requires_later_same_account_measurement
+
+test result: FAILED. 104 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.66s
+
+error: test failed, to rerun pass `--test cli`
+cargo-slot: EXIT=101

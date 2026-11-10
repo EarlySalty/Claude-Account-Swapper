@@ -76,6 +76,14 @@ pub struct Job {
     pub last_window: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_guard: Option<ContinuationGuard>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_confirmation: Option<PendingConfirmation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingConfirmation {
+    pub account: String,
+    pub completed_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,6 +118,7 @@ impl Job {
             last_status: None,
             last_window: None,
             continuation_guard: None,
+            pending_confirmation: None,
         }
     }
 
@@ -303,6 +312,11 @@ pub fn ping_readiness_within(
 pub fn readiness(job: &Job, usage: &Usage, threshold: f64, now: u64) -> Readiness {
     if !job.enabled {
         return Readiness::Waiting("Aufgabe ist abgeschaltet".to_owned());
+    }
+    if job.pending_confirmation.is_some() {
+        return Readiness::Waiting(
+            "Bestätigung des letzten Laufs wartet auf eine spätere Messung".to_owned(),
+        );
     }
     window_readiness(usage, threshold, job.last_window, job.last_run_at, now)
 }

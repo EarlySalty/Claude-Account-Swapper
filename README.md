@@ -206,7 +206,7 @@ Genau daraus folgt der Notfall: waeren alle Accounts ueber ihren eigenen Grenzen
 
 Der Endpunkt ist ratenbegrenzt und antwortet unter Last mit `429`. Ohne Gegenmassnahme faellt dann ausgerechnet der Account als Ziel aus, der bewertet werden muesste. Deshalb zwei Vorkehrungen:
 
-- Die API nimmt je Token nur etwa eine Anfrage alle zwei Minuten an. Der aktive Account wird deshalb alle zwei Minuten abgefragt, ruhende Accounts alle fuenf Minuten. Ein Stand, dessen Fuenf-Stunden-Reset schon vorbei ist, wird sofort neu geholt.
+- Der aktive Account wird frühestens alle drei Minuten abgefragt, ruhende Accounts alle zehn Minuten. Alle Verbraucher teilen eine persistierte Pause bei HTTP 429. Nach einem Reset wird eine neue Messung versucht, sobald die gemeinsame Pause es erlaubt.
 - Jede gelesene Auslastung wird gemerkt. Ein Stand innerhalb dieser Abstaende wird ohne neue Anfrage benutzt; scheitert eine Anfrage, traegt ein Stand bis zu 30 Minuten weiter. Sein Alter steht dann in jeder Zeile, die darauf beruht. Aeltere Zahlen gelten nur noch fuer einen ruhenden Account, den die API drosselt, und nur wenn kein Account mit frischen Zahlen frei ist. Fenster, deren Reset vorbei ist, zaehlen dabei als leer.
 
 Gemerkt werden nur Prozentwerte und Zeitpunkte, keine Zugangsdaten.
@@ -236,7 +236,7 @@ Das Fuenf-Stunden-Fenster beginnt nicht mit dem Reset, sondern mit der ersten An
 claude-account config --ping on
 ```
 
-Meldet die Auslastungs-Abfrage kein laufendes Fenster mehr — die Schnittstelle liefert dann `resets_at: null` bei 0 Prozent —, schickt der Dienst `Bist du da?` mit dem kleinsten Modell los und eroeffnet es damit. Solange ein Fenster laeuft, tut er nichts: hineinzufunken wuerde nur Kontingent kosten und nichts bewirken. Danach fragt er den Stand **ungecacht** erneut ab und protokolliert, bis wann das neue Fenster laeuft. Bleibt der Stand unveraendert, gilt der Ping als fehlgeschlagen und wird als Problem gemeldet: ein Ping, der nichts bewirkt, darf nicht wie Erfolg aussehen. Der naechste Versuch folgt fruehestens 15 Minuten spaeter.
+Meldet die Auslastungs-Abfrage kein laufendes Fenster mehr — die Schnittstelle liefert dann `resets_at: null` bei 0 Prozent —, schickt der Dienst `Bist du da?` mit dem kleinsten Modell los und eroeffnet es damit. Solange ein Fenster laeuft, tut er nichts: hineinzufunken wuerde nur Kontingent kosten und nichts bewirken. Die Bestätigung darf nur auf einer späteren zulässigen API-Messung beruhen. Ein gespeicherter Stand von vor dem Ping bestätigt kein neues Fenster. Der naechste Versuch folgt fruehestens 15 Minuten spaeter.
 
 Text und Modell sind aenderbar: `--ping-prompt`, `--ping-model`.
 
