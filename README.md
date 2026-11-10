@@ -178,6 +178,8 @@ Ist er eingeschaltet, prueft der Dienst jede Minute. Erreicht das Fuenf-Stunden-
 
 Ein Account, dessen Auslastung sich nicht abrufen laesst, wird als Ziel ausgeschlossen und mit Grund gemeldet: ein Wechsel auf gut Glueck kann im naechsten vollen Limit landen. Einzige Ausnahme ist ein ruhender Account, den die API drosselt: er zaehlt mit seinem letzten Stand, wenn kein Account mit frischen Zahlen frei ist. Schwelle aendern: `claude-account config --threshold 95`. Wieder abschalten: `claude-account config --auto-switch off`. Einzeln pruefen: `claude-account usage`, `claude-account auto --dry-run`.
 
+Die Reserve kann einen Wechsel vor der Schwelle auslösen: Bei 98 Prozent Grenze und 5 Prozentpunkten Reserve wird ab 93 Prozent ein sicheres Ziel gesucht, auch ohne Verlauf. Steigt der Verbrauch schnell, kann die Prognose früher wechseln. Die dreistündige Mindestverweildauer gilt nur für den Wochenausgleich. Der Schutz vor einem vollen Limit greift auch unmittelbar nach einem automatischen Wechsel. Manuelle Fixierungen behalten ihre bisherige Wirkung.
+
 #### Wochenkontingent gleichmaessig verbrauchen
 
 Standardmaessig an (`weekly_pacing` in der Konfiguration, im Webmenue unter Automatik). Fuer jeden Account rechnet der Dienst aus, wie viel Prozent pro Stunde bis zu seinem Wochen-Reset verbraucht werden muessten, damit nichts verfaellt. Der Account mit dem hoeheren Bedarf wird bevorzugt: beim vollen Limit als Ziel und vorausschauend, wenn sein Bedarf mindestens 15 Prozent ueber dem des aktiven liegt, sein 5h-Fenster noch Platz hat und der letzte Wechsel mindestens drei Stunden her ist. Der Wechsel bei 98 Prozent im 5h- oder Wochenfenster bleibt davon unberuehrt und greift sofort. Fuer die vorausschauende Pruefung werden nur die minuetlich geladenen Werte benutzt, keine zusaetzlichen Abfragen.
@@ -206,7 +208,7 @@ Genau daraus folgt der Notfall: waeren alle Accounts ueber ihren eigenen Grenzen
 
 Der Endpunkt ist ratenbegrenzt und antwortet unter Last mit `429`. Ohne Gegenmassnahme faellt dann ausgerechnet der Account als Ziel aus, der bewertet werden muesste. Deshalb zwei Vorkehrungen:
 
-- Die API nimmt je Token nur etwa eine Anfrage alle zwei Minuten an. Der aktive Account wird deshalb alle zwei Minuten abgefragt, ruhende Accounts alle fuenf Minuten. Ein Stand, dessen Fuenf-Stunden-Reset schon vorbei ist, wird sofort neu geholt.
+- Der aktive Account wird frühestens alle drei Minuten abgefragt, ruhende Accounts alle zehn Minuten. Alle Verbraucher teilen eine persistierte Pause bei HTTP 429. Nach einem Reset wird eine neue Messung versucht, sobald die gemeinsame Pause es erlaubt.
 - Jede gelesene Auslastung wird gemerkt. Ein Stand innerhalb dieser Abstaende wird ohne neue Anfrage benutzt; scheitert eine Anfrage, traegt ein Stand bis zu 30 Minuten weiter. Sein Alter steht dann in jeder Zeile, die darauf beruht. Aeltere Zahlen gelten nur noch fuer einen ruhenden Account, den die API drosselt, und nur wenn kein Account mit frischen Zahlen frei ist. Fenster, deren Reset vorbei ist, zaehlen dabei als leer.
 
 Gemerkt werden nur Prozentwerte und Zeitpunkte, keine Zugangsdaten.
@@ -236,7 +238,7 @@ Das Fuenf-Stunden-Fenster beginnt nicht mit dem Reset, sondern mit der ersten An
 claude-account config --ping on
 ```
 
-Meldet die Auslastungs-Abfrage kein laufendes Fenster mehr — die Schnittstelle liefert dann `resets_at: null` bei 0 Prozent —, schickt der Dienst `Bist du da?` mit dem kleinsten Modell los und eroeffnet es damit. Solange ein Fenster laeuft, tut er nichts: hineinzufunken wuerde nur Kontingent kosten und nichts bewirken. Danach fragt er den Stand **ungecacht** erneut ab und protokolliert, bis wann das neue Fenster laeuft. Bleibt der Stand unveraendert, gilt der Ping als fehlgeschlagen und wird als Problem gemeldet: ein Ping, der nichts bewirkt, darf nicht wie Erfolg aussehen. Der naechste Versuch folgt fruehestens 15 Minuten spaeter.
+Meldet die Auslastungs-Abfrage kein laufendes Fenster mehr — die Schnittstelle liefert dann `resets_at: null` bei 0 Prozent —, schickt der Dienst `Bist du da?` mit dem kleinsten Modell los und eroeffnet es damit. Solange ein Fenster laeuft, tut er nichts: hineinzufunken wuerde nur Kontingent kosten und nichts bewirken. Die Bestätigung darf nur auf einer späteren zulässigen API-Messung beruhen. Ein gespeicherter Stand von vor dem Ping bestätigt kein neues Fenster. Der naechste Versuch folgt fruehestens 15 Minuten spaeter.
 
 Text und Modell sind aenderbar: `--ping-prompt`, `--ping-model`.
 

@@ -175,7 +175,7 @@ function switchProfile(name, skipCheck = false) {
   run("api/accounts/switch", { name, skipCheck });
 }
 
-function createUsageBucket(label, bucket, ageSeconds) {
+function createUsageBucket(label, bucket, ageSeconds, staleAfterSeconds = 600) {
   const wrap = el("div", "usage-block");
   const heading = el("div", "usage-heading");
   heading.append(el("span", "", label), el("strong", "", percent(bucket?.utilization)));
@@ -185,7 +185,7 @@ function createUsageBucket(label, bucket, ageSeconds) {
   if (Number(bucket?.utilization) >= 90) fill.classList.add("hot");
   track.append(fill);
   wrap.append(heading, track, el("small", "muted", resetLabel(bucket?.resets_at)));
-  if (Number.isFinite(ageSeconds) && ageSeconds > 330) wrap.append(el("small", "stale", `Stand vor ${Math.max(1, Math.round(ageSeconds / 60))} Min.`));
+  if (Number.isFinite(ageSeconds) && ageSeconds > staleAfterSeconds) wrap.append(el("small", "stale", `Stand vor ${Math.max(1, Math.round(ageSeconds / 60))} Min.`));
   return wrap;
 }
 
@@ -202,8 +202,8 @@ function profileCard(profile) {
   const usage = profile.usage?.windows;
   const usageGrid = el("div", "usage-grid");
   if (usage) {
-    usageGrid.append(createUsageBucket("5-Stunden-Fenster", usage.five_hour, profile.usage.ageSeconds));
-    usageGrid.append(createUsageBucket("Wochenfenster", usage.seven_day, profile.usage.ageSeconds));
+    usageGrid.append(createUsageBucket("5-Stunden-Fenster", usage.five_hour, profile.usage.ageSeconds, profile.usage.staleAfterSeconds));
+    usageGrid.append(createUsageBucket("Wochenfenster", usage.seven_day, profile.usage.ageSeconds, profile.usage.staleAfterSeconds));
   } else {
     usageGrid.append(el("p", "usage-error", profile.usageError || "Auslastung noch nicht verfügbar. Aktualisieren lädt den Stand neu."));
   }
