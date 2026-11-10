@@ -178,6 +178,8 @@ Ist er eingeschaltet, prueft der Dienst jede Minute. Erreicht das Fuenf-Stunden-
 
 Ein Account, dessen Auslastung sich nicht abrufen laesst, wird als Ziel ausgeschlossen und mit Grund gemeldet: ein Wechsel auf gut Glueck kann im naechsten vollen Limit landen. Einzige Ausnahme ist ein ruhender Account, den die API drosselt: er zaehlt mit seinem letzten Stand, wenn kein Account mit frischen Zahlen frei ist. Schwelle aendern: `claude-account config --threshold 95`. Wieder abschalten: `claude-account config --auto-switch off`. Einzeln pruefen: `claude-account usage`, `claude-account auto --dry-run`.
 
+Die Reserve kann einen Wechsel vor der Schwelle auslösen: Bei 98 Prozent Grenze und 5 Prozentpunkten Reserve wird ab 93 Prozent ein sicheres Ziel gesucht, auch ohne Verlauf. Die Mindestverweildauer und manuelle Fixierungen gelten weiter.
+
 #### Wochenkontingent gleichmaessig verbrauchen
 
 Standardmaessig an (`weekly_pacing` in der Konfiguration, im Webmenue unter Automatik). Fuer jeden Account rechnet der Dienst aus, wie viel Prozent pro Stunde bis zu seinem Wochen-Reset verbraucht werden muessten, damit nichts verfaellt. Der Account mit dem hoeheren Bedarf wird bevorzugt: beim vollen Limit als Ziel und vorausschauend, wenn sein Bedarf mindestens 15 Prozent ueber dem des aktiven liegt, sein 5h-Fenster noch Platz hat und der letzte Wechsel mindestens drei Stunden her ist. Der Wechsel bei 98 Prozent im 5h- oder Wochenfenster bleibt davon unberuehrt und greift sofort. Fuer die vorausschauende Pruefung werden nur die minuetlich geladenen Werte benutzt, keine zusaetzlichen Abfragen.

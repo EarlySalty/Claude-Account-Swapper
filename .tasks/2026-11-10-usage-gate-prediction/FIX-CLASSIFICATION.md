@@ -6,3 +6,5 @@ Warum unbemerkt: Existing recovery assertions were reversed; prediction tests co
 Geschwister: Ranking, organization identity, delayed job confirmation, idle ping, age readers and docs require coordinated repair.
 
 Locked groups: reactive recovery regression; cold prediction/ranking untested; organization identity and retry bounds spec; confirmation/idle ping instance; age readers/docs instance; future timestamps and malformed optional prediction untested. Wrapper findings map to their source unit. Original commit labels require parent history resolution. Reserve at threshold minus five is intentional.
+
+Second gate: alias siblings and unsettled projection are instance; pending exit, writer coordination and execution status are regression; active web age is instance. Ping pending state is now persisted and resolved by subsequent permitted measurements.

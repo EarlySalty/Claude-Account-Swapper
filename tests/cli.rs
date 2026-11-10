@@ -2362,6 +2362,8 @@ fn a_throttled_target_counts_with_its_old_usage_and_expired_windows_are_free() {
         stdout.contains("Wuerde wechseln zu personal"),
         "stale reset target must remain available: {stdout}"
     );
+    assert!(stdout.contains("5h 0%"), "{stdout}");
+    assert!(stdout.contains("Stand von vor 600 min"), "{stdout}");
 }
 
 #[test]
@@ -3518,4 +3520,70 @@ fn pending_job_confirmation_requires_later_same_account_measurement() {
     let job = harness.read_job("0001");
     assert!(job["pending_confirmation"].is_null(), "{job}");
     assert!(job["last_window"].is_string(), "{job}");
+}
+
+#[test]
+fn later_permitted_measurement_confirms_or_rejects_a_pending_ping() {
+    for opens_window in [true, false] {
+        let harness = harness_with_two_accounts();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        fs::write(
+            harness.store.join("ping.json"),
+            serde_json::to_vec(
+                &json!({"pending_confirmations":{"v2:[\"work@example.test\",null]":now-60}}),
+            )
+            .expect("json"),
+        )
+        .expect("ping state");
+        let body = if opens_window {
+            usage_body(10.0, 20.0)
+        } else {
+            json!({"five_hour":{"utilization":0.0,"resets_at":null},"seven_day":{"utilization":20.0,"resets_at":null}}).to_string()
+        };
+        let server = UsageServer::start(vec![
+            ("access-work", 200, body),
+            ("access-personal", 200, usage_body(10.0, 20.0)),
+        ]);
+        let mut child = harness
+            .command_recording()
+            .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+            .args(["watch", "--interval", "1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("watch");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        child.kill().expect("stop");
+        let output = child.wait_with_output().expect("output");
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            log.contains(if opens_window {
+                "Fenster laeuft jetzt bis"
+            } else {
+                "die API meldet weiterhin kein laufendes Fenster"
+            }),
+            "{log}"
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(harness.store.join("ping.json")).expect("state"))
+                .expect("json");
+        assert!(
+            state["pending_confirmations"].is_null()
+                || state["pending_confirmations"]
+                    .as_object()
+                    .is_some_and(|map| map.is_empty()),
+            "{state}"
+        );
+        assert!(
+            harness.recorded_calls().is_empty(),
+            "confirmation must not send a model request"
+        );
+    }
 }
