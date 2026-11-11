@@ -1171,10 +1171,21 @@ impl App {
     fn blocked_now(&self) -> Result<bool> {
         self.check_config_file()?;
         let config = self.load_config();
-        let levels = self.cached_levels()?;
-        Ok(still_blocked(&config, &levels, || {
+        let active = if config.auto_switch {
+            match self.load_state() {
+                Ok(state) => state.current,
+                Err(error) => {
+                    log_problem(&format!(
+                        "Gespeicherte Kontowahl nicht verfügbar: {error:#}; Quoten werden ohne Auswahlhinweis geprüft"
+                    ));
+                    None
+                }
+            }
+        } else {
             self.active_profile_name_memoized(None)
-        }))
+        };
+        let levels = self.cached_levels_for(active.as_deref())?;
+        Ok(still_blocked(&config, &levels, || active))
     }
 
     pub(crate) fn t3_client(&self, limit: &LimitCompact) -> t3::Client {
@@ -1197,12 +1208,15 @@ impl App {
     }
 
     fn cached_levels(&self) -> Result<Vec<Level>> {
-        let now = unix_timestamp()?;
         let active = self.active_profile_name_memoized(None);
+        self.cached_levels_for(active.as_deref())
+    }
+
+    fn cached_levels_for(&self, active: Option<&str>) -> Result<Vec<Level>> {
         let mut profiles = self.load_profiles()?;
-        profiles.sort_by_key(|profile| active.as_deref() != Some(profile.name.as_str()));
+        profiles.sort_by_key(|profile| active != Some(profile.name.as_str()));
         let mut identities = HashSet::new();
-        Ok(self.deduplicated_levels(profiles, &mut identities, now))
+        Ok(self.deduplicated_levels(profiles, &mut identities, unix_timestamp()?))
     }
 
     fn deduplicated_levels(
@@ -1218,8 +1232,7 @@ impl App {
                 let candidate = self
                     .read_cached_usage(&profile.name)
                     .filter(|cached| {
-                        cached.fetched_at <= now
-                            && now - cached.fetched_at <= crate::USAGE_CACHE_MAX_AGE_SECONDS
+                        now.saturating_sub(cached.fetched_at) <= crate::USAGE_CACHE_MAX_AGE_SECONDS
                     })
                     .map(|cached| Candidate {
                         name: profile.name.clone(),
@@ -1926,8 +1939,8 @@ mod tests {
             .expect("profile")
         };
         let profiles = vec![
-            profile("active", "org-a", 70.0),
-            profile("alias", "org-a", 98.0),
+            profile("b-active", "org-a", 70.0),
+            profile("a-alias", "org-a", 98.0),
             profile("other-org", "org-b", 98.0),
         ];
         let now = crate::unix_timestamp().expect("time");
@@ -1952,18 +1965,76 @@ mod tests {
                 now,
             );
         }
-        let levels = app.deduplicated_levels(profiles, &mut std::collections::HashSet::new(), now);
+        let reset = Some(chrono::Utc::now() + chrono::Duration::hours(2));
+        for (at, utilization) in [(now - 600, 65.0), (now, 75.0)] {
+            app.write_cached_usage(
+                "a-alias",
+                crate::usage::Usage {
+                    five_hour: crate::usage::Bucket {
+                        utilization,
+                        resets_at: reset,
+                    },
+                    seven_day: crate::usage::Bucket {
+                        utilization: 20.0,
+                        resets_at: None,
+                    },
+                },
+                at,
+            );
+        }
+        let levels = app.cached_levels_for(Some("b-active")).expect("levels");
         assert_eq!(levels.len(), 2);
-        assert_eq!(levels[0].0, "active");
+        assert_eq!(levels[0].0, "b-active");
         assert_eq!(levels[1].0, "other-org");
         assert_eq!(
             levels[0].1.as_ref().expect("active quota").stops.five_hour,
             Some(70.0)
         );
         assert!(
-            super::switch_target(&crate::config::Config::default(), &levels, Some("active"))
+            super::switch_target(&crate::config::Config::default(), &levels, Some("b-active"))
                 .is_none()
         );
+        assert_eq!(app.pool_burn(&levels, now), Some(1.0));
+        let earlier_clock = app.deduplicated_levels(
+            app.load_profiles().expect("profiles"),
+            &mut std::collections::HashSet::new(),
+            now - 1,
+        );
+        assert!(
+            earlier_clock
+                .iter()
+                .all(|(_, candidate)| candidate.is_some())
+        );
+        std::fs::remove_file(app.usage_history_path("b-active").expect("history path"))
+            .expect("remove temporary canonical history");
+        std::fs::write(
+            app.profile_dir("a-alias").join("usage-history.json"),
+            serde_json::to_vec(&vec![
+                crate::forecast::Sample {
+                    at: now - 600,
+                    five_hour: 65.0,
+                },
+                crate::forecast::Sample {
+                    at: now,
+                    five_hour: 75.0,
+                },
+            ])
+            .expect("legacy samples"),
+        )
+        .expect("legacy history");
+        assert_eq!(app.pool_burn(&levels, now), Some(1.0));
+        app.update_config(|config| {
+            config.auto_switch = true;
+            config.limit_compact.enabled = true;
+        })
+        .expect("config");
+        app.write_state(&crate::State {
+            current: Some("b-active".to_owned()),
+        })
+        .expect("state");
+        assert!(!app.blocked_now().expect("hook check without auth binary"));
+        std::fs::write(app.state_path(), b"{").expect("broken optional selection hint");
+        assert!(!app.blocked_now().expect("hook check without optional hint"));
     }
     use super::*;
 

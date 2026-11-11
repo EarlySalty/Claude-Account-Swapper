@@ -98,7 +98,7 @@ Ohne Argument öffnet `claude-account` dasselbe Hauptmenü wie der Desktop-Start
 | `claude-account watch` | Macht dasselbe dauerhaft und frischt untaetige Profile auf; laeuft als Hintergrunddienst. `--interval <sekunden>`, Standard 5. `--auto-switch` schaltet den Wechsel bei vollem Limit einmalig ein, solange die Einstellungen den Auto-Wechsel nicht selbst festlegen (`--auto-switch-threshold <prozent>` setzt dabei die Schwelle); danach gelten allein die Einstellungen. |
 | `claude-account keepalive` | Benutzt untaetige Profile, damit ihr Login nicht abläuft. `--max-age-days <tage>`, Standard 7. |
 | `claude-account config` | Zeigt die Einstellungen der Automatik. Aendern: `--auto-switch on\|off`, `--ping on\|off`, `--ping-prompt <text>`, `--ping-model <name>`, `--threshold <prozent>`. |
-| `claude-account ping` | Eroeffnet das Fuenf-Stunden-Fenster sofort mit einer kurzen Nachricht. |
+| `claude-account ping` | Sendet eine kurze Nachricht, um ein noch ungenutztes Fünf-Stunden-Fenster zu öffnen. Solange die Bestätigung eines früheren Pings aussteht, wird kein weiterer gesendet. Diese Sperre endet spätestens nach fünf Stunden. |
 | `claude-account jobs` | Zeigt die Aufgaben, die auf ein freies Fenster warten. |
 | `claude-account job add "<auftrag>"` | Legt einen Auftrag an. `--cwd <pfad>` (Standard: aktuelles Verzeichnis), `--repeat` fuer jedes neue Fenster, `--model`, `--settings`, `--allow-permissions`. |
 | `claude-account job resume <sitzungs-id>` | Setzt eine fruehere Sitzung fort, sobald wieder Kontingent da ist. `--prompt <text>`, `--cwd <pfad>`. |
@@ -182,7 +182,7 @@ Die Reserve kann einen Wechsel vor der Schwelle auslösen: Bei 98 Prozent Grenze
 
 #### Wochenkontingent gleichmaessig verbrauchen
 
-Standardmaessig an (`weekly_pacing` in der Konfiguration, im Webmenue unter Automatik). Fuer jeden Account rechnet der Dienst aus, wie viel Prozent pro Stunde bis zu seinem Wochen-Reset verbraucht werden muessten, damit nichts verfaellt. Der Account mit dem hoeheren Bedarf wird bevorzugt: beim vollen Limit als Ziel und vorausschauend, wenn sein Bedarf mindestens 15 Prozent ueber dem des aktiven liegt, sein 5h-Fenster noch Platz hat und der letzte Wechsel mindestens drei Stunden her ist. Der Wechsel bei 98 Prozent im 5h- oder Wochenfenster bleibt davon unberuehrt und greift sofort. Fuer die vorausschauende Pruefung werden nur die minuetlich geladenen Werte benutzt, keine zusaetzlichen Abfragen.
+Standardmäßig an (`weekly_pacing` in der Konfiguration, im Webmenü unter Automatik). Der Dienst berechnet für jeden Account, wie viel Wochenkontingent pro Stunde bis zum Reset verbraucht werden müsste. Er bevorzugt den höheren Bedarf. Ein vorausschauender Wochenausgleich setzt mindestens 15 Prozent mehr Bedarf als beim aktiven Account, mindestens zehn Prozentpunkte Platz im Fünf-Stunden-Fenster und drei Stunden seit dem letzten Wechsel voraus. Das Ziel muss außerdem in beiden Fenstern unter seiner Grenze abzüglich der doppelten Sicherheitsreserve liegen. Bei der Standardreserve von fünf Prozentpunkten sind das zehn Punkte Abstand. Der Schutz vor einem vollen Limit greift unabhängig von der dreistündigen Wartezeit. Der Wochenausgleich verwendet die vorhandenen Messungen und löst keine zusätzlichen Abfragen aus.
 
 #### Eigene Grenzen pro Account
 
@@ -258,7 +258,7 @@ Für Aufgaben gelten folgende Regeln:
 
 - Beide Fenster muessen unter der Schwelle liegen.
 - Das Fünf-Stunden-Fenster muss ein anderes sein als beim letzten Lauf. Beim Anlegen merkt sich die Aufgabe das gerade laufende Fenster und startet im nächsten. Läuft gerade keines, startet sie sofort.
-- Zwischen zwei Läufen liegen mindestens 15 Minuten. Nach einem Lauf wartet die Aufgabe zusätzlich auf eine spätere Messung desselben Kontos, die noch zum ursprünglichen Fenster gehört. Ohne diese Bestätigung bleibt sie höchstens fünf Stunden gesperrt. Ein ungenutztes Fenster hebt die zusätzliche Sperre auf; der Abstand von 15 Minuten gilt weiter. Messungen eines später eröffneten Fensters werden nicht dem alten Lauf zugerechnet.
+- Zwischen zwei Läufen liegen mindestens 15 Minuten. Wenn das Konto beim Lauf zugeordnet werden konnte, wartet die Aufgabe zusätzlich auf eine spätere gültige Messung desselben Kontos. Jede solche Messung beendet die zusätzliche Sperre, auch bei einem ungenutzten oder später eröffneten Fenster. Nur ein Reset, der zum ursprünglichen Fünf-Stunden-Fenster passen kann, wird dem alten Lauf zugerechnet. Ohne spätere Messung endet die Sperre spätestens nach fünf Stunden. War die Kontozuordnung beim Lauf unbekannt, gilt nur der Abstand von 15 Minuten.
 
 Es laeuft immer nur eine Aufgabe gleichzeitig, und zwar in einem eigenen Faden — der Dienst sichert waehrenddessen weiter rotierte Tokens. Eine einmalige Aufgabe ist nach einem **erfolgreichen** Lauf erledigt; scheitert sie, bleibt sie mit der Begruendung stehen. Fehlt ihr Arbeitsverzeichnis, wird sie abgeschaltet statt blind gestartet.
 

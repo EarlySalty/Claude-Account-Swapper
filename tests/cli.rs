@@ -3693,12 +3693,17 @@ fn pending_pings_block_active_and_idle_model_requests() {
     std::thread::sleep(std::time::Duration::from_millis(1200));
     child.kill().expect("stop");
     let output = child.wait_with_output().expect("output");
-    assert!(
-        !args.exists(),
+    let log = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        log.contains("Bestätigung des letzten Pings steht aus")
+            && log.contains("Fenster-Ping wartet auf Bestätigung"),
+        "{log}"
+    );
+    assert!(!args.exists(), "{log}");
 }
 
 #[test]

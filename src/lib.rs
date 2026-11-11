@@ -1902,19 +1902,12 @@ impl App {
     }
 
     fn target_has_reserve(&self, profile: &Profile, measured: &Usage, threshold: f64) -> bool {
-        let reserve = prediction_setting("CLAUDE_ACCOUNT_SWITCHER_USAGE_RESERVE", 5.0, 50.0);
-        let lead = prediction_setting("CLAUDE_ACCOUNT_SWITCHER_SWITCH_LEAD_SECONDS", 60.0, 3600.0);
+        let (reserve, horizon) = prediction_settings();
         let projected = self
             .gate_path(profile)
             .and_then(|path| self.read_gate(&path))
             .ok()
-            .and_then(|gate| {
-                projected_usage(
-                    &gate,
-                    unix_timestamp().ok()?,
-                    USAGE_REFRESH_ACTIVE_SECONDS as f64 + lead,
-                )
-            })
+            .and_then(|gate| projected_usage(&gate, unix_timestamp().ok()?, horizon))
             .unwrap_or([
                 measured.five_hour.utilization,
                 measured.seven_day.utilization,
@@ -1933,12 +1926,10 @@ impl App {
     ) -> Result<Option<Decision>> {
         let now = unix_timestamp()?;
         let gate = self.read_gate(&self.gate_path(active)?)?;
-        let reserve = prediction_setting("CLAUDE_ACCOUNT_SWITCHER_USAGE_RESERVE", 5.0, 50.0);
-        let lead = prediction_setting("CLAUDE_ACCOUNT_SWITCHER_SWITCH_LEAD_SECONDS", 60.0, 3600.0);
+        let (reserve, horizon) = prediction_settings();
         let Some(current) = gate.cached else {
             return Ok(None);
         };
-        let horizon = USAGE_REFRESH_ACTIVE_SECONDS as f64 + lead;
         if current.fetched_at > now || now - current.fetched_at > 1200 {
             return Ok(None);
         }
@@ -2343,15 +2334,44 @@ impl App {
                     .is_some_and(|active| !same_usage_identity(&active, profile)))
     }
 
-    fn usage_history_path(&self, name: &str) -> PathBuf {
-        self.profile_dir(name).join("usage-history.json")
+    fn usage_history_path(&self, name: &str) -> Result<PathBuf> {
+        let profile = self.load_profile(name)?;
+        Ok(self.gate_path(&profile)?.with_extension("history.json"))
     }
 
     pub(crate) fn usage_history(&self, name: &str) -> Vec<forecast::Sample> {
-        fs::read(self.usage_history_path(name))
+        if let Some(history) = self
+            .usage_history_path(name)
             .ok()
+            .and_then(|path| fs::read(path).ok())
             .and_then(|data| serde_json::from_slice(&data).ok())
+        {
+            return history;
+        }
+        let Ok(profile) = self.load_profile(name) else {
+            return Vec::new();
+        };
+        let mut legacy: Vec<forecast::Sample> = self
+            .load_profiles()
             .unwrap_or_default()
+            .iter()
+            .filter(|alias| same_usage_identity(alias, &profile))
+            .filter_map(|alias| {
+                fs::read(self.profile_dir(&alias.name).join("usage-history.json")).ok()
+            })
+            .filter_map(|data| serde_json::from_slice::<Vec<forecast::Sample>>(&data).ok())
+            .flatten()
+            .collect();
+        legacy.sort_by(|left, right| {
+            left.at
+                .cmp(&right.at)
+                .then_with(|| left.five_hour.total_cmp(&right.five_hour))
+        });
+        let mut history = Vec::new();
+        for sample in legacy {
+            forecast::record(&mut history, sample);
+        }
+        history
     }
 
     fn remember_usage_sample(&self, name: &str, usage: &Usage, fetched_at: u64) -> Result<()> {
@@ -2364,7 +2384,7 @@ impl App {
             },
         );
         atomic_write(
-            &self.usage_history_path(name),
+            &self.usage_history_path(name)?,
             &serde_json::to_vec(&history)?,
             0o600,
         )
@@ -3335,12 +3355,17 @@ impl App {
         self.subagent_compact_tick(spoken);
         self.idle_compact_tick(spoken);
         switched?;
-        if config.ping.enabled
-            && let Err(error) = self.ping_idle_profiles(config, spoken)
-        {
-            log_problem(&format!(
-                "Fenster-Ping fuer ruhende Accounts fehlgeschlagen: {error:#}"
-            ));
+        if config.ping.enabled {
+            match self.ping_idle_profiles(config, spoken) {
+                Ok(()) => {
+                    spoken.remove("ping-idle-error");
+                }
+                Err(error) => log_once(
+                    spoken,
+                    "ping-idle-error",
+                    &format!("Fenster-Ping für ruhende Accounts fehlgeschlagen: {error:#}"),
+                ),
+            }
         }
         if self.limit_pause_holds() {
             log_once(
@@ -4715,6 +4740,12 @@ fn prediction_setting(name: &str, fallback: f64, max: f64) -> f64 {
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0 && *v <= max)
         .unwrap_or(fallback)
+}
+
+fn prediction_settings() -> (f64, f64) {
+    let reserve = prediction_setting("CLAUDE_ACCOUNT_SWITCHER_USAGE_RESERVE", 5.0, 50.0);
+    let lead = prediction_setting("CLAUDE_ACCOUNT_SWITCHER_SWITCH_LEAD_SECONDS", 60.0, 3600.0);
+    (reserve, USAGE_REFRESH_ACTIVE_SECONDS as f64 + lead)
 }
 
 fn projected_usage(gate: &UsageGate, now: u64, horizon: f64) -> Option<[f64; 2]> {
