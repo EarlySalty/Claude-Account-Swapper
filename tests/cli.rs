@@ -3731,3 +3731,52 @@ fn broken_ping_bookkeeping_does_not_stop_quota_switching() {
         "{log}"
     );
 }
+
+#[test]
+fn expired_subscription_discards_old_quota_and_recovers_to_another_account() {
+    let harness = harness_with_two_accounts();
+    write_cached_usage(&harness, "work", 0.0, 11.0, 1060 * 60);
+    let profiles = UsageServer::start(vec![
+        ("access-work", 200, json!({"account":{"email":"work@example.test","has_claude_max":false,"has_claude_pro":false},"organization":{"organization_type":"claude_free"}}).to_string()),
+        ("access-personal", 200, json!({"account":{"email":"personal@example.test","has_claude_max":false,"has_claude_pro":true},"organization":{"organization_type":"claude_pro","subscription_status":"active"}}).to_string()),
+    ]);
+    let usage = UsageServer::start(vec![("access-personal", 200, usage_body(10.0, 20.0))]);
+    for _ in 0..2 {
+        let output = harness
+            .command()
+            .env("CLAUDE_ACCOUNT_SWITCHER_PROFILE_URL", &profiles.url)
+            .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &usage.url)
+            .args(["usage"])
+            .output()
+            .expect("usage");
+        assert_success(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Kein aktives Claude-Abo"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    let listed = harness.run(&["list"]);
+    assert_success(&listed);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("[Kein aktives Abo]"));
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_PROFILE_URL", &profiles.url)
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &usage.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Wuerde wechseln zu personal"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        profiles.requests.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(usage.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let checked = harness.run(&["switch", "work"]);
+    assert!(!checked.status.success());
+}

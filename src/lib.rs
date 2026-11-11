@@ -64,7 +64,29 @@ struct UsageGate {
     previous: Option<CachedUsage>,
     until: u64,
     failures: u32,
+    subscription: Option<SubscriptionCheck>,
+    subscription_retry_at: u64,
 }
+
+#[derive(Serialize, Deserialize)]
+struct SubscriptionCheck {
+    value: usage::Subscription,
+    checked_at: u64,
+}
+
+#[derive(Debug)]
+struct SubscriptionInactive;
+
+impl std::fmt::Display for SubscriptionInactive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Kein aktives Claude-Abo; alte Auslastung wird nicht verwendet"
+        )
+    }
+}
+
+impl std::error::Error for SubscriptionInactive {}
 
 #[derive(Debug)]
 struct UsageThrottled {
@@ -579,6 +601,9 @@ impl App {
         let _lock = self.lock()?;
 
         let target = self.load_profile(name)?;
+        if check && self.subscription_inactive(&target) {
+            return Err(SubscriptionInactive.into());
+        }
         let mut target_credentials = read_valid_credentials(&self.profile_credentials(name))
             .with_context(|| {
                 format!("gespeicherte Credentials fuer Profil `{name}` sind ungueltig")
@@ -675,11 +700,7 @@ impl App {
             } else {
                 " "
             };
-            let plan = profile
-                .subscription_type
-                .as_deref()
-                .map(|value| format!(" [{value}]"))
-                .unwrap_or_default();
+            let plan = format!(" [{}]", self.subscription_label(&profile));
             println!(
                 "{marker} {} - {}{plan}{}",
                 profile.name,
@@ -772,7 +793,10 @@ impl App {
             .as_deref()
             .or(profile_email.as_deref())
             .unwrap_or("von Claude noch nicht geladen");
-        let plan = status.subscription_type.as_deref().unwrap_or("unbekannt");
+        let plan = self
+            .load_profile(&profile_name)
+            .map(|profile| self.subscription_label(&profile))
+            .unwrap_or_else(|_| "Abo ungeprüft".to_owned());
         println!("Aktiver Account: {email}");
         println!("Profil: {profile_name}");
         println!("Abo: {plan}");
@@ -802,7 +826,10 @@ impl App {
         let profiles = profiles
             .iter()
             .map(|profile| {
-                let cached = self.read_cached_usage(&profile.name);
+                let inactive = self.subscription_inactive(profile);
+                let cached = self.read_cached_usage(&profile.name).filter(|cached| {
+                    now.saturating_sub(cached.fetched_at) <= USAGE_CACHE_MAX_AGE_SECONDS
+                });
                 let usage = cached.map(|cached| {
                     serde_json::json!({
                         "windows": cached.usage,
@@ -811,15 +838,17 @@ impl App {
                         "staleAfterSeconds": (if active_profile.as_deref().and_then(|name| self.load_profile(name).ok()).is_some_and(|active| same_usage_identity(&active, profile)) { USAGE_REFRESH_ACTIVE_SECONDS } else { USAGE_REFRESH_IDLE_SECONDS }) + USAGE_CHECK_INTERVAL_SECONDS + DEFAULT_WATCH_INTERVAL_SECONDS,
                     })
                 });
-                let usage_error = usage
-                    .is_none()
-                    .then_some("Noch keine Auslastung geladen".to_owned());
+                let usage_error = usage.is_none().then(|| {
+                    if inactive { SubscriptionInactive.to_string() } else { "Keine aktuelle Auslastung verfügbar".to_owned() }
+                });
 
                 serde_json::json!({
                     "name": profile.name,
                     "email": profile.email,
                     "organization": profile.org_name,
-                    "subscriptionType": profile.subscription_type,
+                    "subscriptionType": self.subscription_label(profile),
+                    "subscriptionInactive": inactive,
+                    "subscriptionCheckedAt": self.gate_path(profile).and_then(|path| self.read_gate(&path)).ok().and_then(|gate| gate.subscription).map(|check| check.checked_at),
                     "savedAt": profile.saved_at,
                     "syncedAt": profile.credentials_synced_at,
                     "loginFailedAt": profile.login_failed_at,
@@ -1792,6 +1821,18 @@ impl App {
         let pacing = self.load_config().weekly_pacing.then(chrono::Utc::now);
         let mut usages = Vec::new();
         let candidate = self.candidate(active_profile, renew);
+        if self.subscription_inactive(active_profile) {
+            let available: Vec<_> = profiles
+                .iter()
+                .filter(|profile| !same_usage_identity(profile, active_profile))
+                .filter_map(|profile| self.candidate(profile, renew))
+                .collect();
+            let decision = match usage::reactive_target(&active, &available, threshold, pacing) {
+                Some(target) => Decision::SwitchTo { name: target.name.clone(), reason: "Aktiver Account hat kein aktives Abo; Wechsel auf einen verfügbaren Account".to_owned() },
+                None => Decision::NoCandidate { reason: "Aktiver Account hat kein aktives Abo und kein anderer Account ist verfügbar".to_owned() },
+            };
+            return self.apply_decision(decision, dry_run);
+        }
         if let Some(reason) = self.manual_pin_stay(&active, candidate.as_ref(), threshold) {
             return self.apply_decision(Decision::Stay { reason }, dry_run);
         }
@@ -2133,6 +2174,9 @@ impl App {
                 Ok((usage, age))
             }
             Err(error) => {
+                if error.downcast_ref::<SubscriptionInactive>().is_some() {
+                    return Err(error);
+                }
                 let throttled = error.downcast_ref::<UsageThrottled>().is_some();
                 let rate_limited =
                     throttled || error.downcast_ref::<usage::RateLimited>().is_some();
@@ -2165,6 +2209,9 @@ impl App {
     /// Ein unlesbarer oder veralteter Cache ist kein Fehler, sondern nur kein Cache.
     fn read_cached_usage(&self, name: &str) -> Option<CachedUsage> {
         let profile = self.load_profile(name).ok()?;
+        if self.subscription_inactive(&profile) {
+            return None;
+        }
         self.read_gate(&self.gate_path(&profile).ok()?)
             .ok()
             .and_then(|gate| gate.cached)
@@ -2185,6 +2232,89 @@ impl App {
             "usage-gate-{:x}.json",
             Sha256::digest(identity.as_bytes())
         )))
+    }
+
+    fn subscription_inactive(&self, profile: &Profile) -> bool {
+        self.gate_path(profile)
+            .and_then(|path| self.read_gate(&path))
+            .ok()
+            .and_then(|gate| gate.subscription)
+            .is_some_and(|check| {
+                unix_timestamp().is_ok_and(|now| check.checked_at <= now) && !check.value.active
+            })
+    }
+
+    fn subscription_label(&self, profile: &Profile) -> String {
+        let check = self
+            .gate_path(profile)
+            .and_then(|path| self.read_gate(&path))
+            .ok()
+            .and_then(|gate| gate.subscription);
+        match check {
+            Some(check)
+                if unix_timestamp().is_ok_and(|now| {
+                    check.checked_at <= now
+                        && (!check.value.active || now - check.checked_at <= 3600)
+                }) =>
+            {
+                if check.value.active {
+                    check
+                        .value
+                        .plan
+                        .unwrap_or_else(|| "Abo bestätigt".to_owned())
+                } else {
+                    "Kein aktives Abo".to_owned()
+                }
+            }
+            _ => "Abo ungeprüft".to_owned(),
+        }
+    }
+
+    fn refresh_subscription(
+        &self,
+        profile: &Profile,
+        token: &str,
+        gate: &mut UsageGate,
+        path: &Path,
+        now: u64,
+    ) -> Result<()> {
+        if gate.subscription_retry_at > now && gate.subscription_retry_at - now <= 86400 {
+            return Ok(());
+        }
+        gate.subscription_retry_at = now.saturating_add(USAGE_REFRESH_IDLE_SECONDS);
+        atomic_write(path, &serde_json::to_vec(gate)?, 0o600)?;
+        match usage::fetch_live_account(token) {
+            Ok(account)
+                if account.email.eq_ignore_ascii_case(&profile.email)
+                    && account.org_id == profile.org_id =>
+            {
+                if let Some(value) = account.subscription {
+                    gate.subscription = Some(SubscriptionCheck {
+                        value,
+                        checked_at: unix_timestamp()?,
+                    });
+                } else if gate
+                    .subscription
+                    .as_ref()
+                    .is_some_and(|check| check.value.active)
+                {
+                    gate.subscription = None;
+                }
+            }
+            Ok(_) => log_problem("Abo-Prüfung verworfen: Kontozuordnung stimmt nicht überein"),
+            Err(error) => {
+                if let Some(limited) = error.downcast_ref::<usage::RateLimited>() {
+                    gate.subscription_retry_at = now.saturating_add(
+                        usage_retry_delay(1, limited.retry_after).max(USAGE_REFRESH_IDLE_SECONDS),
+                    );
+                }
+                log_problem(&format!(
+                    "Abo von {} nicht bestätigt: {error:#}",
+                    profile.name
+                ));
+            }
+        }
+        atomic_write(path, &serde_json::to_vec(gate)?, 0o600)
     }
 
     fn read_gate(&self, path: &Path) -> Result<UsageGate> {
@@ -2361,6 +2491,15 @@ impl App {
         let now = unix_timestamp()?;
         let path = self.gate_path(profile)?;
         let mut gate = self.read_gate(&path)?;
+        self.refresh_subscription(profile, &token, &mut gate, &path, now)?;
+        let now = unix_timestamp()?;
+        if gate
+            .subscription
+            .as_ref()
+            .is_some_and(|check| check.checked_at <= now && !check.value.active)
+        {
+            return Err(SubscriptionInactive.into());
+        }
         if let Some(cached) = gate.cached
             && cached.fetched_at <= now
             && !window_reset_passed(&cached.usage, now)
@@ -4695,6 +4834,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dashboard_does_not_present_saved_max_or_old_usage_as_current_entitlement() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bin = temp.path().join("fake-auth");
+        fs::write(&bin, "#!/bin/sh\nprintf '%s' '{\"loggedIn\":false}'\n").expect("fake auth");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).expect("mode");
+        let app = App::with_paths(Paths {
+            credentials: temp.path().join("unused-credentials"),
+            claude_json: temp.path().join("unused-identity"),
+            store: temp.path().join("store"),
+            claude_bin: bin,
+        });
+        let profile: Profile = serde_json::from_value(serde_json::json!({
+            "name":"saved-max","email":"test@example.test","saved_at":1,"subscription_type":"max"
+        }))
+        .expect("profile");
+        app.write_profile(&profile).expect("save profile");
+        let now = unix_timestamp().expect("time");
+        let mut gate = UsageGate {
+            cached: Some(CachedUsage {
+                usage: Usage {
+                    five_hour: usage::Bucket {
+                        utilization: 0.0,
+                        resets_at: None,
+                    },
+                    seven_day: usage::Bucket {
+                        utilization: 11.0,
+                        resets_at: None,
+                    },
+                },
+                fetched_at: now - 1060 * 60,
+            }),
+            ..Default::default()
+        };
+        let path = app.gate_path(&profile).expect("gate path");
+        atomic_write(&path, &serde_json::to_vec(&gate).expect("gate"), 0o600).expect("write");
+        let snapshot = app.web_snapshot().expect("unknown snapshot");
+        assert_eq!(snapshot["profiles"][0]["subscriptionType"], "Abo ungeprüft");
+        assert!(snapshot["profiles"][0]["usage"].is_null());
+        gate.subscription = Some(SubscriptionCheck {
+            value: usage::Subscription {
+                active: false,
+                plan: None,
+            },
+            checked_at: now,
+        });
+        atomic_write(&path, &serde_json::to_vec(&gate).expect("gate"), 0o600).expect("write");
+        let snapshot = app.web_snapshot().expect("inactive snapshot");
+        assert_eq!(
+            snapshot["profiles"][0]["subscriptionType"],
+            "Kein aktives Abo"
+        );
+        assert_eq!(snapshot["profiles"][0]["subscriptionInactive"], true);
+        assert!(snapshot["profiles"][0]["usage"].is_null());
+        assert!(app.read_cached_usage(&profile.name).is_none());
+    }
+
+    #[test]
     fn confirmation_accepts_only_the_original_window_before_expiry() {
         let cached = |at, reset| CachedUsage {
             fetched_at: at,
@@ -4805,6 +5001,7 @@ mod tests {
         let account = usage::LiveAccount {
             email: "work@example.test".to_owned(),
             org_id: None,
+            subscription: None,
         };
         let later = now + LIVE_ACCOUNT_RETRY * 3;
         assert_eq!(

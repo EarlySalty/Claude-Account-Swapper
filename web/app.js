@@ -65,6 +65,7 @@ function resetLabel(value) {
 }
 
 function weeklyPace(profile, threshold) {
+  if (profile.subscriptionInactive) return null;
   const week = profile.usage?.windows?.seven_day;
   if (!week) return null;
   const stop = profile.limits?.seven_day ?? threshold;
@@ -87,7 +88,7 @@ function renderFlow() {
   const running = Boolean(service.active);
   const auto = Boolean(config.auto_switch);
   const threshold = Math.round(Number(config.threshold) || 0);
-  const others = profiles.filter((profile) => !profile.active).map((profile) => profile.name);
+  const others = profiles.filter((profile) => !profile.active && !profile.subscriptionInactive).map((profile) => profile.name);
   let title;
   let note;
   if (!service.installed) {
@@ -195,11 +196,11 @@ function profileCard(profile) {
   const identity = el("div", "account-identity");
   identity.append(el("h3", "", profile.name));
   identity.append(el("p", "muted", [profile.email, profile.subscriptionType, profile.organization].filter(Boolean).join(" · ")));
-  const badge = el("span", `status-pill ${profile.active ? "good" : ""}`, profile.active ? "Aktiv" : "Gespeichert");
+  const badge = el("span", `status-pill ${profile.active && !profile.subscriptionInactive ? "good" : ""}`, profile.subscriptionInactive ? "Kein Abo" : profile.active ? "Aktiv" : "Gespeichert");
   top.append(identity, badge);
   card.append(top);
 
-  const usage = profile.usage?.windows;
+  const usage = profile.subscriptionInactive ? null : profile.usage?.windows;
   const usageGrid = el("div", "usage-grid");
   if (usage) {
     usageGrid.append(createUsageBucket("5-Stunden-Fenster", usage.five_hour, profile.usage.ageSeconds, profile.usage.staleAfterSeconds));
@@ -217,8 +218,8 @@ function profileCard(profile) {
   card.append(metadata);
 
   const actions = el("div", "account-actions");
-  if (!profile.active) actions.append(actionButton("Wechseln und prüfen", "switch", "button", { name: profile.name }));
-  if (!profile.active) actions.append(actionButton("Ohne Prüfung wechseln", "switch-raw", "button button-quiet", { name: profile.name }));
+  if (!profile.active && !profile.subscriptionInactive) actions.append(actionButton("Wechseln und prüfen", "switch", "button", { name: profile.name }));
+  if (!profile.active && !profile.subscriptionInactive) actions.append(actionButton("Ohne Prüfung wechseln", "switch-raw", "button button-quiet", { name: profile.name }));
   const limits = profile.limits || {};
   const limitText = [limits.five_hour != null ? `5h ${percent(limits.five_hour)}` : "", limits.seven_day != null ? `7d ${percent(limits.seven_day)}` : "", limits.hard ? "hart" : ""].filter(Boolean).join(" · ");
   if (limitText) actions.append(el("span", "limit-summary", limitText));
@@ -243,6 +244,7 @@ function renderAccounts() {
 }
 
 function renderQuickSwitch(profiles) {
+  profiles = profiles.filter((profile) => !profile.subscriptionInactive);
   const select = $("#quick-switch-target");
   const button = $("#quick-switch-button");
   const previous = select.value;
@@ -260,7 +262,7 @@ function renderQuickSwitch(profiles) {
 }
 
 function updateQuickSwitchButton() {
-  const profiles = dashboard?.profiles || [];
+  const profiles = (dashboard?.profiles || []).filter((profile) => !profile.subscriptionInactive);
   const select = $("#quick-switch-target");
   const button = $("#quick-switch-button");
   const selected = profiles.find((profile) => profile.name === select.value);

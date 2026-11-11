@@ -597,6 +597,13 @@ fn profile_url() -> String {
 pub struct LiveAccount {
     pub email: String,
     pub org_id: Option<String>,
+    pub subscription: Option<Subscription>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subscription {
+    pub active: bool,
+    pub plan: Option<String>,
 }
 
 pub fn fetch_live_account(access_token: &str) -> Result<LiveAccount> {
@@ -613,6 +620,24 @@ pub fn fetch_live_account(access_token: &str) -> Result<LiveAccount> {
         .call()
         .map_err(|error| anyhow::anyhow!("Kontodaten konnten nicht abgefragt werden: {error}"))?;
     let status = response.status().as_u16();
+    if status == 429 {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                value.trim().parse::<u64>().ok().or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(value)
+                        .ok()
+                        .map(|date| {
+                            date.timestamp()
+                                .saturating_sub(Utc::now().timestamp())
+                                .max(0) as u64
+                        })
+                })
+            });
+        return Err(RateLimited { retry_after }.into());
+    }
     let body = response
         .body_mut()
         .read_to_string()
@@ -645,7 +670,46 @@ pub fn parse_live_account(body: &str) -> Result<LiveAccount> {
         .map(str::trim)
         .filter(|uuid| !uuid.is_empty())
         .map(str::to_owned);
-    Ok(LiveAccount { email, org_id })
+    let organization = &value["organization"];
+    let kind = organization["organization_type"].as_str();
+    let status = organization["subscription_status"].as_str();
+    let max = value["account"]["has_claude_max"].as_bool();
+    let pro = value["account"]["has_claude_pro"].as_bool();
+    let plan = match kind {
+        Some("claude_max") => Some("max"),
+        Some("claude_pro") => Some("pro"),
+        Some("claude_team") => Some("team"),
+        Some("claude_enterprise") => Some("enterprise"),
+        _ if max == Some(true) => Some("max"),
+        _ if pro == Some(true) => Some("pro"),
+        _ => None,
+    };
+    let inactive = kind == Some("claude_free")
+        || matches!(
+            status,
+            Some("expired" | "unpaid" | "past_due" | "incomplete_expired")
+        )
+        || (!matches!(kind, Some("claude_team" | "claude_enterprise"))
+            && max == Some(false)
+            && pro == Some(false));
+    let subscription = if inactive {
+        Some(Subscription {
+            active: false,
+            plan: None,
+        })
+    } else if status == Some("canceled") && max != Some(true) && pro != Some(true) {
+        None
+    } else {
+        plan.map(|plan| Subscription {
+            active: true,
+            plan: Some(plan.to_owned()),
+        })
+    };
+    Ok(LiveAccount {
+        email,
+        org_id,
+        subscription,
+    })
 }
 
 /// Liest die beiden interessanten Fenster aus der Antwort.
@@ -789,12 +853,44 @@ mod tests {
             LiveAccount {
                 email: "work@example.test".to_owned(),
                 org_id: Some("org-1".to_owned()),
+                subscription: None,
             }
         );
         let without_org = parse_live_account(r#"{"account":{"email":"a@b.c"}}"#).expect("account");
         assert_eq!(without_org.org_id, None);
         assert!(parse_live_account(r#"{"account":{"email":""}}"#).is_err());
         assert!(parse_live_account(r#"{"organization":{"uuid":"org-1"}}"#).is_err());
+    }
+
+    #[test]
+    fn subscription_requires_live_entitlement_and_distinguishes_cancellation() {
+        for (kind, status, max, pro, expected) in [
+            ("claude_free", "canceled", false, false, false),
+            ("claude_max", "canceled", false, false, false),
+            ("claude_max", "canceled", true, false, true),
+            ("claude_max", "past_due", true, false, false),
+            ("claude_pro", "active", false, true, true),
+            ("claude_team", "active", false, false, true),
+        ] {
+            let account = parse_live_account(&serde_json::json!({
+                "account":{"email":"test@example.test","has_claude_max":max,"has_claude_pro":pro},
+                "organization":{"uuid":"org","organization_type":kind,"subscription_status":status}
+            }).to_string()).expect("profile");
+            assert_eq!(
+                account.subscription.expect("entitlement").active,
+                expected,
+                "{kind} {status}"
+            );
+        }
+        assert!(parse_live_account(r#"{"account":{"email":"test@example.test"},"organization":{"organization_type":"claude_max","subscription_status":"canceled"}}"#).expect("profile").subscription.is_none());
+        assert!(
+            parse_live_account(
+                r#"{"account":{"email":"test@example.test","has_claude_max":"false"}}"#
+            )
+            .expect("profile")
+            .subscription
+            .is_none()
+        );
     }
 
     fn usage_at(five: f64, seven: f64, five_reset: &str, seven_reset: &str) -> Usage {
