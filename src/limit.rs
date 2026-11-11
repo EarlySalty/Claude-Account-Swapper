@@ -1198,14 +1198,28 @@ impl App {
 
     fn cached_levels(&self) -> Result<Vec<Level>> {
         let now = unix_timestamp()?;
-        Ok(self
-            .load_profiles()?
+        let active = self.active_profile_name_memoized(None);
+        let mut profiles = self.load_profiles()?;
+        profiles.sort_by_key(|profile| active.as_deref() != Some(profile.name.as_str()));
+        let mut identities = HashSet::new();
+        Ok(self.deduplicated_levels(profiles, &mut identities, now))
+    }
+
+    fn deduplicated_levels(
+        &self,
+        profiles: Vec<crate::Profile>,
+        identities: &mut HashSet<String>,
+        now: u64,
+    ) -> Vec<Level> {
+        profiles
             .into_iter()
+            .filter(|profile| identities.insert(crate::usage_identity(profile)))
             .map(|profile| {
                 let candidate = self
                     .read_cached_usage(&profile.name)
                     .filter(|cached| {
-                        now.saturating_sub(cached.fetched_at) <= crate::USAGE_CACHE_MAX_AGE_SECONDS
+                        cached.fetched_at <= now
+                            && now - cached.fetched_at <= crate::USAGE_CACHE_MAX_AGE_SECONDS
                     })
                     .map(|cached| Candidate {
                         name: profile.name.clone(),
@@ -1214,7 +1228,7 @@ impl App {
                     });
                 (profile.name, candidate)
             })
-            .collect())
+            .collect()
     }
 
     fn switch_for_resume(
@@ -1895,6 +1909,62 @@ pub fn log_hook_failure(error: &anyhow::Error) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn alias_levels_keep_one_quota_and_the_active_profile_limits() {
+        let temp = tempfile::tempdir().expect("temp");
+        let app = crate::App::with_paths(crate::Paths {
+            credentials: temp.path().join("credentials"),
+            claude_json: temp.path().join("identity"),
+            store: temp.path().join("store"),
+            claude_bin: temp.path().join("unused"),
+        });
+        let profile = |name, org, stop| {
+            serde_json::from_value::<crate::Profile>(serde_json::json!({
+                "name":name,"email":"same@example.test","org_id":org,"saved_at":1,
+                "limits":{"five_hour":stop}
+            }))
+            .expect("profile")
+        };
+        let profiles = vec![
+            profile("active", "org-a", 70.0),
+            profile("alias", "org-a", 98.0),
+            profile("other-org", "org-b", 98.0),
+        ];
+        let now = crate::unix_timestamp().expect("time");
+        for profile in &profiles {
+            app.write_profile(profile).expect("profile");
+            app.write_cached_usage(
+                &profile.name,
+                crate::usage::Usage {
+                    five_hour: crate::usage::Bucket {
+                        utilization: if profile.org_id.as_deref() == Some("org-a") {
+                            75.0
+                        } else {
+                            99.0
+                        },
+                        resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(2)),
+                    },
+                    seven_day: crate::usage::Bucket {
+                        utilization: 20.0,
+                        resets_at: None,
+                    },
+                },
+                now,
+            );
+        }
+        let levels = app.deduplicated_levels(profiles, &mut std::collections::HashSet::new(), now);
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].0, "active");
+        assert_eq!(levels[1].0, "other-org");
+        assert_eq!(
+            levels[0].1.as_ref().expect("active quota").stops.five_hour,
+            Some(70.0)
+        );
+        assert!(
+            super::switch_target(&crate::config::Config::default(), &levels, Some("active"))
+                .is_none()
+        );
+    }
     use super::*;
 
     fn hook_reply(input: &HookInput, state: &mut LimitState, now: u64) -> Option<Value> {

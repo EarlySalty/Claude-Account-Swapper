@@ -3521,6 +3521,15 @@ fn pending_job_confirmation_requires_later_same_account_measurement() {
     assert_success(&harness.run(&["jobs"]));
     assert!(harness.read_job("0001")["pending_confirmation"].is_object());
     write_cached_usage(&harness, "work", 10.0, 10.0, 0);
+    let cache_path = harness.store.join("accounts/work/usage.json");
+    let mut cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache_path).expect("cache")).expect("json");
+    cache["five_hour"]["resets_at"] = json!(
+        chrono::DateTime::from_timestamp((now + 3600) as i64, 0)
+            .expect("reset")
+            .to_rfc3339()
+    );
+    fs::write(cache_path, serde_json::to_vec(&cache).expect("json")).expect("write");
     assert_success(&harness.run(&["jobs"]));
     let job = harness.read_job("0001");
     assert!(job["pending_confirmation"].is_null(), "{job}");
@@ -3544,7 +3553,14 @@ fn later_permitted_measurement_confirms_or_rejects_a_pending_ping() {
         )
         .expect("ping state");
         let body = if opens_window {
-            usage_body(10.0, 20.0)
+            usage_body_with_resets(
+                10.0,
+                20.0,
+                &chrono::DateTime::from_timestamp((now + 3600) as i64, 0)
+                    .expect("reset")
+                    .to_rfc3339(),
+                "2099-08-09T02:00:00Z",
+            )
         } else {
             json!({"five_hour":{"utilization":0.0,"resets_at":null},"seven_day":{"utilization":20.0,"resets_at":null}}).to_string()
         };
@@ -3591,4 +3607,127 @@ fn later_permitted_measurement_confirms_or_rejects_a_pending_ping() {
             "confirmation must not send a model request"
         );
     }
+}
+
+#[test]
+fn weekly_pacing_does_not_select_a_target_inside_the_safety_reserve() {
+    let harness = harness_with_two_accounts();
+    let now = chrono::Utc::now();
+    let five = (now + chrono::Duration::hours(3)).to_rfc3339();
+    let slow_week = (now + chrono::Duration::hours(100)).to_rfc3339();
+    let fast_week = (now + chrono::Duration::hours(2)).to_rfc3339();
+    let server = UsageServer::start(vec![
+        (
+            "access-work",
+            200,
+            usage_body_with_resets(20.0, 30.0, &five, &slow_week),
+        ),
+        (
+            "access-personal",
+            200,
+            usage_body_with_resets(20.0, 94.0, &five, &fast_week),
+        ),
+    ]);
+    assert_success(
+        &harness
+            .command()
+            .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+            .args(["usage"])
+            .output()
+            .expect("usage"),
+    );
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["auto", "--dry-run"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Kein Wechsel"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn pending_pings_block_active_and_idle_model_requests() {
+    let harness = harness_with_two_accounts();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    fs::write(
+        harness.store.join("ping.json"),
+        serde_json::to_vec(&json!({
+            "last_run_at":now-1000,
+            "pending_confirmations":{
+                "v2:[\"work@example.test\",null]":now-1000,
+                "v2:[\"personal@example.test\",null]":now-1000
+            }
+        }))
+        .expect("state"),
+    )
+    .expect("write");
+    assert_success(&harness.run(&["config", "--ping", "on"]));
+    let body = json!({"five_hour":{"utilization":0.0,"resets_at":null},"seven_day":{"utilization":20.0,"resets_at":null}}).to_string();
+    let server = UsageServer::start(vec![
+        ("access-work", 429, body.clone()),
+        ("access-personal", 429, body.clone()),
+    ]);
+    for name in ["work", "personal"] {
+        fs::write(harness.store.join(format!("accounts/{name}/usage.json")), serde_json::to_vec(&json!({
+            "five_hour":{"utilization":0.0,"resets_at":null},"seven_day":{"utilization":20.0,"resets_at":null},"fetched_at":now-1100
+        })).expect("cache")).expect("write");
+    }
+    let args = harness.home.join("ping-args");
+    let mut child = harness
+        .command_recording()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .env("FAKE_ARGS_FILE", &args)
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch");
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    child.kill().expect("stop");
+    let output = child.wait_with_output().expect("output");
+    assert!(
+        !args.exists(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn broken_ping_bookkeeping_does_not_stop_quota_switching() {
+    let harness = harness_with_two_accounts();
+    fs::create_dir(harness.store.join("ping.json")).expect("broken ping state");
+    assert_success(&harness.run(&["config", "--auto-switch", "on"]));
+    let server = UsageServer::start(vec![
+        ("access-work", 200, usage_body(100.0, 20.0)),
+        ("access-personal", 200, usage_body(10.0, 20.0)),
+    ]);
+    let mut child = harness
+        .command_recording()
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+        .args(["watch", "--interval", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch");
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    child.kill().expect("stop");
+    let output = child.wait_with_output().expect("output");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        log.contains("Kontoschutz läuft weiter") && log.contains("Wechsel zu personal"),
+        "{log}"
+    );
 }

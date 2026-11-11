@@ -254,11 +254,11 @@ claude-account job resume 3f2a1b90-... --prompt "Mach da weiter, wo du aufgehoer
 
 Eine Aufgabe laeuft als `claude -p` im angegebenen Verzeichnis, ohne Rueckfragen (`--allow-permissions` schaltet das ab), und wartet auf ein freies Fuenf-Stunden-Fenster. Eine haengende Aufgabe wird spaetestens nach fuenf Stunden beendet. Ihre komplette Ausgabe steht in `~/.claude-account-switcher/jobs/<id>.log`, das Ergebnis in der Aufgabe selbst.
 
-Wann eine Aufgabe laeuft, entscheidet dieselbe Regel wie beim Ping:
+Für Aufgaben gelten folgende Regeln:
 
 - Beide Fenster muessen unter der Schwelle liegen.
-- Das Fuenf-Stunden-Fenster muss ein anderes sein als beim letzten Lauf. Beim Anlegen merkt sich die Aufgabe das *gerade laufende* Fenster — sie nimmt damit niemandem das Kontingent weg, an dem er gerade arbeitet, sondern startet im naechsten. Laeuft gerade keines, startet sie sofort.
-- Zwischen zwei Laeufen liegen mindestens 15 Minuten. Diese Bremse faengt den Fall ab, dass die Auslastungs-Abfrage nach einem Lauf scheitert: dann bleibt der gemerkte Fensterstand alt, und ohne sie liefe die Aufgabe sofort erneut.
+- Das Fünf-Stunden-Fenster muss ein anderes sein als beim letzten Lauf. Beim Anlegen merkt sich die Aufgabe das gerade laufende Fenster und startet im nächsten. Läuft gerade keines, startet sie sofort.
+- Zwischen zwei Läufen liegen mindestens 15 Minuten. Nach einem Lauf wartet die Aufgabe zusätzlich auf eine spätere Messung desselben Kontos, die noch zum ursprünglichen Fenster gehört. Ohne diese Bestätigung bleibt sie höchstens fünf Stunden gesperrt. Ein ungenutztes Fenster hebt die zusätzliche Sperre auf; der Abstand von 15 Minuten gilt weiter. Messungen eines später eröffneten Fensters werden nicht dem alten Lauf zugerechnet.
 
 Es laeuft immer nur eine Aufgabe gleichzeitig, und zwar in einem eigenen Faden — der Dienst sichert waehrenddessen weiter rotierte Tokens. Eine einmalige Aufgabe ist nach einem **erfolgreichen** Lauf erledigt; scheitert sie, bleibt sie mit der Begruendung stehen. Fehlt ihr Arbeitsverzeichnis, wird sie abgeschaltet statt blind gestartet.
 

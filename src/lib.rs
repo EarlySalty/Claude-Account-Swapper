@@ -83,6 +83,7 @@ impl std::fmt::Display for UsageThrottled {
 
 impl std::error::Error for UsageThrottled {}
 const PACING_MIN_DWELL_SECONDS: u64 = 3 * 60 * 60;
+const QUOTA_WINDOW_SECONDS: u64 = 5 * 60 * 60;
 const FAILED_LOGIN_RETRY_SECONDS: u64 = 6 * 60 * 60;
 /// Ein haengender Request wuerde den Dienst sonst dauerhaft anhalten.
 const KEEPALIVE_REQUEST_TIMEOUT_SECONDS: u64 = 120;
@@ -807,7 +808,7 @@ impl App {
                         "windows": cached.usage,
                         "ageSeconds": now.saturating_sub(cached.fetched_at),
                         "measured_at": cached.fetched_at,
-                        "staleAfterSeconds": if active_profile.as_deref().and_then(|name| self.load_profile(name).ok()).is_some_and(|active| same_usage_identity(&active, profile)) { USAGE_REFRESH_ACTIVE_SECONDS } else { USAGE_REFRESH_IDLE_SECONDS },
+                        "staleAfterSeconds": (if active_profile.as_deref().and_then(|name| self.load_profile(name).ok()).is_some_and(|active| same_usage_identity(&active, profile)) { USAGE_REFRESH_ACTIVE_SECONDS } else { USAGE_REFRESH_IDLE_SECONDS }) + USAGE_CHECK_INTERVAL_SECONDS + DEFAULT_WATCH_INTERVAL_SECONDS,
                     })
                 });
                 let usage_error = usage
@@ -1812,7 +1813,11 @@ impl App {
                         profiles
                             .iter()
                             .filter(|profile| !same_usage_identity(profile, active_profile))
-                            .filter_map(|profile| self.cached_candidate(profile)),
+                            .filter_map(|profile| {
+                                self.cached_candidate(profile).filter(|candidate| {
+                                    self.target_has_reserve(profile, &candidate.usage, threshold)
+                                })
+                            }),
                     );
                 }
                 let decision = usage::pick_target_with(&active, &known, threshold, pacing);
@@ -1833,10 +1838,50 @@ impl App {
                 }
             }
         }
-        let usages = usage::with_stale_targets(&active, threshold, usages, stale);
+        let mut usages = usage::with_stale_targets(&active, threshold, usages, stale);
+        let safe_names: Vec<_> = profiles
+            .iter()
+            .filter(|profile| !same_usage_identity(profile, active_profile))
+            .filter(|profile| {
+                usages.iter().any(|candidate| {
+                    candidate.name == profile.name
+                        && self.target_has_reserve(profile, &candidate.usage, threshold)
+                })
+            })
+            .map(|profile| profile.name.as_str())
+            .collect();
+        if !safe_names.is_empty() {
+            usages.retain(|candidate| {
+                candidate.name == active || safe_names.contains(&candidate.name.as_str())
+            });
+        }
 
         let decision = usage::pick_target_with(&active, &usages, threshold, pacing);
         self.apply_decision(decision, dry_run)
+    }
+
+    fn target_has_reserve(&self, profile: &Profile, measured: &Usage, threshold: f64) -> bool {
+        let reserve = prediction_setting("CLAUDE_ACCOUNT_SWITCHER_USAGE_RESERVE", 5.0, 50.0);
+        let lead = prediction_setting("CLAUDE_ACCOUNT_SWITCHER_SWITCH_LEAD_SECONDS", 60.0, 3600.0);
+        let projected = self
+            .gate_path(profile)
+            .and_then(|path| self.read_gate(&path))
+            .ok()
+            .and_then(|gate| {
+                projected_usage(
+                    &gate,
+                    unix_timestamp().ok()?,
+                    USAGE_REFRESH_ACTIVE_SECONDS as f64 + lead,
+                )
+            })
+            .unwrap_or([
+                measured.five_hour.utilization,
+                measured.seven_day.utilization,
+            ]);
+        projected[0].max(measured.five_hour.utilization) + reserve * 2.0
+            < profile.limits.five_hour.unwrap_or(threshold)
+            && projected[1].max(measured.seven_day.utilization) + reserve * 2.0
+                < profile.limits.seven_day.unwrap_or(threshold)
     }
 
     fn predictive_switch(
@@ -1888,12 +1933,7 @@ impl App {
             if age > USAGE_REFRESH_IDLE_SECONDS || window_reset_passed(&usage, now) {
                 continue;
             }
-            let target_gate = self.read_gate(&self.gate_path(profile)?)?;
-            let estimated = projected_usage(&target_gate, now, horizon)
-                .unwrap_or([usage.five_hour.utilization, usage.seven_day.utilization]);
-            if estimated[0] + reserve * 2.0 >= profile.limits.five_hour.unwrap_or(threshold)
-                || estimated[1] + reserve * 2.0 >= profile.limits.seven_day.unwrap_or(threshold)
-            {
+            if !self.target_has_reserve(profile, &usage, threshold) {
                 continue;
             }
             safe.extend([usage::Candidate {
@@ -2517,15 +2557,28 @@ impl App {
             let mut job = jobs::parse_job(&data, id)?;
             if confirmation_lock.is_some()
                 && let Some(pending) = &job.pending_confirmation
+                && confirmation_expired(pending.completed_at, unix_timestamp()?)
+            {
+                log_problem(&format!(
+                    "Aufgabe [{}]: Bestätigung abgelaufen oder ungültig",
+                    job.id
+                ));
+                job.pending_confirmation = None;
+                self.write_job(&job)?;
+            }
+            if confirmation_lock.is_some()
+                && let Some(pending) = &job.pending_confirmation
             {
                 let measured = self
                     .load_profiles()?
                     .iter()
                     .find(|profile| usage_identity(profile) == pending.account)
                     .and_then(|profile| self.read_cached_usage(&profile.name))
-                    .filter(|cached| cached.fetched_at > pending.completed_at);
+                    .and_then(|cached| {
+                        confirmed_window(cached, pending.completed_at, unix_timestamp().ok()?)
+                    });
                 if let Some(cached) = measured {
-                    if let Some(reset) = cached.usage.five_hour.resets_at {
+                    if let Some(reset) = cached {
                         job.last_window = Some(reset);
                         job.pending_confirmation = None;
                         self.write_job(&job)?;
@@ -2534,20 +2587,6 @@ impl App {
                         self.write_job(&job)?;
                     }
                 }
-            }
-            if confirmation_lock.is_some()
-                && let Some(pending) = &job.pending_confirmation
-                && unix_timestamp().is_ok_and(|now| {
-                    pending.completed_at > now
-                        || now.saturating_sub(pending.completed_at) >= 5 * 60 * 60
-                })
-            {
-                log_problem(&format!(
-                    "Aufgabe [{}]: Bestätigung abgelaufen oder ungültig",
-                    job.id
-                ));
-                job.pending_confirmation = None;
-                self.write_job(&job)?;
             }
             jobs.push(job);
         }
@@ -2932,11 +2971,12 @@ impl App {
         self.paths.store.join("ping.json")
     }
 
-    fn load_ping_state(&self) -> PingState {
-        fs::read(self.ping_state_path())
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default()
+    fn load_ping_state(&self) -> Result<PingState> {
+        match fs::read(self.ping_state_path()) {
+            Ok(data) => serde_json::from_slice(&data).context("Fenster-Ping-Status ist ungültig"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(PingState::default()),
+            Err(error) => Err(error).context("Fenster-Ping-Status ist nicht lesbar"),
+        }
     }
 
     fn write_ping_state(&self, state: &PingState) -> Result<()> {
@@ -2965,6 +3005,14 @@ impl App {
             .map(PathBuf::from)
             .context("HOME ist nicht gesetzt")?;
         self.update_ping_state(|state| {
+            if let Some(identity) = &account {
+                let now = unix_timestamp()?;
+                if ping_pending(state, identity, now) {
+                    bail!("Bestätigung des letzten Pings steht aus");
+                }
+                state.pending_confirmations.insert(identity.clone(), now);
+                state.idle_profiles.insert(identity.clone(), now);
+            }
             state.last_run_at = Some(unix_timestamp()?);
             Ok(())
         })?;
@@ -3008,7 +3056,7 @@ impl App {
 
     fn update_ping_state(&self, change: impl FnOnce(&mut PingState) -> Result<()>) -> Result<()> {
         let _lock = self.lock_file("ping")?;
-        let mut state = self.load_ping_state();
+        let mut state = self.load_ping_state()?;
         change(&mut state)?;
         self.write_ping_state(&state)
     }
@@ -3043,10 +3091,16 @@ impl App {
                 continue;
             };
             let key = format!("ping-{}", profile.name);
-            let last_run_at = self
-                .load_ping_state()
+            let state = self.load_ping_state()?;
+            let identity = usage_identity(&profile);
+            if ping_pending(&state, &identity, unix_timestamp()?) {
+                log_once(spoken, &key, "Fenster-Ping wartet auf Bestätigung");
+                continue;
+            }
+            let last_run_at = state
                 .idle_profiles
-                .get(&profile.name)
+                .get(&identity)
+                .or_else(|| state.idle_profiles.get(&profile.name))
                 .copied();
             let stops = [
                 profile.limits.five_hour.unwrap_or(config.threshold),
@@ -3084,13 +3138,19 @@ impl App {
     }
 
     fn ping_idle_profile(&self, profile: &Profile) -> Result<()> {
-        let outcome = self.renew_profile(profile);
         self.update_ping_state(|state| {
+            let identity = usage_identity(profile);
+            let now = unix_timestamp()?;
+            if ping_pending(state, &identity, now) {
+                bail!("Bestätigung des letzten Pings steht aus");
+            }
+            state.pending_confirmations.insert(identity, now);
             state
                 .idle_profiles
-                .insert(profile.name.clone(), unix_timestamp()?);
+                .insert(usage_identity(profile), unix_timestamp()?);
             Ok(())
         })?;
+        let outcome = self.renew_profile(profile);
         match outcome? {
             RenewOutcome::Renewed | RenewOutcome::StillValid => {}
             RenewOutcome::Expired => {
@@ -3170,8 +3230,24 @@ impl App {
         let now = unix_timestamp()?;
 
         if config.ping.enabled {
-            let state = self.load_ping_state();
-            let verdict = jobs::ping_readiness(&usage, config.threshold, state.last_run_at, now);
+            let verdict = match self.load_ping_state() {
+                Ok(state) => {
+                    let identity = self
+                        .active_profile_name()
+                        .and_then(|name| self.load_profile(&name))
+                        .map(|profile| usage_identity(&profile));
+                    match identity {
+                        Ok(identity) if ping_pending(&state, &identity, now) => {
+                            Readiness::Waiting("Bestätigung des letzten Pings steht aus".to_owned())
+                        }
+                        Ok(_) => {
+                            jobs::ping_readiness(&usage, config.threshold, state.last_run_at, now)
+                        }
+                        Err(error) => Readiness::Waiting(format!("Account unklar: {error:#}")),
+                    }
+                }
+                Err(error) => Readiness::Waiting(format!("Ping-Status nicht verfügbar: {error:#}")),
+            };
             match &verdict {
                 Readiness::Due(reason) => {
                     log_event(&format!("Fenster-Ping faellig: {reason}"));
@@ -3243,7 +3319,6 @@ impl App {
             match self.profile_usage_cached(&profile, renew) {
                 Ok(_) => {
                     spoken.remove(&key);
-                    self.resolve_ping_confirmation(&profile)?;
                 }
                 Err(error) => log_once(
                     spoken,
@@ -3252,28 +3327,51 @@ impl App {
                 ),
             }
         }
+        match self.resolve_ping_confirmations() {
+            Ok(()) => {
+                spoken.remove("ping-confirmation");
+            }
+            Err(error) => log_once(
+                spoken,
+                "ping-confirmation",
+                &format!("Ping-Bestätigung nicht verfügbar: {error:#}; Kontoschutz läuft weiter"),
+            ),
+        }
         Ok(())
     }
 
-    fn resolve_ping_confirmation(&self, profile: &Profile) -> Result<()> {
-        let identity = usage_identity(profile);
-        let cached = self.read_cached_usage(&profile.name);
+    fn resolve_ping_confirmations(&self) -> Result<()> {
+        let _lock = self.lock_file("ping")?;
+        let mut state = self.load_ping_state()?;
+        if state.pending_confirmations.is_empty() {
+            return Ok(());
+        }
         let now = unix_timestamp()?;
-        self.update_ping_state(|state| {
-            if let Some(completed_at) = state.pending_confirmations.get(&identity).copied() {
-                if completed_at > now || now.saturating_sub(completed_at) >= 5 * 60 * 60 {
-                    log_problem(&format!("Fenster-Ping für `{}`: Bestätigung abgelaufen oder ungültig", profile.name));
-                    state.pending_confirmations.remove(&identity);
-                } else if let Some(cached) = cached.filter(|cached| cached.fetched_at > completed_at) {
-                    match cached.usage.five_hour.resets_at {
-                        Some(reset) => log_event(&format!("Fenster-Ping für `{}`: Fenster laeuft jetzt bis {}", profile.name, format_timestamp(reset.timestamp()))),
-                        None => log_problem(&format!("Fenster-Ping für `{}`: die API meldet weiterhin kein laufendes Fenster", profile.name)),
-                    }
-                    state.pending_confirmations.remove(&identity);
-                }
+        let profiles = self.load_profiles()?;
+        let mut changed = false;
+        state.pending_confirmations.retain(|identity, completed_at| {
+            if confirmation_expired(*completed_at, now) {
+                log_problem("Fenster-Ping: Bestätigung abgelaufen oder ungültig");
+                changed = true;
+                return false;
             }
-            Ok(())
-        })
+            let measured = profiles.iter().find(|profile| usage_identity(profile) == *identity)
+                .and_then(|profile| self.read_cached_usage(&profile.name))
+                .and_then(|cached| confirmed_window(cached, *completed_at, now));
+            if let Some(reset) = measured {
+                match reset {
+                    Some(reset) => log_event(&format!("Fenster-Ping: Fenster laeuft jetzt bis {}", format_timestamp(reset.timestamp()))),
+                    None => log_problem("Fenster-Ping: die API meldet weiterhin kein laufendes Fenster des bestätigten Pings"),
+                }
+                changed = true;
+                return false;
+            }
+            true
+        });
+        if changed {
+            self.write_ping_state(&state)?;
+        }
+        Ok(())
     }
 
     fn active_usage(&self) -> Result<Usage> {
@@ -4430,6 +4528,35 @@ fn same_usage_identity(a: &Profile, b: &Profile) -> bool {
     usage_identity(a) == usage_identity(b)
 }
 
+fn confirmation_expired(completed_at: u64, now: u64) -> bool {
+    completed_at > now || now.saturating_sub(completed_at) >= QUOTA_WINDOW_SECONDS
+}
+
+fn confirmed_window(
+    cached: CachedUsage,
+    completed_at: u64,
+    now: u64,
+) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
+    if confirmation_expired(completed_at, now)
+        || cached.fetched_at <= completed_at
+        || cached.fetched_at > now
+    {
+        return None;
+    }
+    Some(cached.usage.five_hour.resets_at.filter(|reset| {
+        u64::try_from(reset.timestamp()).is_ok_and(|reset| {
+            reset > completed_at && reset <= completed_at.saturating_add(QUOTA_WINDOW_SECONDS)
+        })
+    }))
+}
+
+fn ping_pending(state: &PingState, identity: &str, now: u64) -> bool {
+    state
+        .pending_confirmations
+        .get(identity)
+        .is_some_and(|completed_at| !confirmation_expired(*completed_at, now))
+}
+
 fn usage_retry_delay(failures: u32, server: Option<u64>) -> u64 {
     USAGE_BACKOFF_DEFAULT_SECONDS
         .saturating_mul(1u64 << failures.saturating_sub(1).min(10))
@@ -4566,6 +4693,46 @@ fn unix_millis() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirmation_accepts_only_the_original_window_before_expiry() {
+        let cached = |at, reset| CachedUsage {
+            fetched_at: at,
+            usage: Usage {
+                five_hour: usage::Bucket {
+                    utilization: 1.0,
+                    resets_at: chrono::DateTime::from_timestamp(reset, 0),
+                },
+                seven_day: usage::Bucket {
+                    utilization: 1.0,
+                    resets_at: None,
+                },
+            },
+        };
+        assert!(
+            confirmed_window(cached(1100, 10000), 1000, 1200)
+                .expect("later measurement")
+                .is_some()
+        );
+        assert_eq!(confirmed_window(cached(1000, 10000), 1000, 1200), None);
+        assert_eq!(confirmed_window(cached(1300, 10000), 1000, 1200), None);
+        assert_eq!(
+            confirmed_window(cached(1100, 20000), 1000, 1200),
+            Some(None)
+        );
+        assert_eq!(confirmed_window(cached(20000, 22000), 1000, 21000), None);
+        assert!(confirmation_expired(u64::MAX, 1200));
+    }
+
+    #[test]
+    fn pending_ping_is_shared_by_identity_and_expires() {
+        let mut state = PingState::default();
+        state.pending_confirmations.insert("quota".to_owned(), 1000);
+        assert!(ping_pending(&state, "quota", 2000));
+        assert!(!ping_pending(&state, "other-quota", 2000));
+        assert!(!ping_pending(&state, "quota", 999));
+        assert!(!ping_pending(&state, "quota", 1000 + QUOTA_WINDOW_SECONDS));
+    }
 
     #[test]
     fn retry_delay_grows_and_never_shortens_server_delay() {
