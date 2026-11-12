@@ -2815,6 +2815,45 @@ fn a_resume_job_hands_the_session_id_to_claude() {
 }
 
 #[test]
+fn manual_runs_execute_disabled_jobs_without_enabling_the_scheduler() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&[
+        "job",
+        "add",
+        "manual-only",
+        "--cwd",
+        harness.home.to_str().expect("home"),
+    ]));
+    assert_success(&harness.run(&["job", "disable", "0001"]));
+    for expected_calls in 1..=2 {
+        assert_success(
+            &harness
+                .command_recording()
+                .args(["job", "run", "0001"])
+                .output()
+                .expect("manual run"),
+        );
+        let job = harness.read_job("0001");
+        assert_eq!(job["enabled"], false, "{job}");
+        assert!(
+            job["last_status"]
+                .as_str()
+                .expect("status")
+                .contains("erfolgreich"),
+            "{job}"
+        );
+        assert_eq!(
+            harness
+                .recorded_calls()
+                .lines()
+                .filter(|line| *line == "ARG=manual-only")
+                .count(),
+            expected_calls
+        );
+    }
+}
+
+#[test]
 fn a_one_off_job_is_done_after_its_run_a_repeating_one_stays() {
     let harness = harness_with_two_accounts();
     let home = harness.home.to_str().expect("Pfad").to_owned();
