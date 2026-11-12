@@ -413,6 +413,54 @@ pub fn parse_projection(value: &Value) -> Result<ThreadDetail> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn continuation_dispatches_into_the_existing_t3_chat() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let request = socket.read().unwrap();
+            let request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+            assert_eq!(request["tag"], "orchestration.dispatchCommand");
+            assert_eq!(request["payload"]["type"], "message.dispatch");
+            assert_eq!(request["payload"]["threadId"], "original-chat");
+            assert_eq!(request["payload"]["messageId"], "stable-resume-id");
+            assert_eq!(
+                request["payload"]["commandId"],
+                "limit-compact:stable-resume-id"
+            );
+            assert_eq!(
+                request["payload"]["dispatchMode"]["type"],
+                "start_immediately"
+            );
+            assert_eq!(request["payload"]["text"], "Continue the saved task");
+            socket
+                .send(Message::text(
+                    json!({
+                        "_tag":"Exit", "requestId":request["id"],
+                        "exit":{"_tag":"Success", "value":null}
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+        });
+        let mut rpc = Rpc::open(&format!("http://{address}"), "test-ticket").unwrap();
+        rpc.send_message(
+            "original-chat",
+            "Continue the saved task",
+            "stable-resume-id",
+        )
+        .unwrap();
+        server.join().unwrap();
+    }
+
     use super::*;
 
     #[test]

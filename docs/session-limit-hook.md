@@ -8,6 +8,12 @@ During a pause, the watcher compacts eligible open Claude threads one at a time.
 
 Quota remains necessary for summaries. If the account is already exhausted, summaries wait for quota. This covers T3-managed Claude threads; it does not issue `/compact` into independent terminal sessions.
 
+## Resume in the original T3 chat
+
+After quota recovers, sessions stopped by the quota hook resume through T3's chat dispatcher in their existing thread. The swapper sends a continuation with the saved TODO pointer using `orchestration.dispatchCommand`, `message.dispatch`, and `start_immediately`. T3 owns the provider session resume, model, and workspace. The swapper does not create a replacement chat or start a separate CLI resume job for a recognized T3 session.
+
+The swapper waits for the stopped turn to finish and for the context to be ready. A persisted message ID prevents duplicate continuation messages after an uncertain response. If the user has already continued the chat, automatic continuation is skipped. A T3 connection failure leaves the session pending for retry; it does not select the independent terminal-session job path.
+
 ## Measurement timing and T3 Code
 
 The swapper still measures the active account at most once every three minutes and idle accounts at most once every ten minutes. Consumers share an identity-bound cache and HTTP 429 cooldown. A hook cannot observe consumption newer than that cache. A 97% threshold therefore reserves headroom but cannot guarantee that a burst never reaches 100% between measurements.
