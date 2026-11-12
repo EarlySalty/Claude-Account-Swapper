@@ -2432,7 +2432,7 @@ impl App {
         match self.read_gate(path) {
             Ok(gate) => Ok(gate),
             Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
-                fs::rename(
+                fs::copy(
                     path,
                     path.with_extension(format!("corrupt-{}", unix_timestamp()?)),
                 )?;
@@ -3028,7 +3028,7 @@ impl App {
         log_event(&format!("Aufgabe [{}] wird von Hand gestartet", job.id));
         // Wer die Aufgabe selbst startet, will am Exitcode sehen, ob sie durchlief - der
         // Vermerk in der Aufgabendatei allein wird sonst leicht ueberlesen.
-        if !self.execute_job(&job)? {
+        if !self.execute_job(&job, true)? {
             let job = self.load_job(id)?;
             bail!(
                 "Aufgabe [{}] ist nicht durchgelaufen: {}",
@@ -3043,10 +3043,10 @@ impl App {
 
     /// Startet Claude fuer eine Aufgabe und schreibt das Ergebnis in die Aufgabe zurueck.
     /// Der Rueckgabewert sagt, ob der Lauf selbst geglueckt ist.
-    fn execute_job(&self, job: &Job) -> Result<bool> {
+    fn execute_job(&self, job: &Job, manual: bool) -> Result<bool> {
         let state_lock = self.lock_file("job-state")?;
         let mut job = match self.load_job(&job.id) {
-            Ok(current) if current.enabled => current,
+            Ok(current) if manual || current.enabled => current,
             Ok(_) => return Ok(false),
             Err(error) if !self.job_path(&job.id).exists() => {
                 log_problem(&format!("Aufgabe entfernt: {error:#}"));
@@ -3659,7 +3659,7 @@ impl App {
         let paths = self.paths.clone();
         thread::spawn(move || {
             let app = App::with_paths(paths);
-            if let Err(error) = app.execute_job(&job).map(|_| ()) {
+            if let Err(error) = app.execute_job(&job, false).map(|_| ()) {
                 log_problem(&format!(
                     "Ergebnis der Aufgabe [{}] konnte nicht gespeichert werden: {error:#}",
                     job.id
