@@ -92,7 +92,7 @@ Ohne Argument öffnet `claude-account` dasselbe Hauptmenü wie der Desktop-Start
 | `claude-account list` | Zeigt alle Profile, den letzten Sicherungsstand und den Token-Ablauf. |
 | `claude-account status` | Zeigt den von Claude bestaetigten aktiven Account. |
 | `claude-account usage` | Zeigt fuer jedes Profil die Auslastung des Fuenf-Stunden- und des Wochenfensters samt Reset-Zeitpunkt. |
-| `claude-account auto` | Wechselt auf den Account mit den meisten freien Kontingenten, wenn das aktive Limit voll ist. `--threshold <prozent>`, Standard 98. `--dry-run` zeigt nur die Entscheidung. |
+| `claude-account auto` | Wechselt auf den Account mit den meisten freien Kontingenten, bei drohendem Limit oder fehlendem aktiven Abo. `--threshold <prozent>`, Standard 98. `--dry-run` zeigt nur die Entscheidung. |
 | `claude-account limit <name>` | Setzt die eigene Grenze eines Accounts: `--five-hour <prozent>`, `--seven-day <prozent>`. `--hard` verbietet das Anbrechen, `--soft` erlaubt es wieder, `--clear` entfernt die Grenzen. |
 | `claude-account sync` | Sichert von Claude rotierte Tokens einmalig ins aktive Profil. |
 | `claude-account watch` | Macht dasselbe dauerhaft und frischt untaetige Profile auf; laeuft als Hintergrunddienst. `--interval <sekunden>`, Standard 5. `--auto-switch` schaltet den Wechsel bei vollem Limit einmalig ein, solange die Einstellungen den Auto-Wechsel nicht selbst festlegen (`--auto-switch-threshold <prozent>` setzt dabei die Schwelle); danach gelten allein die Einstellungen. |
@@ -178,7 +178,7 @@ Ist er eingeschaltet, prueft der Dienst jede Minute. Erreicht das Fuenf-Stunden-
 
 Ein Account, dessen Auslastung sich nicht abrufen laesst, wird als Ziel ausgeschlossen und mit Grund gemeldet: ein Wechsel auf gut Glueck kann im naechsten vollen Limit landen. Einzige Ausnahme ist ein ruhender Account, den die API drosselt: er zaehlt mit seinem letzten Stand, wenn kein Account mit frischen Zahlen frei ist. Schwelle aendern: `claude-account config --threshold 95`. Wieder abschalten: `claude-account config --auto-switch off`. Einzeln pruefen: `claude-account usage`, `claude-account auto --dry-run`.
 
-Die Reserve kann einen Wechsel vor der Schwelle auslösen: Bei 98 Prozent Grenze und 5 Prozentpunkten Reserve wird ab 93 Prozent ein sicheres Ziel gesucht, auch ohne Verlauf. Steigt der Verbrauch schnell, kann die Prognose früher wechseln. Die dreistündige Mindestverweildauer gilt nur für den Wochenausgleich. Der Schutz vor einem vollen Limit greift auch unmittelbar nach einem automatischen Wechsel. Manuelle Fixierungen behalten ihre bisherige Wirkung.
+Die Reserve kann einen Wechsel vor der Schwelle auslösen: Bei 98 Prozent Grenze und 5 Prozentpunkten Reserve wird ab 93 Prozent ein sicheres Ziel gesucht, auch ohne Verlauf. Steigt der Verbrauch schnell, kann die Prognose früher wechseln. Die dreistündige Mindestverweildauer gilt nur für den Wochenausgleich. Der Schutz vor einem vollen Limit greift auch unmittelbar nach einem automatischen Wechsel. Manuelle Fixierungen gelten, solange ein aktives Abo bestätigt ist.
 
 #### Wochenkontingent gleichmaessig verbrauchen
 

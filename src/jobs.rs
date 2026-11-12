@@ -313,7 +313,11 @@ pub fn readiness(job: &Job, usage: &Usage, threshold: f64, now: u64) -> Readines
     if !job.enabled {
         return Readiness::Waiting("Aufgabe ist abgeschaltet".to_owned());
     }
-    if job.pending_confirmation.is_some() {
+    if job
+        .pending_confirmation
+        .as_ref()
+        .is_some_and(|pending| !crate::confirmation_expired(pending.completed_at, now))
+    {
         return Readiness::Waiting(
             "Bestätigung des letzten Laufs wartet auf eine spätere Messung".to_owned(),
         );
@@ -659,5 +663,22 @@ mod tests {
         assert!(job.skip_permissions);
         assert_eq!(job.timeout_minutes, DEFAULT_TIMEOUT_MINUTES);
         assert_eq!(job.text(), "tu was");
+    }
+    #[test]
+    fn pending_confirmation_blocks_only_until_its_expiry() {
+        let data = br#"{"id":"0001","title":"pending","art":"prompt","text":"run","cwd":"/tmp","created_at":10,"pending_confirmation":{"account":"quota","completed_at":1000}}"#;
+        let job = parse_job(data, "0001").expect("job");
+        let usage = Usage {
+            five_hour: Bucket {
+                utilization: 0.0,
+                resets_at: None,
+            },
+            seven_day: Bucket {
+                utilization: 10.0,
+                resets_at: None,
+            },
+        };
+        assert!(!readiness(&job, &usage, 98.0, 1001).is_due());
+        assert!(readiness(&job, &usage, 98.0, 1000 + crate::QUOTA_WINDOW_SECONDS).is_due());
     }
 }

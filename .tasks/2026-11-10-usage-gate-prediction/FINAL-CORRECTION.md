@@ -1,3 +1,5 @@
+Historical record. The current contract is docs/usage-gate.md. Later corrections are recorded in .tasks/2026-11-12-usage-gate-recovery/CAUSE.md. Earlier verification claims apply only to the revisions named below.
+
 # Authorized focused correction
 
 The user authorized one further correction and gate attempt after the c3bd0fa verdict. The current base of this correction is fd494ef, including the separately tested subscription fix.

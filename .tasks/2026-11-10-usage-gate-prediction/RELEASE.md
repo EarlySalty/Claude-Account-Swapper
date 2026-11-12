@@ -1,3 +1,5 @@
+Historical record. The current contract is docs/usage-gate.md. Later corrections are recorded in .tasks/2026-11-12-usage-gate-recovery/CAUSE.md. Earlier verification claims apply only to the revisions named below.
+
 # Shared usage gate and quota protection
 
 The release consolidates the implementation and two review correction rounds. Earlier branch commits remain pushed under fix/usage-gate-prediction. The independent review and gate logs remain in the local task directory; the final release commit is gated separately before deployment.

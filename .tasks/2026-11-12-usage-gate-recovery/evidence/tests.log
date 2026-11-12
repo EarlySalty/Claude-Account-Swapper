@@ -1,0 +1,258 @@
+cargo-remote: Abgleich 1 Quelle(n) in 2s
+cargo-remote: ubuntu Slot 2, jobs=4
+   Compiling claude-account-swapper v0.2.0 (/home/nathanael/.worktrees/cas-usage-integration)
+    Finished `verify` profile [optimized] target(s) in 2.08s
+
+running 117 tests
+     Running unittests src/lib.rs (/home/naniadm/cargo-remote/ws/240059b920430f39/target/verify/deps/claude_account_swapper-60d886ff631a6989)
+test config::tests::der_zustandssatz_nennt_beide_schalter ... ok
+test config::tests::eine_leere_datei_ist_die_standardkonfiguration ... ok
+test config::tests::fehlende_felder_fallen_auf_die_standardwerte_zurueck ... ok
+test forecast::tests::burn_adds_growth_of_every_account_over_the_longest_span ... ok
+test config::tests::unsinnige_werte_sind_ein_fehler ... ok
+test forecast::tests::exhaustion_counts_resets_that_happen_before_the_pool_runs_dry ... ok
+test forecast::tests::record_starts_over_after_a_window_reset_and_forgets_old_samples ... ok
+test idle_compact::tests::a_checked_thread_is_skipped_until_it_runs_again ... ok
+test idle_compact::tests::compacts_unsettled_threads_idle_inside_the_cache_window ... ok
+test jobs::tests::die_bewertung_liefert_zu_jeder_aufgabe_eine_begruendung ... ok
+test jobs::tests::der_ping_feuert_nur_in_ein_ungenutztes_fenster ... ok
+test jobs::tests::die_sperre_zaehlt_ab_dem_ende_eines_langen_laufs ... ok
+test jobs::tests::ein_titel_wird_gekuerzt_und_einzeilig ... ok
+test jobs::tests::ein_volles_fuenfstundenfenster_haelt_die_aufgabe_zurueck ... ok
+test jobs::tests::ein_volles_wochenfenster_haelt_die_aufgabe_zurueck ... ok
+test jobs::tests::ein_wirkungsloser_ping_wird_nicht_sofort_wiederholt ... ok
+test jobs::tests::ein_volles_limit_haelt_auch_den_ping_zurueck ... ok
+test jobs::tests::eine_abgeschaltete_aufgabe_laeuft_nie ... ok
+test jobs::tests::eine_aufgabe_laeuft_im_selben_fenster_kein_zweites_mal ... ok
+test jobs::tests::eine_aufgabe_wartet_im_laufenden_fenster_und_startet_nach_dem_reset ... ok
+test jobs::tests::eine_datei_ohne_die_neueren_felder_bleibt_lesbar ... ok
+test jobs::tests::eine_frische_aufgabe_startet_im_ungenutzten_fenster_sofort ... ok
+test jobs::tests::eine_gerade_gelaufene_aufgabe_startet_trotz_fensterwechsel_nicht_erneut ... ok
+test jobs::tests::eine_sitzungs_id_mit_sonderzeichen_wird_abgelehnt ... ok
+test jobs::tests::eine_gespeicherte_aufgabe_bleibt_beim_lesen_dieselbe ... ok
+test jobs::tests::nummern_zaehlen_hoch_und_bleiben_vierstellig ... ok
+test jobs::tests::pending_confirmation_blocks_only_until_its_expiry ... ok
+test limit::tests::compaction_exemption_ends_with_its_stop ... ok
+test limit::tests::compaction_never_spends_past_a_hard_stop ... ok
+test limit::tests::compaction_starts_before_the_last_account_hits_the_pause ... ok
+test limit::tests::compaction_turns_are_left_alone_and_subagents_stop_with_the_parent ... ok
+test limit::tests::entry_after_pre_pause_compaction_keeps_its_markers ... ok
+test limit::tests::explicit_hook_model_overrides_process_ancestry ... ok
+test limit::tests::hard_stops_block_release_and_count_as_full ... ok
+test limit::tests::hook_stays_silent_when_fresh_usage_is_no_longer_blocked ... ok
+test limit::tests::inactive_state_never_answers ... ok
+test limit::tests::injected_name_is_not_claude_even_when_listed ... ok
+test limit::tests::missing_catalog_keeps_the_previous_claude_names ... ok
+test limit::tests::manual_pin_blocks_resume_only_for_a_pinned_account_that_fits ... ok
+test limit::tests::near_reset_does_not_open_the_pause_and_a_far_one_does ... ok
+test limit::tests::only_a_compacted_or_small_thread_is_cheap_to_resume ... ok
+test limit::tests::only_a_claude_model_name_counts ... ok
+test limit::tests::only_a_proven_free_account_lifts_the_block ... ok
+test limit::tests::only_foreign_messages_after_the_instruction_count ... ok
+test limit::tests::only_warm_idle_threads_are_candidates ... ok
+test limit::tests::process_cmdline_decides_claude_model ... ok
+test limit::tests::post_tool_use_tells_once_and_stop_then_records ... ok
+test limit::tests::partial_catalog_adds_fable_without_dropping_known_names ... ok
+test limit::tests::reason_names_the_window_that_really_blocks ... ok
+test limit::tests::reentry_keeps_only_stopped_sessions_and_fresh_compaction_markers_and_resets_the_budget ... ok
+test limit::tests::released_parent_stop_keeps_the_child_clock_and_takes_parent_paths ... ok
+test limit::tests::released_pause_still_records_stops_and_keeps_the_first ... ok
+test limit::tests::resume_message_allows_compacted_subagents ... ok
+test limit::tests::scoped_pause_only_touches_listed_sessions ... ok
+test limit::tests::soft_stops_are_a_reserve_not_a_barrier ... ok
+test limit::tests::subagent_hooks_do_not_forget_the_parent_session ... ok
+test limit::tests::switch_target_only_when_active_is_unusable ... ok
+test limit::tests::t3_gets_two_minutes_to_resume_first ... ok
+test limit::tests::todo_path_comes_from_the_last_mention ... ok
+test limit::tests::todo_comes_only_from_replies_after_the_instruction ... ok
+test limit::tests::untold_stop_after_another_block_is_still_recorded ... ok
+test limit::tests::untold_stop_is_blocked_once ... ok
+test limit::tests::verdict_needs_usable_quota_to_release ... ok
+test subagent_compact::tests::compacts_only_while_the_settled_thread_is_still_warm ... ok
+test subagent_compact::tests::expiry_and_removal_keep_fresh_marks ... ok
+test subagent_compact::tests::only_parent_spawn_tools_mark_the_session ... ok
+test subagent_compact::tests::scope_limits_marked_sessions ... ok
+test t3::tests::projection_reads_latest_turn_and_compaction ... ok
+test t3::tests::shell_keeps_live_claude_threads_and_flags_busy_ones ... ok
+test limit::tests::prompt_after_the_stop_means_the_user_continued ... ok
+test tests::live_account_lookup_is_not_repeated_for_the_same_login ... ok
+test limit::tests::catalog_files_define_claude_and_injected_names ... ok
+test tests::prediction_rejects_resets_negative_slopes_stale_and_repeated_samples ... ok
+test tests::prediction_uses_age_poll_and_lead_for_both_windows ... ok
+test tests::pending_ping_is_shared_by_identity_and_expires ... ok
+test usage::tests::account_with_real_quota_is_not_swapped_back_and_forth ... ok
+test tests::confirmation_accepts_only_the_original_window_before_expiry ... ok
+test tests::retry_delay_grows_and_never_shortens_server_delay ... ok
+test usage::tests::aktiver_account_mit_fruehestem_reset_bleibt ... ok
+test usage::tests::bei_gleichem_fuenfstundenfenster_entscheidet_die_woche ... ok
+test usage::tests::aktiver_account_unter_der_schwelle_bleibt ... ok
+test usage::tests::beim_vollen_limit_gewinnt_der_dringendste_wochenrest ... ok
+test usage::tests::ein_account_unter_seiner_grenze_bleibt_stehen ... ok
+test usage::tests::ein_ungenutztes_fenster_ohne_reset_zeitpunkt_ist_kein_fehler ... ok
+test usage::tests::beim_vollen_limit_schlaegt_fuenf_stunden_luft_das_wochentempo ... ok
+test usage::tests::echte_antwort_wird_gelesen_und_zusatzfelder_stoeren_nicht ... ok
+test usage::tests::ein_account_ueber_seiner_grenze_wird_nicht_als_ziel_gewaehlt ... ok
+test usage::tests::ein_volles_wochenfenster_zaehlt_als_wartezeit_nicht_das_fuenfstundenfenster ... ok
+test usage::tests::eine_eigene_grenze_verlaesst_den_account_frueher ... ok
+test usage::tests::eine_eigene_wochengrenze_wirkt_genauso ... ok
+test usage::tests::eine_harte_grenze_wird_nie_angebrochen_eine_weiche_schon ... ok
+test usage::tests::expired_windows_are_empty_and_have_no_reset ... ok
+test usage::tests::eine_harte_grenze_zaehlt_auch_fuer_die_wartezeit ... ok
+test usage::tests::freiester_account_gewinnt ... ok
+test usage::tests::gleichmaessiges_tempo_loest_keinen_wechsel_aus ... ok
+test usage::tests::gleichstand_entscheidet_der_name_und_bleibt_stabil ... ok
+test usage::tests::fehlende_felder_sind_ein_fehler_und_kein_stiller_nullwert ... ok
+test usage::tests::knapp_unter_der_schwelle_bleibt_aktiv ... ok
+test usage::tests::kurz_vor_dem_reset_wird_der_rest_verbraucht ... ok
+test usage::tests::live_account_reads_email_and_organization ... ok
+test usage::tests::manual_pin_holds_with_quota_or_unknown_usage ... ok
+test usage::tests::ohne_datierbaren_reset_gewinnt_ein_account_das_warten_nicht ... ok
+test usage::tests::ohne_besseres_ziel_bleibt_der_aktive_account_in_seiner_reserve ... ok
+test usage::tests::ohne_freien_account_wird_eine_weiche_reserve_angebrochen ... ok
+test usage::tests::ohne_kandidaten_wird_nicht_gewechselt ... ok
+test usage::tests::ohne_freien_account_gewinnt_der_fruehere_reset ... ok
+test usage::tests::schwelle_ist_erreicht_nicht_erst_ueberschritten ... ok
+test usage::tests::unbekannte_auslastung_des_aktiven_accounts_verhindert_den_wechsel ... ok
+test usage::tests::subscription_requires_live_entitlement_and_distinguishes_cancellation ... ok
+test usage::tests::volles_fuenf_stunden_fenster_blockiert_den_vorzug ... ok
+test usage::tests::volles_wochenfenster_schliesst_einen_sonst_freien_account_aus ... ok
+test web::tests::only_allowlisted_hosts_and_their_own_origin_pass ... ok
+test web::tests::pruning_never_drops_a_running_task ... ok
+test usage::tests::stale_targets_only_count_without_a_confirmed_free_target ... ok
+test tests::dashboard_does_not_present_saved_max_or_old_usage_as_current_entitlement ... ok
+test limit::tests::alias_levels_keep_one_quota_and_the_active_profile_limits ... ok
+     Running unittests src/main.rs (/home/naniadm/cargo-remote/ws/240059b920430f39/target/verify/deps/claude_account-1250f73792f5b415)
+     Running tests/cli.rs (/home/naniadm/cargo-remote/ws/240059b920430f39/target/verify/deps/cli-e71808b07a9712cd)
+test limit::tests::only_real_prompts_after_the_stop_count_as_continuation ... ok
+
+test result: ok. 117 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 112 tests
+test a_failed_request_reports_what_claude_wrote_to_stderr ... ok
+test a_job_runs_with_its_own_prompt_in_its_own_directory ... ok
+test a_job_without_its_directory_is_switched_off_with_a_reason ... ok
+test a_failed_run_keeps_the_job_and_records_the_reason ... ok
+test a_one_off_job_is_done_after_its_run_a_repeating_one_stays ... ok
+test a_reported_reason_never_carries_a_token_into_the_log ... ok
+test a_rate_limited_account_is_not_asked_again_during_the_backoff ... ok
+test a_throttled_target_counts_with_its_old_usage_and_expired_windows_are_free ... ok
+test auth_environment_overrides_block_switching_without_mutation ... ok
+test a_resume_job_hands_the_session_id_to_claude ... ok
+test an_active_account_does_not_trust_usage_older_than_the_cache_limit ... ok
+test auto_asks_no_other_account_while_the_active_one_is_fine ... ok
+test aliases_and_rotated_tokens_do_not_clear_the_shared_cooldown ... ok
+test auto_dry_run_reports_without_switching ... ok
+test auto_breaks_into_a_soft_reserve_when_nothing_else_is_left ... ok
+test auto_falls_back_to_the_remembered_usage_when_the_api_rate_limits ... ok
+test auto_ignores_a_stale_remembered_usage ... ok
+test auto_keeps_the_active_account_below_the_threshold ... ok
+test auto_never_leaks_the_access_token_into_its_output ... ok
+test auto_leaves_an_account_at_its_own_stop ... ok
+test auto_ignores_an_account_whose_weekly_limit_is_full ... ok
+test auto_rejects_an_impossible_threshold ... ok
+test auto_picks_the_earliest_reset_when_every_account_is_full ... ok
+test auto_never_switches_onto_an_account_beyond_its_own_stop ... ok
+test auto_reports_an_unreachable_usage_api_and_switches_nothing ... ok
+test auto_uses_a_fresh_remembered_usage_without_asking_again ... ok
+test auto_respects_a_hard_stop_even_with_nothing_else_left ... ok
+test auto_switches_to_the_account_with_free_limits ... ok
+test cold_measurement_reserve_switches_without_a_previous_sample ... ok
+test corrupt_state_does_not_close_the_desktop_menu ... ok
+test failed_first_login_removes_partially_written_credentials ... ok
+test concurrent_cli_consumers_share_measurements_and_preserve_age ... ok
+test cooldown_is_shared_across_accounts_and_survives_restart ... ok
+test identity_conflict_stays_an_error_when_the_live_token_is_unknown ... ok
+test expired_subscription_discards_old_quota_and_recovers_to_another_account ... ok
+test future_legacy_measurement_is_not_fresh ... ok
+test incomplete_profile_directories_do_not_block_valid_accounts ... ok
+test invalid_saved_credentials_never_replace_the_live_login ... ok
+test keepalive_does_not_hunt_a_profile_that_needs_no_renewal ... ok
+test keepalive_keeps_an_expired_profile_untouched_and_says_so ... ok
+test inactive_account_recovers_into_a_soft_reserve ... ok
+test keepalive_never_renews_the_login_that_is_currently_live ... ok
+test keepalive_leaves_no_working_directory_behind ... ok
+test failed_requests_never_promote_old_reserve_data_to_throttled_data ... ok
+test keepalive_reports_a_failed_request_instead_of_calling_it_valid ... ok
+test keepalive_renews_an_idle_profile_without_touching_the_active_login ... ok
+test keepalive_skips_profiles_that_were_recently_synced ... ok
+test keepalive_saves_the_renewed_login_even_if_the_active_one_changes_meanwhile ... ok
+test legacy_profiles_without_sync_metadata_still_load ... ok
+test limit_rejects_impossible_values_and_unknown_profiles ... ok
+test limit_stores_its_own_stops_in_the_profile ... ok
+test list_forgets_the_mark_after_a_successful_renewal ... ok
+test list_marks_a_profile_whose_renewal_failed ... ok
+test list_warns_about_a_refresh_token_that_expires_soon ... ok
+test login_preserves_the_previous_account_and_saves_the_new_one ... ok
+test login_preserves_credentials_rotated_by_the_status_check ... ok
+test login_recovers_from_a_logged_out_stale_credential_file ... ok
+test login_with_the_wrong_account_restores_the_previous_login ... ok
+test menu_can_save_the_current_account_without_cli_arguments ... ok
+test menu_can_run_the_one_time_login_flow ... ok
+test menu_header_uses_the_real_claude_login_not_stale_switcher_state ... ok
+test menu_can_switch_between_saved_accounts ... ok
+test menu_returns_after_an_invalid_action_instead_of_closing ... ok
+test pending_job_confirmation_requires_later_same_account_measurement ... ok
+test prediction_switches_early_only_with_a_safe_target ... ok
+test profile_names_cannot_escape_the_account_store ... ok
+test profiles_written_before_this_version_still_load ... ok
+test quota_identity_separates_orgs_and_deduplicates_aliases_without_429 ... ok
+test save_and_switch_syncs_the_latest_outgoing_credentials ... ok
+test saved_profile_stores_a_fingerprint_instead_of_the_token ... ok
+test saving_an_account_again_keeps_its_limits ... ok
+test settings_survive_a_restart_and_a_broken_file_falls_back_to_defaults ... ok
+test stale_identity_cache_after_switch_is_resolved_by_the_live_token ... ok
+test switch_clears_the_stale_account_identity_cache ... ok
+test switch_no_check_keeps_the_old_unverified_way ... ok
+test switch_puts_the_renewed_login_live_when_the_snapshot_needed_a_refresh ... ok
+test switch_refuses_a_dead_snapshot_instead_of_breaking_running_sessions ... ok
+test switch_refuses_to_discard_an_unsaved_active_login ... ok
+test switch_refuses_to_sync_when_claude_reports_a_stale_identity ... ok
+test switch_spends_no_request_while_the_snapshot_is_still_valid ... ok
+test switch_to_the_active_account_never_rotates_the_live_login ... ok
+test switch_without_a_known_identity_syncs_the_last_active_profile ... ok
+test sync_refuses_when_claude_reports_a_different_identity ... ok
+test sync_reports_unchanged_credentials_without_rewriting ... ok
+test sync_without_identity_updates_the_last_active_profile ... ok
+test sync_writes_rotated_live_tokens_into_the_active_profile ... ok
+test sync_writes_the_state_even_when_the_snapshot_already_matches ... ok
+test the_menu_creates_a_job ... ok
+test the_menu_offers_usage_limits_and_automation ... ok
+test the_menu_switches_the_window_ping_on ... ok
+test a_hanging_job_is_stopped_by_its_time_limit ... ok
+test keepalive_rescues_the_renewed_login_when_the_request_runs_into_the_timeout ... ok
+test broken_ping_bookkeeping_does_not_stop_quota_switching ... ok
+test pending_pings_block_active_and_idle_model_requests ... ok
+test later_permitted_measurement_confirms_or_rejects_a_pending_ping ... ok
+test a_job_deleted_during_its_run_does_not_come_back ... ok
+test a_job_switched_off_during_its_run_stays_off ... ok
+test the_rerun_block_counts_from_the_end_of_a_run ... ok
+test usage_lists_every_account_and_shows_failures ... ok
+test the_service_asks_for_usage_only_when_it_has_something_to_do ... ok
+test watch_rejects_a_threshold_without_the_opt_in ... ok
+test the_ping_stays_quiet_while_a_window_is_running ... ok
+test the_service_opens_a_fresh_window_with_a_ping ... ok
+test the_service_opens_the_window_of_an_idle_account_too ... ok
+test weekly_pacing_does_not_select_a_target_inside_the_safety_reserve ... ok
+test watch_keeps_the_active_profile_in_sync_with_rotated_tokens ... ok
+test watch_auto_switch_flag_does_not_override_saved_settings ... ok
+test watch_logs_every_decision_including_the_ones_without_changes ... ok
+test the_service_starts_a_due_job_and_marks_it_done ... ok
+test watch_switches_nothing_without_the_opt_in ... ok
+test watch_switches_with_the_opt_in ... ok
+   Doc-tests claude_account_swapper
+test watch_waits_instead_of_guessing_while_claude_has_no_identity ... ok
+
+test result: ok. 112 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.94s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+cargo-remote: EXIT=0 nach 12s

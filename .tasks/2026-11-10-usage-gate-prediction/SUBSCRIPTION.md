@@ -1,3 +1,5 @@
+Historical record. The current contract is docs/usage-gate.md. Later corrections are recorded in .tasks/2026-11-12-usage-gate-recovery/CAUSE.md. Earlier verification claims apply only to the revisions named below.
+
 # Subscription freshness
 
 Root cause:

@@ -57,7 +57,7 @@ enum AccountCommand {
         #[arg(long, conflicts_with_all = ["five_hour", "seven_day", "hard", "soft"])]
         clear: bool,
     },
-    /// Bei vollem Limit auf den Account mit den meisten freien Kontingenten wechseln
+    /// Account bei drohendem Limit oder fehlendem Abo wechseln
     Auto {
         /// Ab dieser Auslastung in Prozent gilt ein Limit als verbraucht
         #[arg(long, default_value_t = DEFAULT_SWITCH_THRESHOLD)]
@@ -119,7 +119,7 @@ enum AccountCommand {
         #[command(subcommand)]
         command: JobCommand,
     },
-    /// Das Fuenf-Stunden-Fenster sofort eroeffnen
+    /// Ein freies Fünf-Stunden-Fenster öffnen, sobald keine Ping-Bestätigung aussteht
     Ping,
     /// Claude-Code-Hook der Limit-Pause; liest das Hook-JSON von stdin
     Hook,

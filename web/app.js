@@ -105,7 +105,7 @@ function renderFlow() {
     const pacing = config.weekly_pacing !== false;
     const urgent = [...profiles].map((profile) => ({ profile, pace: weeklyPace(profile, threshold) })).filter((entry) => entry.pace).sort((left, right) => right.pace.pace - left.pace.pace)[0];
     note = !others.length
-      ? "Speichere einen zweiten Account, damit gewechselt werden kann."
+      ? profiles.some((profile) => !profile.active) ? "Kein anderer gespeicherter Account hat ein bestätigtes aktives Abo." : "Speichere einen zweiten Account, damit gewechselt werden kann."
       : pacing
         ? `Bei ${threshold}% im 5h- oder Wochenfenster wird sofort gewechselt. Dazwischen wird das Wochenkontingent gleichmäßig verbraucht${urgent ? `, gerade bevorzugt: ${urgent.profile.name}` : ""}.`
         : `Erreicht der aktive Account ${threshold}% oder seine eigene Grenze, wechselt der Dienst zum freiesten Account (${others.join(", ")}).`;
@@ -176,7 +176,7 @@ function switchProfile(name, skipCheck = false) {
   run("api/accounts/switch", { name, skipCheck });
 }
 
-function createUsageBucket(label, bucket, ageSeconds, staleAfterSeconds = 600) {
+function createUsageBucket(label, bucket, ageSeconds, staleAfterSeconds) {
   const wrap = el("div", "usage-block");
   const heading = el("div", "usage-heading");
   heading.append(el("span", "", label), el("strong", "", percent(bucket?.utilization)));
@@ -267,7 +267,7 @@ function updateQuickSwitchButton() {
   const button = $("#quick-switch-button");
   const selected = profiles.find((profile) => profile.name === select.value);
   button.disabled = !selected || selected.active;
-  button.textContent = selected ? selected.active ? "Bereits aktiv" : "Jetzt wechseln" : profiles.length ? "Account auswählen" : "Kein Account gespeichert";
+  button.textContent = selected ? selected.active ? "Bereits aktiv" : "Jetzt wechseln" : profiles.length ? "Account auswählen" : (dashboard?.profiles || []).length ? "Kein aktives Abo bestätigt" : "Kein Account gespeichert";
 }
 
 function limitRowInUse(row) {

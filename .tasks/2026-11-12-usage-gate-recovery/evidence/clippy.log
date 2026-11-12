@@ -1,0 +1,7 @@
+cargo-slot: alle Slots belegt, warte auf den nächsten freien
+cargo-remote: Abgleich 1 Quelle(n) in 5s
+cargo-remote: ubuntu Slot 2, jobs=4
+cargo-remote: Build-Messung nicht verfügbar, Build läuft trotzdem.
+    Checking claude-account-swapper v0.2.0 (/home/nathanael/.worktrees/cas-usage-integration)
+    Finished `verify` profile [optimized] target(s) in 1.47s
+cargo-remote: EXIT=0 nach 9s

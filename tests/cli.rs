@@ -174,6 +174,8 @@ esac
             .env("CLAUDE_ACCOUNT_SWITCHER_CLAUDE_BIN", &self.fake_claude)
             .env("FAKE_CLAUDE_STATUS", &self.status)
             .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CLAUDE_ACCOUNT_SWITCHER_USAGE_RESERVE")
+            .env_remove("CLAUDE_ACCOUNT_SWITCHER_SWITCH_LEAD_SECONDS")
             .env(
                 "CLAUDE_ACCOUNT_SWITCHER_USAGE_URL",
                 "http://127.0.0.1:9/usage",
@@ -1951,6 +1953,7 @@ fn auto_switches_to_the_account_with_free_limits() {
 #[test]
 fn auto_keeps_the_active_account_below_the_threshold() {
     let harness = harness_with_two_accounts();
+    fs::write(harness.store.join("config.json"), r#"{"usage_reserve":0}"#).expect("config");
     let server = UsageServer::start(vec![
         ("access-work", 200, usage_body(97.0, 40.0)),
         ("access-personal", 200, usage_body(0.0, 0.0)),
@@ -1959,7 +1962,6 @@ fn auto_keeps_the_active_account_below_the_threshold() {
     let output = harness
         .command()
         .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
-        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_RESERVE", "0")
         .args(["auto"])
         .output()
         .expect("auto");
@@ -2321,6 +2323,33 @@ fn write_cached_usage(harness: &Harness, name: &str, five: f64, seven: f64, age_
         serde_json::to_vec(&payload).expect("usage json"),
     )
     .expect("write usage cache");
+    let profile: serde_json::Value = serde_json::from_slice(
+        &fs::read(harness.store.join(format!("accounts/{name}/profile.json"))).expect("profile"),
+    )
+    .expect("profile json");
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "v2:{}",
+        serde_json::to_string(&(
+            profile["email"]
+                .as_str()
+                .expect("email")
+                .trim()
+                .to_lowercase(),
+            profile["org_id"].as_str()
+        ))
+        .expect("identity")
+    );
+    let path = harness.store.join(format!(
+        "usage-gate-{:x}.json",
+        Sha256::digest(identity.as_bytes())
+    ));
+    if path.exists() {
+        let mut gate: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("gate")).expect("gate json");
+        gate["cached"] = payload;
+        fs::write(path, serde_json::to_vec(&gate).expect("gate")).expect("write gate");
+    }
 }
 
 #[test]
@@ -3290,20 +3319,29 @@ fn concurrent_cli_consumers_share_measurements_and_preserve_age() {
         ("access-work", 200, usage_body(20.0, 30.0)),
         ("access-personal", 200, usage_body(10.0, 20.0)),
     ]);
-    let mut children: Vec<_> = (0..4)
+    let children: Vec<_> = (0..4)
         .map(|_| {
             harness
                 .command()
                 .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
                 .args(["usage"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("consumer")
         })
         .collect();
-    for child in &mut children {
-        assert!(child.wait().expect("consumer exit").success());
+    for child in children {
+        let output = child.wait_with_output().expect("consumer output");
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("work")
+                && stdout.contains("personal")
+                && stdout.contains("20.0%")
+                && stdout.contains("10.0%"),
+            "{stdout}"
+        );
     }
     assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 2);
     let files: Vec<_> = fs::read_dir(&harness.store)
@@ -3368,7 +3406,7 @@ fn prediction_switches_early_only_with_a_safe_target() {
     let output = harness.run(&["auto", "--dry-run"]);
     assert_success(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("Wuerde wechseln zu personal"));
-    write_cached_usage(&harness, "personal", 99.0, 99.0, 5);
+    write_cached_usage(&harness, "personal", 91.0, 91.0, 5);
     let output = harness.run(&["auto", "--dry-run"]);
     assert_success(&output);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("Wuerde wechseln"));
@@ -3434,16 +3472,7 @@ fn cold_measurement_reserve_switches_without_a_previous_sample() {
 fn future_legacy_measurement_is_not_fresh() {
     let harness = harness_with_two_accounts();
     write_cached_usage(&harness, "work", 10.0, 10.0, 0);
-    let path = harness.store.join("profiles/work/usage.json");
-    let path = if path.exists() {
-        path
-    } else {
-        harness
-            .saved_credentials("work")
-            .parent()
-            .expect("profile")
-            .join("usage.json")
-    };
+    let path = harness.store.join("accounts/work/usage.json");
     let mut cached: serde_json::Value =
         serde_json::from_slice(&fs::read(&path).expect("cache")).expect("json");
     cached["fetched_at"] = json!(u64::MAX);
@@ -3530,6 +3559,17 @@ fn pending_job_confirmation_requires_later_same_account_measurement() {
             .to_rfc3339()
     );
     fs::write(cache_path, serde_json::to_vec(&cache).expect("json")).expect("write");
+    use sha2::{Digest, Sha256};
+    let gate_path = harness.store.join(format!(
+        "usage-gate-{:x}.json",
+        Sha256::digest(b"v2:[\"work@example.test\",null]")
+    ));
+    if gate_path.exists() {
+        let mut gate: serde_json::Value =
+            serde_json::from_slice(&fs::read(&gate_path).expect("gate")).expect("json");
+        gate["cached"] = cache;
+        fs::write(gate_path, serde_json::to_vec(&gate).expect("json")).expect("write gate");
+    }
     assert_success(&harness.run(&["jobs"]));
     let job = harness.read_job("0001");
     assert!(job["pending_confirmation"].is_null(), "{job}");
@@ -3540,6 +3580,7 @@ fn pending_job_confirmation_requires_later_same_account_measurement() {
 fn later_permitted_measurement_confirms_or_rejects_a_pending_ping() {
     for opens_window in [true, false] {
         let harness = harness_with_two_accounts();
+        assert_success(&harness.run(&["config", "--ping", "on"]));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -3547,7 +3588,7 @@ fn later_permitted_measurement_confirms_or_rejects_a_pending_ping() {
         fs::write(
             harness.store.join("ping.json"),
             serde_json::to_vec(
-                &json!({"pending_confirmations":{"v2:[\"work@example.test\",null]":now-60}}),
+                &json!({"pending_confirmations":{"v2:[\"work@example.test\",null]":now-60},"idle_profiles":{"v2:[\"work@example.test\",null]":now-60}}),
             )
             .expect("json"),
         )
@@ -3699,7 +3740,7 @@ fn pending_pings_block_active_and_idle_model_requests() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        log.contains("Bestätigung des letzten Pings steht aus")
+        log.contains("Fenster-Ping wartet: Bestätigung des letzten Pings steht aus")
             && log.contains("Fenster-Ping wartet auf Bestätigung"),
         "{log}"
     );
@@ -3784,4 +3825,80 @@ fn expired_subscription_discards_old_quota_and_recovers_to_another_account() {
     assert_eq!(usage.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     let checked = harness.run(&["switch", "work"]);
     assert!(!checked.status.success());
+    assert!(String::from_utf8_lossy(&checked.stderr).contains("Kein aktives Claude-Abo"));
+}
+
+#[test]
+fn failed_requests_never_promote_old_reserve_data_to_throttled_data() {
+    for status in [401, 500] {
+        let harness = harness_with_two_accounts();
+        write_cached_usage(&harness, "work", 100.0, 100.0, 0);
+        write_cached_usage(&harness, "personal", 10.0, 10.0, 10 * 3600);
+        let server = UsageServer::start(vec![("access-personal", status, "{}".to_owned())]);
+        for _ in 0..2 {
+            let output = harness
+                .command()
+                .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &server.url)
+                .args(["auto", "--dry-run"])
+                .output()
+                .expect("auto");
+            assert_success(&output);
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains("Wuerde wechseln zu personal"),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let recovered = UsageServer::start(vec![("access-personal", 200, usage_body(10.0, 10.0))]);
+        for entry in fs::read_dir(&harness.store).expect("store") {
+            let path = entry.expect("entry").path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("usage-gate-"))
+            {
+                let mut gate: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).expect("gate")).expect("json");
+                gate["until"] = json!(0);
+                fs::write(path, serde_json::to_vec(&gate).expect("json")).expect("retry elapsed");
+            }
+        }
+        let output = harness
+            .command()
+            .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &recovered.url)
+            .args(["auto"])
+            .output()
+            .expect("recover");
+        assert_success(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Wechsel zu personal"));
+        let credentials: serde_json::Value = serde_json::from_slice(
+            &fs::read(harness.home.join(".claude/.credentials.json")).expect("credentials"),
+        )
+        .expect("json");
+        assert_eq!(
+            credentials["claudeAiOauth"]["accessToken"],
+            "access-personal"
+        );
+    }
+}
+
+#[test]
+fn inactive_account_recovers_into_a_soft_reserve() {
+    let harness = harness_with_two_accounts();
+    assert_success(&harness.run(&["limit", "personal", "--five-hour", "50", "--soft"]));
+    let profiles = UsageServer::start(vec![
+        ("access-work", 200, json!({"account":{"email":"work@example.test","has_claude_max":false,"has_claude_pro":false},"organization":{"organization_type":"claude_free"}}).to_string()),
+        ("access-personal", 200, json!({"account":{"email":"personal@example.test","has_claude_pro":true},"organization":{"organization_type":"claude_pro"}}).to_string()),
+    ]);
+    let usage = UsageServer::start(vec![("access-personal", 200, usage_body(60.0, 20.0))]);
+    let output = harness
+        .command()
+        .env("CLAUDE_ACCOUNT_SWITCHER_PROFILE_URL", &profiles.url)
+        .env("CLAUDE_ACCOUNT_SWITCHER_USAGE_URL", &usage.url)
+        .args(["auto"])
+        .output()
+        .expect("auto");
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Wechsel zu personal"));
 }

@@ -52,7 +52,8 @@ const USAGE_REFRESH_IDLE_SECONDS: u64 = 600;
 const USAGE_CACHE_MAX_AGE_SECONDS: u64 = 30 * 60;
 const PACING_CACHE_MAX_AGE_SECONDS: u64 = USAGE_REFRESH_IDLE_SECONDS;
 const USAGE_BACKOFF_DEFAULT_SECONDS: u64 = 5 * 60;
-const USAGE_BACKOFF_MIN_SECONDS: u64 = 60;
+const MAX_API_DELAY_SECONDS: u64 = 24 * 60 * 60;
+const PREDICTION_MAX_AGE_SECONDS: u64 = 20 * 60;
 const USAGE_BACKOFF_MAX_SECONDS: u64 = 15 * 60;
 /// Nur eine Bremse gegen haengende Laeufe, so lang wie ein Fuenf-Stunden-Fenster.
 const JOB_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60 * 60);
@@ -68,6 +69,14 @@ struct UsageGate {
     subscription_retry_at: u64,
 }
 
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ProfileCheck {
+    account: Option<usage::LiveAccount>,
+    checked_at: u64,
+    retry_at: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 struct SubscriptionCheck {
     value: usage::Subscription,
@@ -81,7 +90,7 @@ impl std::fmt::Display for SubscriptionInactive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Kein aktives Claude-Abo; alte Auslastung wird nicht verwendet"
+            "Kein aktives Claude-Abo bestätigt; mit `claude-account usage` erneut prüfen"
         )
     }
 }
@@ -324,6 +333,7 @@ pub struct App {
     paths: Paths,
     active_memo: Arc<Mutex<Option<ActiveMemo>>>,
     live_account_memo: Arc<Mutex<Option<LiveAccountMemo>>>,
+    error_memo: Arc<Mutex<HashMap<String, String>>>,
 }
 
 struct LiveAccountMemo {
@@ -359,6 +369,7 @@ impl App {
             paths,
             active_memo: Arc::new(Mutex::new(None)),
             live_account_memo: Arc::new(Mutex::new(None)),
+            error_memo: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -834,7 +845,7 @@ impl App {
                     serde_json::json!({
                         "windows": cached.usage,
                         "ageSeconds": now.saturating_sub(cached.fetched_at),
-                        "measured_at": cached.fetched_at,
+
                         "staleAfterSeconds": (if active_profile.as_deref().and_then(|name| self.load_profile(name).ok()).is_some_and(|active| same_usage_identity(&active, profile)) { USAGE_REFRESH_ACTIVE_SECONDS } else { USAGE_REFRESH_IDLE_SECONDS }) + USAGE_CHECK_INTERVAL_SECONDS + DEFAULT_WATCH_INTERVAL_SECONDS,
                     })
                 });
@@ -848,7 +859,7 @@ impl App {
                     "organization": profile.org_name,
                     "subscriptionType": self.subscription_label(profile),
                     "subscriptionInactive": inactive,
-                    "subscriptionCheckedAt": self.gate_path(profile).and_then(|path| self.read_gate(&path)).ok().and_then(|gate| gate.subscription).map(|check| check.checked_at),
+
                     "savedAt": profile.saved_at,
                     "syncedAt": profile.credentials_synced_at,
                     "loginFailedAt": profile.login_failed_at,
@@ -1822,12 +1833,33 @@ impl App {
         let mut usages = Vec::new();
         let candidate = self.candidate(active_profile, renew);
         if self.subscription_inactive(active_profile) {
-            let available: Vec<_> = profiles
+            let mut available = Vec::new();
+            let mut stale = Vec::new();
+            for profile in profiles
                 .iter()
                 .filter(|profile| !same_usage_identity(profile, active_profile))
-                .filter_map(|profile| self.candidate(profile, renew))
+            {
+                if let Some((candidate, age)) = self.candidate_within(profile, renew, u64::MAX) {
+                    if age <= USAGE_CACHE_MAX_AGE_SECONDS {
+                        available.extend([candidate]);
+                    } else {
+                        stale.extend([candidate]);
+                    }
+                }
+            }
+            let available = usage::with_stale_targets(&active, threshold, available, stale);
+            let safe: Vec<_> = available
+                .iter()
+                .filter(|candidate| {
+                    profiles.iter().any(|profile| {
+                        profile.name == candidate.name
+                            && self.target_has_reserve(profile, &candidate.usage, threshold)
+                    })
+                })
+                .cloned()
                 .collect();
-            let decision = match usage::reactive_target(&active, &available, threshold, pacing) {
+            let targets = if safe.is_empty() { &available } else { &safe };
+            let decision = match usage::recovery_target(&active, targets, threshold, pacing) {
                 Some(target) => Decision::SwitchTo { name: target.name.clone(), reason: "Aktiver Account hat kein aktives Abo; Wechsel auf einen verfügbaren Account".to_owned() },
                 None => Decision::NoCandidate { reason: "Aktiver Account hat kein aktives Abo und kein anderer Account ist verfügbar".to_owned() },
             };
@@ -1839,9 +1871,10 @@ impl App {
         match self.predictive_switch(active_profile, &profiles, threshold) {
             Ok(Some(decision)) => return self.apply_decision(decision, dry_run),
             Ok(None) => {}
-            Err(error) => log_problem(&format!(
-                "Prognose nicht verfügbar: {error:#}; reaktive Prüfung läuft weiter"
-            )),
+            Err(error) => self.report_error(
+                "prediction",
+                &format!("Prognose nicht verfügbar: {error:#}; reaktive Prüfung läuft weiter"),
+            ),
         }
         if let Some(candidate) = candidate {
             // Solange der aktive Account unter seiner Grenze liegt, aendert keine weitere Zahl
@@ -1901,8 +1934,24 @@ impl App {
         self.apply_decision(decision, dry_run)
     }
 
+    fn report_error(&self, key: &str, message: &str) {
+        if let Ok(mut memo) = self.error_memo.lock() {
+            log_once(&mut memo, key, message);
+        } else {
+            log_problem(message);
+        }
+    }
+
+    fn prediction_settings(&self) -> (f64, f64) {
+        let config = self.load_config();
+        (
+            config.usage_reserve,
+            USAGE_REFRESH_ACTIVE_SECONDS as f64 + config.switch_lead_seconds as f64,
+        )
+    }
+
     fn target_has_reserve(&self, profile: &Profile, measured: &Usage, threshold: f64) -> bool {
-        let (reserve, horizon) = prediction_settings();
+        let (reserve, horizon) = self.prediction_settings();
         let projected = self
             .gate_path(profile)
             .and_then(|path| self.read_gate(&path))
@@ -1924,13 +1973,13 @@ impl App {
         profiles: &[Profile],
         threshold: f64,
     ) -> Result<Option<Decision>> {
-        let now = unix_timestamp()?;
         let gate = self.read_gate(&self.gate_path(active)?)?;
-        let (reserve, horizon) = prediction_settings();
+        let now = unix_timestamp()?;
+        let (reserve, horizon) = self.prediction_settings();
         let Some(current) = gate.cached else {
             return Ok(None);
         };
-        if current.fetched_at > now || now - current.fetched_at > 1200 {
+        if current.fetched_at > now || now - current.fetched_at > USAGE_CACHE_MAX_AGE_SECONDS {
             return Ok(None);
         }
         let measured = current.usage.settled(chrono::Utc::now());
@@ -2147,8 +2196,8 @@ impl App {
         renew: bool,
         throttled_max_age: u64,
     ) -> Result<(Usage, u64)> {
-        let now = unix_timestamp()?;
         let cached = self.read_cached_usage(&profile.name);
+        let now = unix_timestamp()?;
         let age = |cached: &CachedUsage| now.saturating_sub(cached.fetched_at);
         if let Some(cached) = cached.filter(|cached| {
             !window_reset_passed(&cached.usage, now) && self.still_fresh(profile, age(cached))
@@ -2203,10 +2252,13 @@ impl App {
         if self.subscription_inactive(&profile) {
             return None;
         }
-        self.read_gate(&self.gate_path(&profile).ok()?)
-            .ok()
-            .and_then(|gate| gate.cached)
-            .or_else(|| serde_json::from_slice(&fs::read(self.usage_cache_path(name)).ok()?).ok())
+        let path = self.gate_path(&profile).ok()?;
+        let cached = if path.exists() {
+            self.read_gate(&path).ok()?.cached
+        } else {
+            serde_json::from_slice(&fs::read(self.usage_cache_path(name)).ok()?).ok()
+        };
+        cached
             .filter(|c: &CachedUsage| unix_timestamp().is_ok_and(|now| c.fetched_at <= now))
             .map(|c: CachedUsage| CachedUsage {
                 usage: c.usage.settled(chrono::Utc::now()),
@@ -2245,7 +2297,8 @@ impl App {
             Some(check)
                 if unix_timestamp().is_ok_and(|now| {
                     check.checked_at <= now
-                        && (!check.value.active || now - check.checked_at <= 3600)
+                        && (!check.value.active
+                            || now - check.checked_at <= USAGE_REFRESH_IDLE_SECONDS * 6)
                 }) =>
             {
                 if check.value.active {
@@ -2261,6 +2314,66 @@ impl App {
         }
     }
 
+    fn fetch_account_coordinated(&self, token: &str) -> Result<(usage::LiveAccount, u64)> {
+        let _lock = self.lock_file("profile-api")?;
+        let path = self.paths.store.join(format!(
+            "profile-check-{:x}.json",
+            Sha256::digest(token.as_bytes())
+        ));
+        let now = unix_timestamp()?;
+        let mut check: ProfileCheck = match fs::read(&path) {
+            Ok(data) => match serde_json::from_slice(&data) {
+                Ok(check) => check,
+                Err(_) => {
+                    fs::rename(&path, path.with_extension(format!("corrupt-{now}")))?;
+                    ProfileCheck::default()
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ProfileCheck::default(),
+            Err(error) => return Err(error.into()),
+        };
+        if check.checked_at > now
+            || now.saturating_sub(check.checked_at) > USAGE_REFRESH_IDLE_SECONDS
+        {
+            check.account = None;
+        }
+        if check.retry_at > now && check.retry_at - now <= MAX_API_DELAY_SECONDS {
+            return check
+                .account
+                .map(|account| (account, check.checked_at))
+                .context("Profilprüfung wartet auf den nächsten zulässigen Versuch");
+        }
+        let budget_path = self.paths.store.join("profile-budget.json");
+        let mut budget = self.recover_gate(&budget_path)?;
+        if budget.until > now {
+            bail!("Profil-API pausiert noch {} s", budget.until - now);
+        }
+        check.account = None;
+        check.retry_at = now.saturating_add(USAGE_REFRESH_IDLE_SECONDS);
+        atomic_write(&path, &serde_json::to_vec(&check)?, 0o600)?;
+        let result = usage::fetch_live_account(token);
+        let finished = unix_timestamp()?;
+        match &result {
+            Ok(account) => {
+                check.account = Some(account.clone());
+                check.checked_at = finished;
+                budget.until = 0;
+                budget.failures = 0;
+            }
+            Err(error) => {
+                if let Some(limited) = error.downcast_ref::<usage::RateLimited>() {
+                    budget.failures = budget.failures.saturating_add(1);
+                    budget.until = finished
+                        .saturating_add(usage_retry_delay(budget.failures, limited.retry_after));
+                    check.retry_at = check.retry_at.max(budget.until);
+                }
+            }
+        }
+        atomic_write(&path, &serde_json::to_vec(&check)?, 0o600)?;
+        atomic_write(&budget_path, &serde_json::to_vec(&budget)?, 0o600)?;
+        result.map(|account| (account, finished))
+    }
+
     fn refresh_subscription(
         &self,
         profile: &Profile,
@@ -2269,21 +2382,25 @@ impl App {
         path: &Path,
         now: u64,
     ) -> Result<()> {
-        if gate.subscription_retry_at > now && gate.subscription_retry_at - now <= 86400 {
+        if gate.subscription_retry_at > now
+            && gate.subscription_retry_at - now <= MAX_API_DELAY_SECONDS
+        {
             return Ok(());
         }
         gate.subscription_retry_at = now.saturating_add(USAGE_REFRESH_IDLE_SECONDS);
         atomic_write(path, &serde_json::to_vec(gate)?, 0o600)?;
-        match usage::fetch_live_account(token) {
-            Ok(account)
-                if account.email.eq_ignore_ascii_case(&profile.email)
-                    && account.org_id == profile.org_id =>
+        match self.fetch_account_coordinated(token) {
+            Ok((account, checked_at))
+                if account
+                    .email
+                    .trim()
+                    .eq_ignore_ascii_case(profile.email.trim())
+                    && (account.org_id.is_none()
+                        || profile.org_id.is_none()
+                        || account.org_id == profile.org_id) =>
             {
                 if let Some(value) = account.subscription {
-                    gate.subscription = Some(SubscriptionCheck {
-                        value,
-                        checked_at: unix_timestamp()?,
-                    });
+                    gate.subscription = Some(SubscriptionCheck { value, checked_at });
                 } else if gate
                     .subscription
                     .as_ref()
@@ -2292,20 +2409,40 @@ impl App {
                     gate.subscription = None;
                 }
             }
-            Ok(_) => log_problem("Abo-Prüfung verworfen: Kontozuordnung stimmt nicht überein"),
+            Ok(_) => self.report_error(
+                &format!("subscription-{}", profile.name),
+                "Abo-Prüfung verworfen: Kontozuordnung stimmt nicht überein",
+            ),
             Err(error) => {
                 if let Some(limited) = error.downcast_ref::<usage::RateLimited>() {
                     gate.subscription_retry_at = now.saturating_add(
                         usage_retry_delay(1, limited.retry_after).max(USAGE_REFRESH_IDLE_SECONDS),
                     );
                 }
-                log_problem(&format!(
-                    "Abo von {} nicht bestätigt: {error:#}",
-                    profile.name
-                ));
+                self.report_error(
+                    &format!("subscription-{}", profile.name),
+                    &format!("Abo von {} nicht bestätigt: {error:#}", profile.name),
+                );
             }
         }
         atomic_write(path, &serde_json::to_vec(gate)?, 0o600)
+    }
+
+    fn recover_gate(&self, path: &Path) -> Result<UsageGate> {
+        match self.read_gate(path) {
+            Ok(gate) => Ok(gate),
+            Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+                fs::rename(
+                    path,
+                    path.with_extension(format!("corrupt-{}", unix_timestamp()?)),
+                )?;
+                let gate = UsageGate::default();
+                atomic_write(path, &serde_json::to_vec(&gate)?, 0o600)?;
+                log_problem("Ungültiger Auslastungsspeicher gesichert; neue Messung erforderlich");
+                Ok(gate)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn read_gate(&self, path: &Path) -> Result<UsageGate> {
@@ -2314,7 +2451,7 @@ impl App {
                 let mut gate: UsageGate =
                     serde_json::from_slice(&data).context("Auslastungsspeicher ist ungültig")?;
                 let now = unix_timestamp()?;
-                if gate.until > now.saturating_add(86400) {
+                if gate.until > now.saturating_add(MAX_API_DELAY_SECONDS) {
                     log_problem("Ungültige gespeicherte API-Pause über 24 Stunden wird verworfen");
                     gate.until = 0;
                 }
@@ -2390,22 +2527,19 @@ impl App {
         )
     }
 
-    /// Der Cache haelt nur Prozentwerte und Zeitpunkte, keine Zugangsdaten.
+    #[cfg(test)]
     fn write_cached_usage(&self, name: &str, usage: Usage, fetched_at: u64) {
-        if let Err(error) = self.remember_usage_sample(name, &usage, fetched_at) {
-            log_problem(&format!(
-                "Verlauf der Auslastung von {name} konnte nicht gemerkt werden: {error:#}"
-            ));
-        }
-        let cached = CachedUsage { usage, fetched_at };
-        let written = serde_json::to_vec(&cached)
-            .map_err(anyhow::Error::from)
-            .and_then(|payload| atomic_write(&self.usage_cache_path(name), &payload, 0o600));
-        if let Err(error) = written {
-            log_problem(&format!(
-                "Auslastung von {name} konnte nicht gemerkt werden: {error:#}"
-            ));
-        }
+        let result = (|| -> Result<()> {
+            let _lock = self.lock_file("usage-gate")?;
+            let profile = self.load_profile(name)?;
+            let path = self.gate_path(&profile)?;
+            let mut gate = self.read_gate(&path)?;
+            gate.previous = gate.cached;
+            gate.cached = Some(CachedUsage { usage, fetched_at });
+            atomic_write(&path, &serde_json::to_vec(&gate)?, 0o600)?;
+            self.remember_usage_sample(name, &usage, fetched_at)
+        })();
+        assert!(result.is_ok(), "fixture measurement failed: {result:?}");
     }
 
     /// Der Name des Profils, das gerade aktiv ist.
@@ -2510,7 +2644,11 @@ impl App {
         let _gate_lock = self.lock_file("usage-gate")?;
         let now = unix_timestamp()?;
         let path = self.gate_path(profile)?;
-        let mut gate = self.read_gate(&path)?;
+        let new_gate = !path.exists();
+        let mut gate = self.recover_gate(&path)?;
+        if new_gate {
+            gate.cached = self.read_cached_usage(&profile.name);
+        }
         self.refresh_subscription(profile, &token, &mut gate, &path, now)?;
         let now = unix_timestamp()?;
         if gate
@@ -2528,18 +2666,24 @@ impl App {
             return Ok(cached.usage.settled(chrono::Utc::now()));
         }
         let budget_path = self.paths.store.join("usage-budget.json");
-        let mut budget = self.read_gate(&budget_path)?;
-        if budget.until.max(gate.until) > now {
+        let mut budget = self.recover_gate(&budget_path)?;
+        if budget.until > now {
             log_event(&format!(
                 "Auslastung von {}: gemeinsame API-Pause {} s, Messalter {:?} s",
                 profile.name,
-                budget.until.max(gate.until) - now,
+                budget.until - now,
                 gate.cached.map(|c| now.saturating_sub(c.fetched_at))
             ));
             return Err(UsageThrottled {
-                remaining: budget.until.max(gate.until) - now,
+                remaining: budget.until - now,
             }
             .into());
+        }
+        if gate.until > now {
+            bail!(
+                "Auslastungsabfrage nach fehlgeschlagenem Versuch pausiert noch {} s",
+                gate.until - now
+            );
         }
         gate.until = now.saturating_add(USAGE_REFRESH_ACTIVE_SECONDS);
         atomic_write(&path, &serde_json::to_vec(&gate)?, 0o600)?;
@@ -2560,6 +2704,7 @@ impl App {
             ));
         }
         if let Ok(usage) = result.as_ref() {
+            gate.until = 0;
             gate.previous = gate.cached;
             gate.cached = Some(CachedUsage {
                 usage: *usage,
@@ -2569,15 +2714,15 @@ impl App {
             budget.failures = 0;
             budget.until = 0;
             atomic_write(&budget_path, &serde_json::to_vec(&budget)?, 0o600)?;
-            self.write_cached_usage(&profile.name, *usage, finished);
+            if let Err(error) = self.remember_usage_sample(&profile.name, usage, finished) {
+                log_problem(&format!("Auslastungsverlauf nicht gespeichert: {error:#}"));
+            }
         }
         result
     }
 
     fn usage_credentials(&self, profile: &Profile) -> Result<(Vec<u8>, bool)> {
-        let Some(_lock) = self.try_lock()? else {
-            bail!("Switcher wird gerade benutzt");
-        };
+        let _lock = self.lock()?;
         let live = fs::read(&self.paths.credentials).ok();
         let snapshot = fs::read(self.profile_credentials(&profile.name)).ok();
         let name = profile.name.as_str();
@@ -2691,7 +2836,6 @@ impl App {
     }
 
     pub fn load_jobs(&self) -> Result<Vec<Job>> {
-        let confirmation_lock = self.try_lock_file("jobs")?;
         let _state_lock = self.lock_file("job-state")?;
         let entries = match fs::read_dir(self.jobs_dir()) {
             Ok(entries) => entries,
@@ -2714,38 +2858,49 @@ impl App {
                 format!("Aufgabe konnte nicht gelesen werden: {}", path.display())
             })?;
             let mut job = jobs::parse_job(&data, id)?;
-            if confirmation_lock.is_some()
-                && let Some(pending) = &job.pending_confirmation
-                && confirmation_expired(pending.completed_at, unix_timestamp()?)
-            {
-                log_problem(&format!(
-                    "Aufgabe [{}]: Bestätigung abgelaufen oder ungültig",
-                    job.id
-                ));
-                job.pending_confirmation = None;
-                self.write_job(&job)?;
-            }
-            if confirmation_lock.is_some()
-                && let Some(pending) = &job.pending_confirmation
-            {
-                let measured = self
-                    .load_profiles()?
-                    .iter()
-                    .find(|profile| usage_identity(profile) == pending.account)
-                    .and_then(|profile| self.read_cached_usage(&profile.name))
-                    .and_then(|cached| {
-                        confirmed_window(cached, pending.completed_at, unix_timestamp().ok()?)
-                    });
-                if let Some(cached) = measured {
-                    if let Some(reset) = cached {
-                        job.last_window = Some(reset);
-                        job.pending_confirmation = None;
-                        self.write_job(&job)?;
-                    } else {
-                        job.pending_confirmation = None;
-                        self.write_job(&job)?;
+            let confirmation = (|| -> Result<()> {
+                if let Some(pending) = &job.pending_confirmation
+                    && confirmation_expired(pending.completed_at, unix_timestamp()?)
+                {
+                    log_problem(&format!(
+                        "Aufgabe [{}]: Bestätigung abgelaufen oder ungültig",
+                        job.id
+                    ));
+                    job.pending_confirmation = None;
+                    self.write_job(&job)?;
+                }
+                if let Some(pending) = &job.pending_confirmation {
+                    let measured = self
+                        .load_profiles()?
+                        .iter()
+                        .find(|profile| usage_identity(profile) == pending.account)
+                        .and_then(|profile| self.read_cached_usage(&profile.name))
+                        .and_then(|cached| {
+                            confirmed_window(cached, pending.completed_at, unix_timestamp().ok()?)
+                        });
+                    if let Some(cached) = measured {
+                        if let Some(reset) = cached {
+                            log_event(&format!(
+                                "Aufgabe [{}]: Fenster läuft jetzt bis {}",
+                                job.id,
+                                format_timestamp(reset.timestamp())
+                            ));
+                            job.last_window = Some(reset);
+                            job.pending_confirmation = None;
+                            self.write_job(&job)?;
+                        } else {
+                            job.pending_confirmation = None;
+                            self.write_job(&job)?;
+                        }
                     }
                 }
+                Ok(())
+            })();
+            if let Err(error) = confirmation {
+                log_problem(&format!(
+                    "Aufgabe [{}]: Bestätigung nicht gespeichert: {error:#}",
+                    job.id
+                ));
             }
             jobs.push(job);
         }
@@ -2889,7 +3044,16 @@ impl App {
     /// Startet Claude fuer eine Aufgabe und schreibt das Ergebnis in die Aufgabe zurueck.
     /// Der Rueckgabewert sagt, ob der Lauf selbst geglueckt ist.
     fn execute_job(&self, job: &Job) -> Result<bool> {
-        let mut job = job.clone();
+        let state_lock = self.lock_file("job-state")?;
+        let mut job = match self.load_job(&job.id) {
+            Ok(current) if current.enabled => current,
+            Ok(_) => return Ok(false),
+            Err(error) if !self.job_path(&job.id).exists() => {
+                log_problem(&format!("Aufgabe entfernt: {error:#}"));
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
         if !job.cwd.is_dir() {
             job.enabled = false;
             job.last_status = Some(format!(
@@ -2923,11 +3087,7 @@ impl App {
         job.last_status = Some("laeuft".to_owned());
         self.write_job(&job)?;
         let started_at = job.last_run_at;
-        let run_account = self
-            .active_profile_name()
-            .and_then(|name| self.load_profile(&name))
-            .ok()
-            .map(|profile| usage_identity(&profile));
+        drop(state_lock);
 
         let mut args = vec!["-p".to_owned(), job.text().to_owned()];
         let mut label = String::from("-p <Auftrag>");
@@ -2978,11 +3138,12 @@ impl App {
                 false
             }
         };
-        // Die Sperre zaehlt ab dem *Ende* des Laufs. Mit dem Startzeitpunkt waere sie bei jedem
-        // Lauf, der laenger als sie selbst dauert, schon abgelaufen, bevor er fertig ist - und
-        // genau dann muesste sie greifen, naemlich wenn die Auslastungsabfrage danach scheitert
-        // und das gemerkte Fenster deshalb alt bleibt.
         job.last_run_at = Some(unix_timestamp()?);
+        let run_account = self
+            .active_profile_name()
+            .and_then(|name| self.load_profile(&name))
+            .ok()
+            .map(|profile| usage_identity(&profile));
         job.pending_confirmation = run_account.map(|account| jobs::PendingConfirmation {
             account,
             completed_at: job.last_run_at.unwrap_or(0),
@@ -3157,8 +3318,9 @@ impl App {
         let account = self
             .active_profile_name()
             .and_then(|name| self.load_profile(&name))
-            .ok()
-            .map(|profile| usage_identity(&profile));
+            .map(|profile| usage_identity(&profile))
+            .context("Account für den Fenster-Ping ist unklar")?;
+        let account = Some(account);
         let home = env::var_os("HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -3194,8 +3356,6 @@ impl App {
             Ok(run) => log_problem(&format!("Fenster-Ping fehlgeschlagen: {}", run.status)),
             Err(error) => log_problem(&format!("Fenster-Ping nicht gestartet: {error:#}")),
         }
-        // Der Beweis, dass der Ping wirklich ein Fenster eroeffnet hat, gehoert ins Log; die
-        // Sperre zaehlt danach ab dem Ende des Laufs, nicht ab seinem Beginn.
         if let Some(account) = account {
             self.update_ping_state(|state| {
                 state
@@ -3273,10 +3433,14 @@ impl App {
                     ));
                     spoken.remove(&key);
                     if let Err(error) = self.ping_idle_profile(&profile) {
-                        log_problem(&format!(
-                            "Fenster-Ping fuer `{}` fehlgeschlagen: {error:#}",
-                            profile.name
-                        ));
+                        log_once(
+                            spoken,
+                            &format!("{key}-error"),
+                            &format!(
+                                "Fenster-Ping für `{}` fehlgeschlagen: {error:#}",
+                                profile.name
+                            ),
+                        );
                     }
                     return Ok(());
                 }
@@ -3350,7 +3514,11 @@ impl App {
             false => Ok(()),
         };
         if let Err(error) = self.limit_tick(config, spoken) {
-            log_problem(&format!("Limit-Pause fehlgeschlagen: {error:#}"));
+            log_once(
+                spoken,
+                "limit-error",
+                &format!("Limit-Pause fehlgeschlagen: {error:#}"),
+            );
         }
         self.subagent_compact_tick(spoken);
         self.idle_compact_tick(spoken);
@@ -3379,7 +3547,11 @@ impl App {
         let jobs = match self.load_jobs() {
             Ok(jobs) => jobs,
             Err(error) => {
-                log_problem(&format!("Aufgaben nicht lesbar: {error:#}"));
+                log_once(
+                    spoken,
+                    "jobs-error",
+                    &format!("Aufgaben nicht lesbar: {error:#}"),
+                );
                 Vec::new()
             }
         };
@@ -3390,7 +3562,20 @@ impl App {
 
         // Die Auslastung wird genau einmal geholt und von Ping und Aufgaben gemeinsam benutzt:
         // der Endpunkt ist ratenbegrenzt, und beide bewerten dasselbe Fenster.
-        let usage = self.active_usage()?;
+        let usage = match self.active_usage() {
+            Ok(usage) => {
+                spoken.remove("active-usage-error");
+                usage
+            }
+            Err(error) => {
+                log_once(
+                    spoken,
+                    "active-usage-error",
+                    &format!("Auslastung des aktiven Accounts nicht verfügbar: {error:#}"),
+                );
+                return Ok(());
+            }
+        };
         let now = unix_timestamp()?;
 
         if config.ping.enabled {
@@ -3404,9 +3589,12 @@ impl App {
                         Ok(identity) if ping_pending(&state, &identity, now) => {
                             Readiness::Waiting("Bestätigung des letzten Pings steht aus".to_owned())
                         }
-                        Ok(_) => {
-                            jobs::ping_readiness(&usage, config.threshold, state.last_run_at, now)
-                        }
+                        Ok(identity) => jobs::ping_readiness(
+                            &usage,
+                            config.threshold,
+                            state.idle_profiles.get(&identity).copied(),
+                            unix_timestamp()?,
+                        ),
                         Err(error) => Readiness::Waiting(format!("Account unklar: {error:#}")),
                     }
                 }
@@ -3417,7 +3605,11 @@ impl App {
                     log_event(&format!("Fenster-Ping faellig: {reason}"));
                     spoken.remove("ping");
                     if let Err(error) = self.send_ping(config) {
-                        log_problem(&format!("Fenster-Ping fehlgeschlagen: {error:#}"));
+                        log_once(
+                            spoken,
+                            "ping-error",
+                            &format!("Fenster-Ping fehlgeschlagen: {error:#}"),
+                        );
                     }
                 }
                 Readiness::Waiting(reason) => {
@@ -3521,7 +3713,7 @@ impl App {
             }
             let measured = profiles.iter().find(|profile| usage_identity(profile) == *identity)
                 .and_then(|profile| self.read_cached_usage(&profile.name))
-                .and_then(|cached| confirmed_window(cached, *completed_at, now));
+                .and_then(|cached| confirmed_window(cached, *completed_at, unix_timestamp().unwrap_or(now)));
             if let Some(reset) = measured {
                 match reset {
                     Some(reset) => log_event(&format!("Fenster-Ping: Fenster laeuft jetzt bis {}", format_timestamp(reset.timestamp()))),
@@ -3936,7 +4128,10 @@ impl App {
             .as_ref()
             .is_some_and(|memo| memo.fingerprint == fingerprint);
         let account = read_access_token(credentials)
-            .and_then(|token| usage::fetch_live_account(&token))
+            .and_then(|token| {
+                self.fetch_account_coordinated(&token)
+                    .map(|(account, _)| account)
+            })
             .map_err(|error| {
                 if !retried {
                     log_problem(&format!("Live-Login liess sich nicht zuordnen: {error:#}"));
@@ -4725,27 +4920,18 @@ fn usage_retry_delay(failures: u32, server: Option<u64>) -> u64 {
     USAGE_BACKOFF_DEFAULT_SECONDS
         .saturating_mul(1u64 << failures.saturating_sub(1).min(10))
         .min(USAGE_BACKOFF_MAX_SECONDS)
-        .max(server.filter(|delay| *delay <= 86400).unwrap_or_else(|| {
-            if server.is_some() {
-                log_problem("Ungültiges Retry-After über 24 Stunden; lokale API-Pause gilt");
-            }
-            0
-        }))
-        .max(USAGE_BACKOFF_MIN_SECONDS)
-}
-
-fn prediction_setting(name: &str, fallback: f64, max: f64) -> f64 {
-    env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= max)
-        .unwrap_or(fallback)
-}
-
-fn prediction_settings() -> (f64, f64) {
-    let reserve = prediction_setting("CLAUDE_ACCOUNT_SWITCHER_USAGE_RESERVE", 5.0, 50.0);
-    let lead = prediction_setting("CLAUDE_ACCOUNT_SWITCHER_SWITCH_LEAD_SECONDS", 60.0, 3600.0);
-    (reserve, USAGE_REFRESH_ACTIVE_SECONDS as f64 + lead)
+        .max(
+            server
+                .filter(|delay| *delay <= MAX_API_DELAY_SECONDS)
+                .unwrap_or_else(|| {
+                    if server.is_some() {
+                        log_problem(
+                            "Ungültiges Retry-After über 24 Stunden; lokale API-Pause gilt",
+                        );
+                    }
+                    0
+                }),
+        )
 }
 
 fn projected_usage(gate: &UsageGate, now: u64, horizon: f64) -> Option<[f64; 2]> {
@@ -4753,7 +4939,7 @@ fn projected_usage(gate: &UsageGate, now: u64, horizon: f64) -> Option<[f64; 2]>
     let previous = gate.previous?;
     let elapsed = current.fetched_at.checked_sub(previous.fetched_at)?;
     let age = now.checked_sub(current.fetched_at)?;
-    if elapsed == 0 || elapsed > 1200 || age > 1200 {
+    if elapsed == 0 || elapsed > PREDICTION_MAX_AGE_SECONDS || age > PREDICTION_MAX_AGE_SECONDS {
         return None;
     }
     let mut predicted = [0.0; 2];
@@ -4967,7 +5153,10 @@ mod tests {
         assert_eq!(usage_retry_delay(1, Some(0)), 300);
         assert_eq!(usage_retry_delay(2, None), 600);
         assert_eq!(usage_retry_delay(u32::MAX, None), 900);
-        assert_eq!(usage_retry_delay(1, Some(86400)), 86400);
+        assert_eq!(
+            usage_retry_delay(1, Some(MAX_API_DELAY_SECONDS)),
+            MAX_API_DELAY_SECONDS
+        );
         assert_eq!(usage_retry_delay(2, Some(u64::MAX)), 600);
         assert_eq!(usage_retry_delay(2, Some(86401)), 600);
     }

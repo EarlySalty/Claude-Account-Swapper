@@ -22,6 +22,8 @@ pub struct Config {
     /// Ab dieser Auslastung in Prozent gilt ein Fenster als verbraucht.
     pub threshold: f64,
     pub weekly_pacing: bool,
+    pub usage_reserve: f64,
+    pub switch_lead_seconds: u64,
     pub ping: Ping,
     pub limit_compact: LimitCompact,
 }
@@ -82,6 +84,8 @@ impl Default for Config {
             auto_switch: false,
             threshold: DEFAULT_SWITCH_THRESHOLD,
             weekly_pacing: true,
+            usage_reserve: 5.0,
+            switch_lead_seconds: 60,
             ping: Ping::default(),
             limit_compact: LimitCompact::default(),
         }
@@ -119,6 +123,16 @@ impl Config {
         anyhow::ensure!(
             self.ping.timeout_minutes > 0,
             "Zeitlimit des Pings muss größer als 0 sein"
+        );
+        anyhow::ensure!(
+            self.usage_reserve.is_finite()
+                && self.usage_reserve >= 0.0
+                && (self.usage_reserve == 0.0 || self.usage_reserve * 2.0 < self.threshold),
+            "Reserve muss kleiner als die halbe Schwelle sein"
+        );
+        anyhow::ensure!(
+            self.switch_lead_seconds <= 3600,
+            "Wechselvorlauf darf höchstens eine Stunde sein"
         );
         let limit = &self.limit_compact;
         anyhow::ensure!(
@@ -213,6 +227,10 @@ mod tests {
         assert!(Config::parse(r#"{"ping":{"prompt":"  "}}"#).is_err());
         assert!(Config::parse(r#"{"ping":{"timeout_minutes":0}}"#).is_err());
         assert!(Config::parse("kein json").is_err());
+        assert!(Config::parse(r#"{"usage_reserve":49}"#).is_err());
+        assert!(Config::parse(r#"{"usage_reserve":-1}"#).is_err());
+        assert!(Config::parse(r#"{"switch_lead_seconds":3601}"#).is_err());
+        assert!(Config::parse(r#"{"usage_reserve":0,"switch_lead_seconds":0}"#).is_ok());
     }
 
     #[test]

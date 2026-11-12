@@ -1171,6 +1171,12 @@ impl App {
     fn blocked_now(&self) -> Result<bool> {
         self.check_config_file()?;
         let config = self.load_config();
+        if !config.limit_compact.enabled {
+            return Ok(false);
+        }
+        if config.limit_compact.force {
+            return Ok(true);
+        }
         let active = if config.auto_switch {
             match self.load_state() {
                 Ok(state) => state.current,
@@ -1271,7 +1277,26 @@ impl App {
             }
         }
         spoken.remove("limit-manual-pin");
-        let Some(target) = switch_target(config, levels, active.as_deref()) else {
+        let safe: Vec<_> = levels
+            .iter()
+            .filter(|(name, candidate)| {
+                active.as_deref() == Some(name.as_str())
+                    || candidate.as_ref().is_some_and(|candidate| {
+                        self.load_profile(name).is_ok_and(|profile| {
+                            self.target_has_reserve(&profile, &candidate.usage, config.threshold)
+                        })
+                    })
+            })
+            .cloned()
+            .collect();
+        let preferred = if safe.iter().any(|(name, candidate)| {
+            active.as_deref() != Some(name.as_str()) && candidate.is_some()
+        }) {
+            &safe
+        } else {
+            levels
+        };
+        let Some(target) = switch_target(config, preferred, active.as_deref()) else {
             spoken.remove("limit-switch-off");
             return;
         };

@@ -270,6 +270,41 @@ pub fn with_stale_targets(
     fresh
 }
 
+pub fn recovery_target<'a>(
+    active: &str,
+    accounts: &'a [Candidate],
+    threshold: f64,
+    pacing: Option<DateTime<Utc>>,
+) -> Option<&'a Candidate> {
+    reactive_target(active, accounts, threshold, pacing)
+        .or_else(|| {
+            rank(
+                pacing,
+                threshold,
+                accounts.iter().filter(|candidate| {
+                    candidate.name != active && candidate.within_global_limit(threshold)
+                }),
+            )
+        })
+        .or_else(|| {
+            rank(
+                pacing,
+                threshold,
+                accounts
+                    .iter()
+                    .filter(|candidate| candidate.name != active && candidate.has_real_quota()),
+            )
+        })
+        .or_else(|| {
+            accounts
+                .iter()
+                .filter(|candidate| candidate.name != active)
+                .filter_map(|candidate| candidate.unblocked_at(threshold).map(|at| (candidate, at)))
+                .min_by(|(a, at), (b, bt)| at.cmp(bt).then_with(|| a.name.cmp(&b.name)))
+                .map(|(candidate, _)| candidate)
+        })
+}
+
 const WEEK_HOURS: f64 = 7.0 * 24.0;
 const PACE_MIN_HOURS: f64 = 1.0;
 pub const PACE_SWITCH_RATIO: f64 = 1.15;
@@ -526,7 +561,7 @@ pub struct RateLimited {
 
 impl std::fmt::Display for RateLimited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Auslastungs-API antwortete mit HTTP 429")
+        write!(f, "API antwortete mit HTTP 429")
     }
 }
 
@@ -537,6 +572,18 @@ pub fn usage_url() -> String {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_USAGE_URL.to_owned())
+}
+
+fn parse_retry_after(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|date| {
+                date.timestamp()
+                    .saturating_sub(Utc::now().timestamp())
+                    .max(0) as u64
+            })
+    })
 }
 
 pub fn fetch(access_token: &str) -> Result<Usage> {
@@ -563,17 +610,7 @@ pub fn fetch(access_token: &str) -> Result<Usage> {
             .headers()
             .get("retry-after")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| {
-                value.trim().parse::<u64>().ok().or_else(|| {
-                    chrono::DateTime::parse_from_rfc2822(value)
-                        .ok()
-                        .map(|date| {
-                            date.timestamp()
-                                .saturating_sub(Utc::now().timestamp())
-                                .max(0) as u64
-                        })
-                })
-            });
+            .and_then(parse_retry_after);
         return Err(RateLimited { retry_after }.into());
     }
     let body = response
@@ -593,7 +630,7 @@ fn profile_url() -> String {
         .unwrap_or_else(|| DEFAULT_PROFILE_URL.to_owned())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveAccount {
     pub email: String,
     pub org_id: Option<String>,
@@ -625,17 +662,7 @@ pub fn fetch_live_account(access_token: &str) -> Result<LiveAccount> {
             .headers()
             .get("retry-after")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| {
-                value.trim().parse::<u64>().ok().or_else(|| {
-                    chrono::DateTime::parse_from_rfc2822(value)
-                        .ok()
-                        .map(|date| {
-                            date.timestamp()
-                                .saturating_sub(Utc::now().timestamp())
-                                .max(0) as u64
-                        })
-                })
-            });
+            .and_then(parse_retry_after);
         return Err(RateLimited { retry_after }.into());
     }
     let body = response
@@ -676,19 +703,19 @@ pub fn parse_live_account(body: &str) -> Result<LiveAccount> {
     let max = value["account"]["has_claude_max"].as_bool();
     let pro = value["account"]["has_claude_pro"].as_bool();
     let plan = match kind {
-        Some("claude_max") => Some("max"),
-        Some("claude_pro") => Some("pro"),
-        Some("claude_team") => Some("team"),
-        Some("claude_enterprise") => Some("enterprise"),
         _ if max == Some(true) => Some("max"),
         _ if pro == Some(true) => Some("pro"),
+        Some("claude_team") => Some("team"),
+        Some("claude_enterprise") => Some("enterprise"),
         _ => None,
     };
     let inactive = kind == Some("claude_free")
-        || matches!(
-            status,
-            Some("expired" | "unpaid" | "past_due" | "incomplete_expired")
-        )
+        || (max != Some(true)
+            && pro != Some(true)
+            && matches!(
+                status,
+                Some("expired" | "unpaid" | "past_due" | "incomplete_expired")
+            ))
         || (!matches!(kind, Some("claude_team" | "claude_enterprise"))
             && max == Some(false)
             && pro == Some(false));
@@ -733,8 +760,8 @@ fn bucket(value: &Value, field: &str) -> Result<Bucket> {
         .get("utilization")
         .and_then(Value::as_f64)
         .with_context(|| format!("`{field}` enthaelt keine Auslastung"))?;
-    if !utilization.is_finite() || utilization < 0.0 {
-        bail!("Auslastung von `{field}` muss endlich und nicht negativ sein");
+    if utilization < 0.0 {
+        bail!("Auslastung von `{field}` darf nicht negativ sein");
     }
     // `resets_at` fehlt bei einem ungenutzten Fenster; nur ein *unlesbarer* Wert ist ein Fehler.
     let resets_at = match bucket.get("resets_at").and_then(Value::as_str) {
@@ -868,7 +895,7 @@ mod tests {
             ("claude_free", "canceled", false, false, false),
             ("claude_max", "canceled", false, false, false),
             ("claude_max", "canceled", true, false, true),
-            ("claude_max", "past_due", true, false, false),
+            ("claude_max", "past_due", true, false, true),
             ("claude_pro", "active", false, true, true),
             ("claude_team", "active", false, false, true),
         ] {

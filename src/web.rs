@@ -415,7 +415,10 @@ fn dispatch_post(
         }
         "/api/config" => {
             let mut config: Config = read_json(request)?;
-            config.limit_compact = app.load_config().limit_compact;
+            let saved = app.load_config();
+            config.limit_compact = saved.limit_compact;
+            config.usage_reserve = saved.usage_reserve;
+            config.switch_lead_seconds = saved.switch_lead_seconds;
             app.write_config(&config).map_err(internal_error)?;
             Ok(message_response(
                 "Automatik-Einstellungen wurden gespeichert.",
