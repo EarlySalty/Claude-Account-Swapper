@@ -60,7 +60,7 @@ impl Default for LimitCompact {
         Self {
             enabled: false,
             force: false,
-            threshold: 95.0,
+            threshold: 97.0,
             resume_below: 80.0,
             compact_from: 85.0,
             compact_lead_minutes: 30,

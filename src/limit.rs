@@ -798,6 +798,27 @@ fn minutes(value: u64) -> i64 {
     i64::try_from(value.saturating_mul(60)).unwrap_or(i64::MAX)
 }
 
+fn pause_candidate(
+    thread: &ThreadSummary,
+    state: &LimitState,
+    limit: &LimitCompact,
+    now: DateTime<Utc>,
+) -> bool {
+    !thread.busy
+        && !thread.settled
+        && thread.last_run_completed_at.is_some_and(|completed| {
+            thread
+                .last_user_message_at
+                .is_none_or(|message| message <= completed)
+                && (now.signed_duration_since(completed).num_seconds()
+                    < minutes(limit.cache_ttl_minutes)
+                    || state
+                        .sessions
+                        .values()
+                        .any(|parked| parked.thread_id.as_deref() == Some(thread.id.as_str())))
+        })
+}
+
 pub(crate) fn worth_compacting(detail: &t3::ThreadDetail, limit: &LimitCompact) -> bool {
     !detail.last_item_is_compaction
         && detail
@@ -888,9 +909,19 @@ fn verdict(config: &Config, levels: &[Level], active_profile: Option<&str>) -> V
         Fit::Reserve => best_other(config, levels, active_profile, Fit::Strict).is_none(),
         Fit::No => false,
     };
+    // With switching disabled, quota on another saved login cannot help the
+    // sessions running on the active login. Do not wait for the entire pool.
+    let active_at_limit = !config.auto_switch
+        && levels.iter().any(|(name, candidate)| {
+            active_profile == Some(name.as_str())
+                && candidate
+                    .as_ref()
+                    .is_some_and(|candidate| blocked(candidate, config))
+        });
     Verdict {
         at_limit: limit.enabled
             && (limit.force
+                || active_at_limit
                 || (all_at_limit && !any_account_frees_within_an_hour(config, levels, Utc::now()))),
         released: !limit.enabled || (!limit.force && active_usable),
     }
@@ -1001,7 +1032,7 @@ fn limit_reason(levels: &[Level]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ");
-    format!("no saved Claude account has quota left ({figures})")
+    format!("saved account quota ({figures})")
 }
 
 fn still_blocked(
@@ -1138,9 +1169,6 @@ impl App {
 
     pub fn hook(&self, input: &str) -> Result<Option<String>> {
         let state = self.load_limit_state()?;
-        if !state.active && state.sessions.is_empty() && state.compacting_sessions.is_empty() {
-            return Ok(None);
-        }
         let mut input: HookInput =
             serde_json::from_str(input).context("Hook-Eingabe ist kein JSON")?;
         input.entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
@@ -1157,6 +1185,22 @@ impl App {
             return Ok(None);
         }
         if !quota_hook_owns(&input, &catalog) {
+            return Ok(None);
+        }
+        if matches!(input.hook_event_name.as_str(), "Stop" | "PostToolUse") {
+            self.check_config_file()?;
+            let config = self.load_config();
+            if config.limit_compact.enabled {
+                // Hooks only read the shared measurement. Never refresh quota or
+                // call T3 here: many concurrent sessions invoke this path.
+                let active = self.hook_active_profile();
+                let levels = self.cached_levels_for(active.as_deref())?;
+                let verdict = verdict(&config, &levels, active.as_deref());
+                self.enter_or_release(&config, &levels, &verdict, unix_timestamp()?)?;
+            }
+        }
+        let state = self.load_limit_state()?;
+        if !state.active && state.sessions.is_empty() && state.compacting_sessions.is_empty() {
             return Ok(None);
         }
         let now = unix_millis()?;
@@ -1182,10 +1226,33 @@ impl App {
                 }
             }
         } else {
-            self.active_profile_name_memoized(None)
+            self.hook_active_profile()
         };
         let levels = self.cached_levels_for(active.as_deref())?;
         Ok(still_blocked(&config, &levels, || active))
+    }
+
+    // A hook is a new process each time, so the watcher's in-memory identity
+    // memo cannot help. Bind the saved selection to the live credential locally.
+    fn hook_active_profile(&self) -> Option<String> {
+        let live = fs::read(&self.paths.credentials).ok()?;
+        let fingerprint = crate::credential_fingerprint(&live).ok()?;
+        let profiles = self.load_profiles().ok()?;
+        let matches = |profile: &&crate::Profile| {
+            profile.credential_fingerprint.as_deref() == Some(fingerprint.as_str())
+                || fs::read(self.profile_credentials(&profile.name))
+                    .ok()
+                    .and_then(|saved| crate::credential_fingerprint(&saved).ok())
+                    .as_deref()
+                    == Some(fingerprint.as_str())
+        };
+        let owners: Vec<_> = profiles.iter().filter(matches).collect();
+        let current = self.load_state().ok().and_then(|state| state.current);
+        owners
+            .iter()
+            .find(|profile| current.as_deref() == Some(profile.name.as_str()))
+            .or_else(|| (owners.len() == 1).then(|| &owners[0]))
+            .map(|profile| profile.name.clone())
     }
 
     pub(crate) fn t3_client(&self, limit: &LimitCompact) -> t3::Client {
@@ -1494,11 +1561,28 @@ impl App {
     fn compact_pass(&self, limit: &LimitCompact, state: &LimitState) -> Result<()> {
         let client = self.t3_client(limit);
         let threads = client.claude_threads()?;
+        // Drain paused sessions sequentially to preserve the summary reserve.
+        if state.active
+            && threads
+                .iter()
+                .any(|thread| thread.busy && state.compacted.contains_key(&thread.id))
+        {
+            return Ok(());
+        }
         let now = Utc::now();
         let mut candidates: Vec<&ThreadSummary> = threads
             .iter()
-            .filter(|thread| !state.compacted.contains_key(&thread.id))
-            .filter(|thread| warm_candidate(thread, limit, now))
+            // A thread may have worked again after proactive compaction. During
+            // the pause, inspect its latest turn before treating it as saved.
+            .filter(|thread| state.active || !state.compacted.contains_key(&thread.id))
+            .filter(|thread| {
+                if state.active {
+                    // Parked threads are compacted as soon as their turn ends.
+                    pause_candidate(thread, state, limit, now)
+                } else {
+                    warm_candidate(thread, limit, now)
+                }
+            })
             .filter(|thread| {
                 let stamp = thread.last_run_completed_at.map(|time| time.to_rfc3339());
                 state.inspected.get(&thread.id) != stamp.as_ref()
@@ -1511,12 +1595,28 @@ impl App {
         if candidates.is_empty() && !unmapped {
             return Ok(());
         }
-        candidates.sort_by_key(|thread| std::cmp::Reverse(thread.last_run_completed_at));
+        candidates.sort_by_key(|thread| {
+            let parked = state
+                .sessions
+                .values()
+                .any(|session| session.thread_id.as_deref() == Some(thread.id.as_str()));
+            (
+                std::cmp::Reverse(parked),
+                std::cmp::Reverse(thread.last_run_completed_at),
+            )
+        });
         let mut rpc = client.connect()?;
         self.map_sessions(&mut rpc, &threads, state)?;
-        let budget = limit.max_compactions.saturating_sub(state.compacted.len());
+        let budget = if state.active {
+            1
+        } else {
+            limit.max_compactions.saturating_sub(state.compacted.len())
+        };
         let mut sent = 0;
         for thread in candidates {
+            if sent >= budget {
+                break;
+            }
             let detail = rpc.thread_detail(&thread.id)?;
             let stamp = thread
                 .last_run_completed_at
@@ -1528,7 +1628,13 @@ impl App {
                     .native_session_ids
                     .iter()
                     .any(|id| limit.scope_sessions.contains(id));
-            if sent >= budget || !in_scope || !worth_compacting(&detail, limit) {
+            let worth = if state.active {
+                !detail.last_item_is_compaction
+                    && detail.used_tokens.is_some_and(|tokens| tokens > 0)
+            } else {
+                worth_compacting(&detail, limit)
+            };
+            if !in_scope || !worth {
                 self.update_limit_state(|state| {
                     state.inspected.insert(thread.id.clone(), stamp.clone());
                 })?;
@@ -1922,6 +2028,108 @@ pub fn log_hook_failure(error: &anyhow::Error) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_account_pauses_at_97_without_waiting_for_other_accounts_or_reset() {
+        let config = config(false);
+        let soon = Some(Utc::now() + chrono::Duration::minutes(5));
+        for (percent, expected) in [(96.99, false), (97.0, true), (99.0, true)] {
+            let levels = vec![
+                ("a".to_owned(), usage_at(percent, 10.0, soon)),
+                ("b".to_owned(), usage(0.0, 0.0)),
+            ];
+            assert_eq!(verdict(&config, &levels, Some("a")).at_limit, expected);
+            assert!(!verdict(&config, &levels, Some("b")).at_limit);
+            assert!(!verdict(&config, &levels, None).at_limit);
+        }
+    }
+
+    #[test]
+    fn hook_activates_from_cache_without_claude_or_network_and_does_not_loop() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = crate::App::with_paths(crate::Paths {
+            credentials: temp.path().join("credentials"),
+            claude_json: temp.path().join("identity"),
+            store: temp.path().join("store"),
+            claude_bin: temp.path().join("must-not-run"),
+        });
+        let credentials = br#"{"claudeAiOauth":{"refreshToken":"local-test-token"}}"#;
+        fs::write(&app.paths.credentials, credentials).unwrap();
+        let profile: crate::Profile = serde_json::from_value(json!({
+            "name":"active", "email":"test@example.test", "org_id":"org", "saved_at":1,
+            "credential_fingerprint": crate::credential_fingerprint(credentials).unwrap()
+        }))
+        .unwrap();
+        app.write_profile(&profile).unwrap();
+        app.write_state(&crate::State {
+            current: Some(profile.name.clone()),
+        })
+        .unwrap();
+        app.update_config(|config| {
+            config.limit_compact.enabled = true;
+            config.auto_switch = false;
+        })
+        .unwrap();
+        let write_quota = |percent| {
+            app.write_cached_usage(
+                "active",
+                usage(percent, 0.0).unwrap().usage,
+                unix_timestamp().unwrap(),
+            );
+        };
+        let event = |kind| {
+            json!({"hook_event_name":kind,"session_id":"s","model":"claude-opus-4-6"}).to_string()
+        };
+        write_quota(96.99);
+        assert!(app.hook(&event("Stop")).unwrap().is_none());
+        write_quota(97.0);
+        assert!(app.hook(&event("Stop")).unwrap().unwrap().contains("block"));
+        assert!(app.load_limit_state().unwrap().active);
+        assert!(app.hook(&event("Stop")).unwrap().is_none());
+        app.update_limit_state(|state| {
+            state.sessions.get_mut("s").unwrap().continued_by_user = true
+        })
+        .unwrap();
+        assert!(app.hook(&event("PostToolUse")).unwrap().is_none());
+        fs::write(
+            &app.paths.credentials,
+            br#"{"claudeAiOauth":{"refreshToken":"different-account"}}"#,
+        )
+        .unwrap();
+        assert!(app.hook_active_profile().is_none());
+    }
+
+    #[test]
+    fn pause_compaction_includes_recent_sessions_and_parked_old_sessions() {
+        let now = Utc::now();
+        let limit = LimitCompact::default();
+        let mut state = LimitState {
+            active: true,
+            ..LimitState::default()
+        };
+        let mut thread = ThreadSummary {
+            id: "thread".to_owned(),
+            busy: false,
+            settled: false,
+            last_run_completed_at: Some(now),
+            last_user_message_at: None,
+            updated_at: Some(now),
+        };
+        assert!(pause_candidate(&thread, &state, &limit, now));
+        assert!(!warm_candidate(&thread, &limit, now));
+        thread.last_run_completed_at = Some(now - chrono::Duration::hours(2));
+        assert!(!pause_candidate(&thread, &state, &limit, now));
+        state.sessions.insert(
+            "s".to_owned(),
+            Parked {
+                thread_id: Some(thread.id.clone()),
+                ..Parked::default()
+            },
+        );
+        assert!(pause_candidate(&thread, &state, &limit, now));
+        thread.busy = true;
+        assert!(!pause_candidate(&thread, &state, &limit, now));
+    }
+
     #[test]
     fn alias_levels_keep_one_quota_and_the_active_profile_limits() {
         let temp = tempfile::tempdir().expect("temp");
@@ -2584,7 +2792,7 @@ mod tests {
         above.limit_compact.compact_from = 99.0;
         assert!(nearing_limit(
             &above,
-            &[at(96.0, later), full.clone()],
+            &[at(97.0, later), full.clone()],
             None
         ));
         assert!(above.validate().is_ok());
@@ -2810,7 +3018,7 @@ mod tests {
         let reason = limit_reason(&[weekly_full("a", 100.0, 71.0), weekly_full("b", 72.0, 100.0)]);
         assert_eq!(
             reason,
-            "no saved Claude account has quota left (a: 5h 100%, 7d 71%; b: 5h 72%, 7d 100%)"
+            "saved account quota (a: 5h 100%, 7d 71%; b: 5h 72%, 7d 100%)"
         );
     }
 
