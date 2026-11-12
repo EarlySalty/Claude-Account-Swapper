@@ -1969,6 +1969,10 @@ impl App {
             limit.max_compactions
         );
         println!(
+            "Während der Limit-Pause: alle geeigneten offenen Claude-Threads einzeln kompaktieren; \
+             keine Mindestgröße und keine Gesamtobergrenze"
+        );
+        println!(
             "Kompaktieren nach Subagent: {} (wartender T3-Thread, ab {} Tokens, nach {} min Ruhe)",
             if limit.after_subagent { "an" } else { "aus" },
             limit.min_context_tokens,
